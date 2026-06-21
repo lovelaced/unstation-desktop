@@ -1,0 +1,12 @@
+[package]
+name = "unstation-node"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "unstation-node"
+path = "src/main.rs"
+
+[dependencies]
+unstation-core = { path = "../unstation-core" }

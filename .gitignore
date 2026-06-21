@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.DS_Store
+
+# Tauri / web
+desktop/src-tauri/target
+desktop/node_modules
+desktop/dist
+
+# fuzz
+crates/unstation-core/fuzz/target
+crates/unstation-core/fuzz/corpus
+crates/unstation-core/fuzz/artifacts

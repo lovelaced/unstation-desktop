@@ -1,0 +1,26 @@
+# Detached fuzz crate (own [workspace] so the stable workspace build ignores it).
+# Run with: cargo +nightly fuzz run protocol_decode
+[package]
+name = "unstation-core-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+parity-scale-codec = "3"
+
+[dependencies.unstation-core]
+path = ".."
+
+[[bin]]
+name = "protocol_decode"
+path = "fuzz_targets/protocol_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

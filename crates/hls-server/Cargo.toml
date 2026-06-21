@@ -1,0 +1,11 @@
+[package]
+name = "hls-server"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+description = "Localhost HLS re-server: serves a dynamically-generated media playlist + init/media segments the mesh engine has delivered, so any player stays ignorant of P2P."
+
+[dependencies]
+unstation-core = { path = "../unstation-core" }
+bytes.workspace = true
+tiny_http = "0.12"

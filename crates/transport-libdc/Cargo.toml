@@ -1,0 +1,12 @@
+[package]
+name = "transport-libdc"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+datachannel = "0.16.0"
+unstation-core = { path = "../unstation-core" }
+
+[dev-dependencies]
+parity-scale-codec.workspace = true
