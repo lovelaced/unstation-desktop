@@ -1,108 +1,102 @@
-//! Real libdatachannel loopback (D2 probe): two in-process `RtcPeerConnection`s
-//! complete an offer/answer + ICE handshake over the loopback interface, open a
-//! `DataChannel`, and carry a real `MeshMsg` from one peer to the other.
+//! Real two-channel libdatachannel loopback (D2 probe): two `LibDcTransport`
+//! reactors complete an offer/answer + trickle-ICE handshake over the loopback
+//! interface, open the `ctrl`+`bulk` data channels, and carry a real `MeshMsg`
+//! across the `bulk` channel — exercising the production transport path end to end.
 //!
-//! This proves the native transport works and carries our wire protocol. It needs
-//! to bind loopback UDP sockets; if a sandbox forbids that the handshake can't
-//! complete, so the test fails closed with a clear timeout message rather than
-//! hanging. The deterministic mesh logic is covered separately by the in-memory
-//! transport (`unstation-core/tests/two_peer.rs`).
+//! Needs to bind loopback UDP sockets for ICE; if a sandbox forbids that the
+//! handshake can't complete, so the test fails closed with a clear timeout rather
+//! than hanging. The deterministic mesh logic is covered separately by the
+//! in-memory transport (`unstation-core/tests/two_peer.rs`).
 
-use datachannel::{RtcConfig, RtcPeerConnection};
 use parity_scale_codec::{Decode, Encode};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::channel;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use transport_libdc::{Conn, DcSink};
+use std::time::Duration;
+use tokio::sync::mpsc::unbounded_channel;
+use transport_libdc::{LibDcTransport, SignalOut};
 use unstation_core::protocol::MeshMsg;
+use unstation_core::transport::{Channel, EngineEvent};
+use unstation_core::types::PeerId;
 
 // Requires binding loopback UDP for ICE, which the default test sandbox blocks.
-// Verified passing (~1s) on a networked host: `cargo test -p transport-libdc -- --ignored`.
-#[test]
+// Run on a networked host: `cargo test -p transport-libdc -- --ignored`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires loopback UDP (ICE); run with --ignored on a networked host"]
-fn libdc_loopback_roundtrips_protocol_bytes() {
-    // No ICE servers — host candidates over loopback suffice.
-    let conf = RtcConfig::new::<&str>(&[]);
+async fn two_channel_link_roundtrips_protocol_bytes() {
+    let a_id = PeerId::from_u64(1);
+    let b_id = PeerId::from_u64(2);
 
-    let (a_desc_tx, a_desc_rx) = channel();
-    let (a_cand_tx, a_cand_rx) = channel();
-    let (b_desc_tx, b_desc_rx) = channel();
-    let (b_cand_tx, b_cand_rx) = channel();
-    let (a_in_tx, _a_in_rx) = channel::<Vec<u8>>();
-    let (b_in_tx, b_in_rx) = channel::<Vec<u8>>();
+    let (a_inbox_tx, mut a_inbox_rx) = unbounded_channel::<EngineEvent>();
+    let (b_inbox_tx, mut b_inbox_rx) = unbounded_channel::<EngineEvent>();
+    let (a_sig_tx, mut a_sig_rx) = unbounded_channel::<SignalOut>();
+    let (b_sig_tx, mut b_sig_rx) = unbounded_channel::<SignalOut>();
 
-    let a_opened = Arc::new(AtomicBool::new(false));
-    let b_opened = Arc::new(AtomicBool::new(false));
+    // No STUN — host candidates over loopback suffice.
+    let a = LibDcTransport::new(vec![], a_inbox_tx, a_sig_tx);
+    let b = LibDcTransport::new(vec![], b_inbox_tx, b_sig_tx);
 
-    let mut pc_b = RtcPeerConnection::new(
-        &conf,
-        Conn {
-            local_desc: b_desc_tx,
-            local_cand: b_cand_tx,
-            incoming: b_in_tx,
-            opened: b_opened,
-            recv_dc: Arc::new(Mutex::new(None)),
-        },
-    )
-    .expect("create pc_b");
-
-    let mut pc_a = RtcPeerConnection::new(
-        &conf,
-        Conn {
-            local_desc: a_desc_tx,
-            local_cand: a_cand_tx,
-            incoming: a_in_tx.clone(),
-            opened: a_opened.clone(),
-            recv_dc: Arc::new(Mutex::new(None)),
-        },
-    )
-    .expect("create pc_a");
-
-    // A initiates: creating the channel triggers offer/answer auto-negotiation.
-    let mut dc_a = pc_a
-        .create_data_channel(
-            "mesh",
-            DcSink { incoming: a_in_tx, opened: a_opened.clone() },
-        )
-        .expect("create data channel");
-
-    let payload = MeshMsg::Want { segment_seqs: vec![1, 2, 3], deadline_hint_ms: 0 }.encode();
-
-    let start = Instant::now();
-    let mut sent = false;
-    let mut received: Option<Vec<u8>> = None;
-    loop {
-        // Ferry signaling A -> B.
-        while let Ok(d) = a_desc_rx.try_recv() {
-            let _ = pc_b.set_remote_description(&d);
-        }
-        while let Ok(c) = a_cand_rx.try_recv() {
-            let _ = pc_b.add_remote_candidate(&c);
-        }
-        // Ferry signaling B -> A.
-        while let Ok(d) = b_desc_rx.try_recv() {
-            let _ = pc_a.set_remote_description(&d);
-        }
-        while let Ok(c) = b_cand_rx.try_recv() {
-            let _ = pc_a.add_remote_candidate(&c);
-        }
-        // Once A's channel is open, push the payload.
-        if !sent && a_opened.load(Ordering::SeqCst) && dc_a.send(&payload).is_ok() {
-            sent = true;
-        }
-        if let Ok(msg) = b_in_rx.try_recv() {
-            received = Some(msg);
-            break;
-        }
-        if start.elapsed() > Duration::from_secs(20) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    // Relay A's local signaling to B (the first description is A's offer → accept).
+    {
+        let b = b.clone();
+        tokio::spawn(async move {
+            let mut accepted = false;
+            while let Some(sig) = a_sig_rx.recv().await {
+                match sig {
+                    SignalOut::LocalDescription { sdp, .. } => {
+                        if !accepted {
+                            b.accept(a_id, sdp);
+                            accepted = true;
+                        } else {
+                            b.remote_description(a_id, sdp);
+                        }
+                    }
+                    SignalOut::LocalCandidate { cand, .. } => b.remote_candidate(a_id, cand),
+                }
+            }
+        });
+    }
+    // Relay B's local signaling to A (B's answer + candidates).
+    {
+        let a = a.clone();
+        tokio::spawn(async move {
+            while let Some(sig) = b_sig_rx.recv().await {
+                match sig {
+                    SignalOut::LocalDescription { sdp, .. } => a.remote_description(b_id, sdp),
+                    SignalOut::LocalCandidate { cand, .. } => a.remote_candidate(b_id, cand),
+                }
+            }
+        });
     }
 
-    let received = received.expect("B should receive A's message over a real DataChannel");
-    assert_eq!(received, payload, "bytes must arrive intact");
-    let decoded = MeshMsg::decode(&mut &received[..]).expect("decodes as MeshMsg");
+    a.dial(b_id);
+
+    // A should see the link come up within 20s.
+    let link = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match a_inbox_rx.recv().await {
+                Some(EngineEvent::PeerConnected { link, .. }) => return link,
+                Some(_) => continue,
+                None => panic!("A inbox closed before connect"),
+            }
+        }
+    })
+    .await
+    .expect("A should connect to B within 20s");
+
+    let payload = MeshMsg::Want { segment_seqs: vec![1, 2, 3], deadline_hint_ms: 0 }.encode();
+    link.send(Channel::Bulk, payload.clone());
+
+    let got = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match b_inbox_rx.recv().await {
+                Some(EngineEvent::Inbound { channel: Channel::Bulk, bytes, .. }) => return bytes,
+                Some(_) => continue,
+                None => panic!("B inbox closed before message"),
+            }
+        }
+    })
+    .await
+    .expect("B should receive the bulk message within 10s");
+
+    assert_eq!(got, payload, "bytes must arrive intact");
+    let decoded = MeshMsg::decode(&mut &got[..]).expect("decodes as MeshMsg");
     assert!(matches!(decoded, MeshMsg::Want { .. }), "got {decoded:?}");
 }

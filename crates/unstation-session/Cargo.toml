@@ -1,0 +1,17 @@
+# Orchestration layer: ties unstation-chain (signaling) + transport-libdc (WebRTC)
+# into the MeshNode. Excluded from the engine workspace (pulls the SDK via unstation-chain).
+[package]
+name = "unstation-session"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+unstation-core = { path = "../unstation-core" }
+unstation-chain = { path = "../unstation-chain" }
+transport-libdc = { path = "../transport-libdc" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schnorrkel = "0.11"
+log = "0.4"

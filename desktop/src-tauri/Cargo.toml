@@ -1,0 +1,42 @@
+[package]
+name = "unstation-desktop"
+version = "0.0.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Unstation — decentralized P2P live streaming (desktop)."
+default-run = "unstation-desktop"
+
+[lib]
+name = "unstation_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+# The real engine.
+unstation-core = { path = "../../crates/unstation-core" }
+transport-libdc = { path = "../../crates/transport-libdc" }
+hls-server = { path = "../../crates/hls-server" }
+segmenter = { path = "../../infra/segmenter" }
+bytes = "1"
+
+# Real chain integration: discovery + SDP-over-statement signaling + WebRTC
+# orchestration, and the UserAgent Kit wallet that signs statement-store writes.
+unstation-session = { path = "../../crates/unstation-session" }
+useragent-native = { package = "useragent-native", path = "../../../useragent-kit/crates/host-native" }
+# Enable the testnet allowance helper crate-wide (Cargo feature unification) so a
+# fresh statement-store key auto-provisions a metered allowance on Paseo.
+useragent-chain = { package = "useragent-chain", path = "../../../useragent-kit/crates/host-chain", features = ["testnet-provisioning"] }
+schnorrkel = "0.11"
+bip39 = { version = "2", features = ["rand"] }
+
+[features]
+# Enables the system webview private API needed for native macOS window vibrancy.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

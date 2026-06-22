@@ -9,3 +9,8 @@ description = "Localhost HLS re-server: serves a dynamically-generated media pla
 unstation-core = { path = "../unstation-core" }
 bytes.workspace = true
 tiny_http = "0.12"
+
+[dev-dependencies]
+segmenter = { path = "../../infra/segmenter" }
+tokio.workspace = true
+tempfile = "3"

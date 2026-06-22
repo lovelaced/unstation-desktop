@@ -1,14 +1,37 @@
+# --- Rust build artifacts ---
+# Workspace root, the excluded standalone crates (unstation-chain, unstation-session),
+# the Tauri app, and the fuzz crate all produce their own target/ dirs.
 /target
-**/*.rs.bk
-Cargo.lock.bak
-.DS_Store
-
-# Tauri / web
+crates/*/target
 desktop/src-tauri/target
-desktop/node_modules
-desktop/dist
-
-# fuzz
 crates/unstation-core/fuzz/target
 crates/unstation-core/fuzz/corpus
 crates/unstation-core/fuzz/artifacts
+**/*.rs.bk
+Cargo.lock.bak
+
+# --- Node / web ---
+node_modules/
+dist/
+*.tsbuildinfo
+
+# --- Secrets & environment ---
+.env
+.env.*
+!.env.example
+
+# --- Editors & OS ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# --- Logs & scratch ---
+*.log
+/scratch/
+/tmp/
+
+# --- Local design docs ---
+# Only the README is published; specs, notes, and other markdown stay local.
+*.md
+!README.md

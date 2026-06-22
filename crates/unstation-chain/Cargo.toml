@@ -1,0 +1,17 @@
+# Real chain integration, kept OUT of the engine workspace (like desktop/src-tauri)
+# so `cargo test --workspace` on the deterministic simulator stays SDK-free and fast.
+[package]
+name = "unstation-chain"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+unstation-core = { path = "../unstation-core" }
+# The Parity UserAgent Kit native facade (statement store, wallet, VRF, bulletin).
+# Mirrors truhost/desktop/src-tauri's dependency on the same crate.
+useragent-native = { package = "useragent-native", path = "../../../useragent-kit/crates/host-native" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros"] }
+parity-scale-codec = { version = "3", features = ["derive"] }
+schnorrkel = "0.11"
+log = "0.4"

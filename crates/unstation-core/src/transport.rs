@@ -5,8 +5,9 @@
 //! (connections + inbound bytes). Implemented by `transport-libdc` (D2/native) and
 //! by the in-memory [`crate::transport_mem`] loopback used in tests/sim.
 
-use crate::types::PeerId;
+use crate::types::{PeerId, SegmentId, Seq};
 use crate::BoxFuture;
+use bytes::Bytes;
 use std::sync::Arc;
 
 /// Session Description Protocol payload (raw bytes, carried over signaling).
@@ -32,6 +33,12 @@ pub enum EngineEvent {
     PeerConnected { peer: PeerId, link: Arc<dyn Link> },
     Inbound { peer: PeerId, channel: Channel, bytes: Vec<u8> },
     PeerDisconnected { peer: PeerId },
+    /// Publisher-side, locally injected: the segmenter produced a content-addressed
+    /// segment. The node stores it and starts serving it to the mesh.
+    Produced { seq: Seq, id: SegmentId, bytes: Bytes },
+    /// Viewer-side, locally injected: the signed live-edge announced a segment's
+    /// content id, so the node knows it exists and how to verify it (TECH_SPEC §6.4).
+    LiveEdge { seq: Seq, id: SegmentId },
     /// Scheduler tick (also emitted by a timer in production).
     Tick,
     Stop,

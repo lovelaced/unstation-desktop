@@ -37,6 +37,8 @@ pub struct NodeStats {
     pub delivered: usize,
     pub peer_bytes: u64,
     pub hash_failures: u64,
+    /// Connected neighbors in the peer table.
+    pub peers: usize,
     /// Peers learned via in-mesh `PeerGossip` (no statement-store writes).
     pub known_peers: usize,
 }
@@ -95,6 +97,18 @@ impl MeshNode {
         Self::with_engine(me, eng, sink, segment_ids)
     }
 
+    /// A publisher fed **live** (no preloaded VOD): segments arrive as
+    /// [`EngineEvent::Produced`] from the segmenter, and the node serves them to
+    /// the mesh as they land.
+    pub fn new_live_publisher(
+        me: PeerId,
+        cfg: MeshConfig,
+        seg_bytes: u64,
+        sink: Arc<dyn MediaSink>,
+    ) -> Self {
+        Self::with_engine(me, MeshEngine::new(cfg, seg_bytes), sink, HashMap::new())
+    }
+
     fn with_engine(
         me: PeerId,
         eng: MeshEngine,
@@ -148,6 +162,7 @@ impl MeshNode {
         }
         self.stats.delivered = self.eng.local.count();
         self.stats.known_peers = self.known_peers.len();
+        self.stats.peers = self.eng.peers.len();
         self.stats
     }
 
@@ -163,6 +178,18 @@ impl MeshNode {
                 self.eng.peers.remove(&peer);
             }
             EngineEvent::Inbound { peer, channel, bytes } => self.on_inbound(peer, channel, &bytes),
+            EngineEvent::Produced { seq, id, bytes } => {
+                // Publisher pipeline produced a segment — store it and start serving.
+                self.eng.store.insert(seq, id, bytes);
+                self.eng.local.set(seq);
+                self.segment_ids.insert(seq, id);
+                self.eng.head_seq = self.eng.head_seq.max(seq);
+            }
+            EngineEvent::LiveEdge { seq, id } => {
+                // Learn that a segment exists + its content id (so we can fetch + verify).
+                self.segment_ids.insert(seq, id);
+                self.eng.head_seq = self.eng.head_seq.max(seq);
+            }
             EngineEvent::Tick => self.on_tick(),
             EngineEvent::Stop => {}
         }
@@ -181,6 +208,14 @@ impl MeshNode {
     }
 
     fn on_tick(&mut self) {
+        // Follow the player's play head so the picker's window (panic/mid/prefetch
+        // zones) tracks real playback. The localhost HLS server advances it as the
+        // viewer fetches segments; a publisher/seed sink reports 0 (no-op here).
+        let head = self.sink.on_play_head();
+        if head > self.eng.play_seq {
+            self.eng.play_seq = head;
+        }
+
         // Advertise our current buffer map.
         let bm = MeshMsg::BufferMap {
             base_seq: self.eng.local.base(),

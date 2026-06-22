@@ -1,0 +1,257 @@
+//! Real CMAF/fMP4 segmenter (TECH_SPEC §3.1, IMPLEMENTATION_SPEC §13.1).
+//!
+//! Drives `ffmpeg` to produce low-latency H.264 CMAF — a shared `init.mp4` plus
+//! numbered `seg_NNNNN.m4s` fragments — then content-addresses each with
+//! `blake2b256`. These are exactly the bytes that flow through the mesh; once a
+//! viewer reassembles + verifies them and the HLS re-server serves them, the
+//! platform player decodes **real video**.
+//!
+//! Two ways to feed it, both standard:
+//!   - [`produce`] / [`demo_stream`] — batch (test pattern or a file) for the
+//!     local demo + tests.
+//!   - [`spawn`] with [`Source::RtmpListen`] — **the publisher's live ingest**:
+//!     ffmpeg listens for an incoming RTMP publish and segments it as it arrives.
+//!     This is the contribution path real encoders use — point **OBS** (Settings →
+//!     Stream → Service: *Custom*, Server: `rtmp://127.0.0.1:<port>/live`, Stream
+//!     Key: `<key>`) straight at it; no plugins, no special workflow.
+
+use bytes::Bytes;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use unstation_core::crypto::segment_id;
+use unstation_core::types::{SegmentId, Seq};
+
+/// A content-addressed CMAF segment.
+pub struct Segment {
+    pub seq: Seq,
+    pub id: SegmentId,
+    pub bytes: Bytes,
+}
+
+/// A loaded CMAF stream: the init segment + ordered media fragments.
+pub struct Cmaf {
+    pub init: Bytes,
+    pub segments: Vec<Segment>,
+}
+
+/// What to encode.
+pub enum Source<'a> {
+    /// Built-in test pattern (bars + tone) of `secs` seconds — demo + tests.
+    TestPattern { secs: u32 },
+    /// Transcode an existing media file.
+    File(&'a Path),
+    /// **Live ingest:** listen for an incoming RTMP publisher (OBS / any encoder)
+    /// at `url` (e.g. from [`rtmp_url`]) and segment it as it arrives.
+    RtmpListen { url: &'a str },
+}
+
+/// Is ffmpeg available on this machine?
+pub fn ffmpeg_available() -> bool {
+    Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// The publish URL to hand an encoder for a local ingest `port` + stream `key`.
+/// In OBS this splits into Server `rtmp://127.0.0.1:<port>/live` + Stream Key `<key>`.
+pub fn rtmp_url(port: u16, key: &str) -> String {
+    format!("rtmp://127.0.0.1:{port}/live/{key}")
+}
+
+/// Build the ffmpeg command for `source` → CMAF in `out_dir`.
+fn ffmpeg_command(source: &Source, out_dir: &Path, seg_secs: u32) -> Command {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-y", "-hide_banner", "-loglevel", "error"]);
+
+    let live = match source {
+        Source::TestPattern { secs } => {
+            cmd.args(["-f", "lavfi", "-i"]);
+            cmd.arg(format!("testsrc=size=640x360:rate=30:duration={secs}"));
+            cmd.args(["-f", "lavfi", "-i"]);
+            cmd.arg(format!("sine=frequency=440:duration={secs}"));
+            false
+        }
+        Source::File(p) => {
+            cmd.arg("-re").arg("-i").arg(p);
+            false
+        }
+        Source::RtmpListen { url } => {
+            // ffmpeg acts as the RTMP server; accepts a standard publisher (OBS).
+            cmd.args(["-listen", "1", "-i", url]);
+            true
+        }
+    };
+
+    cmd.args([
+        "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+        "-g", "30", "-bf", "0", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "96k",
+        "-f", "hls",
+        "-hls_time", &seg_secs.to_string(),
+        "-hls_segment_type", "fmp4",
+        "-hls_fmp4_init_filename", "init.mp4",
+        "-hls_list_size", "0",
+        "-hls_segment_filename",
+    ]);
+    cmd.arg(out_dir.join("seg_%05d.m4s"));
+    if !live {
+        // Finite sources get a closed VOD playlist; live ingest stays open-ended.
+        cmd.args(["-hls_playlist_type", "vod"]);
+    }
+    cmd.arg(out_dir.join("live.m3u8"));
+    cmd
+}
+
+/// Produce CMAF into `out_dir` and block until the (finite) source completes.
+/// Use [`spawn`] for live ingest. Low-latency encode (no B-frames, 1 s GOP).
+pub fn produce(source: &Source, out_dir: &Path, seg_secs: u32) -> std::io::Result<()> {
+    std::fs::create_dir_all(out_dir)?;
+    let status = ffmpeg_command(source, out_dir, seg_secs).status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!("ffmpeg exited with {status}")));
+    }
+    Ok(())
+}
+
+/// A running ffmpeg segmenter (live ingest). Drop or [`stop`](SegmenterProcess::stop)
+/// to end it.
+pub struct SegmenterProcess {
+    child: Child,
+    pub out_dir: PathBuf,
+}
+
+impl SegmenterProcess {
+    /// True while ffmpeg is still running (a publisher is connected / awaited).
+    pub fn running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+    /// Stop the segmenter.
+    pub fn stop(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Spawn ffmpeg to segment `source` into `out_dir` live; returns immediately.
+/// For [`Source::RtmpListen`] ffmpeg binds the port and waits for a publisher.
+pub fn spawn(source: &Source, out_dir: &Path, seg_secs: u32) -> std::io::Result<SegmenterProcess> {
+    std::fs::create_dir_all(out_dir)?;
+    let mut cmd = ffmpeg_command(source, out_dir, seg_secs);
+    cmd.stdin(Stdio::null());
+    let child = cmd.spawn()?;
+    Ok(SegmenterProcess { child, out_dir: out_dir.to_path_buf() })
+}
+
+/// Read the init segment if present yet.
+pub fn load_init(out_dir: &Path) -> Option<Bytes> {
+    std::fs::read(out_dir.join("init.mp4")).ok().map(Bytes::from)
+}
+
+/// Load every `*.m4s` fragment in order, content-addressed. Works on a live dir
+/// too (a snapshot of whatever's been written so far).
+pub fn load(out_dir: &Path) -> std::io::Result<Cmaf> {
+    let init = load_init(out_dir).ok_or_else(|| std::io::Error::other("no init.mp4 yet"))?;
+    let segments = load_segments_from(out_dir, 0)?;
+    Ok(Cmaf { init, segments })
+}
+
+/// Load fragments with sequence >= `from` (the live tail). The publisher loop
+/// calls this each tick to feed newly-written fragments into the mesh.
+pub fn load_segments_from(out_dir: &Path, from: Seq) -> std::io::Result<Vec<Segment>> {
+    let mut paths: Vec<_> = std::fs::read_dir(out_dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("m4s"))
+        .collect();
+    paths.sort();
+    let mut out = Vec::new();
+    for (i, p) in paths.iter().enumerate() {
+        let seq = i as Seq;
+        if seq < from {
+            continue;
+        }
+        let bytes = Bytes::from(std::fs::read(p)?);
+        out.push(Segment { seq, id: segment_id(&bytes), bytes });
+    }
+    Ok(out)
+}
+
+/// Convenience: produce + load a test-pattern stream in one call (batch).
+pub fn demo_stream(out_dir: &Path, secs: u32, seg_secs: u32) -> std::io::Result<Cmaf> {
+    produce(&Source::TestPattern { secs }, out_dir, seg_secs)?;
+    load(out_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn probe_is_h264(init: &[u8], seg: &[u8], dir: &Path) -> bool {
+        let probe = dir.join("probe.mp4");
+        let mut buf = init.to_vec();
+        buf.extend_from_slice(seg);
+        std::fs::write(&probe, &buf).unwrap();
+        let out = Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0"])
+            .arg(&probe)
+            .output()
+            .expect("ffprobe runs");
+        String::from_utf8_lossy(&out.stdout).contains("h264")
+    }
+
+    #[test]
+    fn produces_real_h264_cmaf() {
+        if !ffmpeg_available() {
+            eprintln!("ffmpeg not found — skipping");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cmaf = demo_stream(dir.path(), 4, 1).expect("produce CMAF");
+        assert!(!cmaf.init.is_empty());
+        assert!(cmaf.segments.len() >= 3, "got {}", cmaf.segments.len());
+        let mut ids: Vec<_> = cmaf.segments.iter().map(|s| s.id.0).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), cmaf.segments.len(), "unique content ids");
+        assert!(probe_is_h264(&cmaf.init, &cmaf.segments[0].bytes, dir.path()));
+    }
+
+    #[test]
+    fn rtmp_ingest_from_a_standard_publisher() {
+        if !ffmpeg_available() {
+            eprintln!("ffmpeg not found — skipping");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let url = rtmp_url(21937, "stream");
+
+        // Publisher's live ingest: ffmpeg listens for an OBS-style RTMP publish.
+        let seg = spawn(&Source::RtmpListen { url: &url }, dir.path(), 1).unwrap();
+        std::thread::sleep(Duration::from_millis(500)); // let the listener bind
+
+        // A standard RTMP client — exactly what OBS sends. Push ~5 s and exit.
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner", "-loglevel", "error", "-re",
+                "-f", "lavfi", "-i", "testsrc=size=640x360:rate=30:duration=5",
+                "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+                "-g", "30", "-f", "flv", &url,
+            ])
+            .status()
+            .expect("publisher runs");
+        assert!(status.success(), "OBS-style RTMP publish should be accepted");
+
+        std::thread::sleep(Duration::from_millis(800)); // flush the last fragment
+        seg.stop();
+
+        let cmaf = load(dir.path()).expect("CMAF written from the ingest");
+        assert!(!cmaf.init.is_empty(), "init.mp4 written");
+        assert!(cmaf.segments.len() >= 3, "live fragments written, got {}", cmaf.segments.len());
+        assert!(
+            probe_is_h264(&cmaf.init, &cmaf.segments[0].bytes, dir.path()),
+            "ingested media decodes as H.264"
+        );
+    }
+}

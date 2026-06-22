@@ -1,0 +1,93 @@
+name: Build macOS DMG
+
+# Builds a universal (Apple Silicon + Intel) macOS .dmg you can download and
+# install on another Mac to test over a LAN. See the README → "Test on a second
+# Mac over your LAN".
+#
+# Run it two ways:
+#   • Actions tab → "Build macOS DMG" → Run workflow   (DMG appears as a build artifact)
+#   • Push a tag:  git tag v0.0.1 && git push --tags    (DMG is attached to a GitHub Release)
+#
+# Required once, in repo Settings:
+#   • Secret  USERAGENT_KIT_TOKEN — a GitHub PAT with read access to the UserAgent Kit SDK repo.
+#   • (optional) Variables USERAGENT_KIT_REPO / USERAGENT_KIT_REF if the SDK lives elsewhere
+#     than paritytech/useragent-kit @ main.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build-dmg:
+    runs-on: macos-14 # Apple Silicon runner; cross-compiles the Intel slice too.
+    timeout-minutes: 90
+    steps:
+      - name: Check out the app
+        uses: actions/checkout@v4
+        with:
+          path: unstation-desktop
+
+      # The desktop app depends on the UserAgent Kit Rust SDK by relative path
+      # (../../../useragent-kit). Check it out as a sibling so cargo resolves it.
+      - name: Check out the UserAgent Kit SDK
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.USERAGENT_KIT_REPO || 'paritytech/useragent-kit' }}
+          ref: ${{ vars.USERAGENT_KIT_REF || 'main' }}
+          token: ${{ secrets.USERAGENT_KIT_TOKEN }}
+          path: useragent-kit
+
+      - name: Install Rust (stable + universal targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: unstation-desktop/desktop/src-tauri
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: unstation-desktop/desktop/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: unstation-desktop/desktop
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the universal macOS DMG
+        working-directory: unstation-desktop/desktop
+        # `tauri build` runs the frontend build (beforeBuildCommand) and bundles
+        # an unsigned .app + .dmg. Unsigned is fine for self-testing; see the
+        # README for the one-time Gatekeeper bypass on the other Mac.
+        run: pnpm tauri build --target universal-apple-darwin
+
+      - name: Locate the DMG
+        id: dmg
+        run: |
+          DMG=$(find unstation-desktop/desktop/src-tauri/target/universal-apple-darwin/release/bundle/dmg -name "*.dmg" | head -1)
+          if [ -z "$DMG" ]; then echo "no .dmg produced"; exit 1; fi
+          echo "path=$DMG" >> "$GITHUB_OUTPUT"
+          echo "Built $DMG"
+
+      - name: Upload the DMG as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Unstation-macOS-universal
+          path: ${{ steps.dmg.outputs.path }}
+          if-no-files-found: error
+
+      - name: Attach the DMG to the release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.dmg.outputs.path }}
