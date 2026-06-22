@@ -1,0 +1,69 @@
+# git-cliff configuration — generates the GitHub Release notes.
+#
+# Notes are split into a USER-FACING section (what changed for people using the app)
+# and a collapsed TECHNICAL section below. Categorization is driven by Conventional
+# Commit prefixes, so write commits like:
+#   feat: watch a stream by name        -> "New & improved"
+#   fix: reconnect after a dropped peer  -> "Fixes"
+#   perf: ...                            -> "Performance"
+#   refactor:/docs:/test:/chore:/ci:     -> Technical details (collapsed)
+# Anything else still shows up under "Other changes" in the technical section.
+
+[changelog]
+header = ""
+body = """
+{% if version %}## {{ version }}{% if timestamp %} — {{ timestamp | date(format="%Y-%m-%d") }}{% endif %}{% else %}## Unreleased{% endif %}
+{% if version and previous and previous.version %}
+_Changes since {{ previous.version }}._
+{% endif %}
+{% for group, commits in commits | group_by(attribute="group") %}\
+{% if group is starting_with("0") or group is starting_with("1") or group is starting_with("2") %}
+### {{ group | split(pat="@@") | last }}
+{% for commit in commits %}\
+- {{ commit.message | split(pat="\n") | first | upper_first }}{% if commit.scope %} _({{ commit.scope }})_{% endif %}
+{% endfor %}\
+{% endif %}\
+{% endfor %}
+{% set_global has_tech = false %}\
+{% for group, commits in commits | group_by(attribute="group") %}\
+{% if group is starting_with("8") or group is starting_with("9") %}{% set_global has_tech = true %}{% endif %}\
+{% endfor %}\
+{% if has_tech %}
+<details>
+<summary>🔧 Technical details</summary>
+{% for group, commits in commits | group_by(attribute="group") %}\
+{% if group is starting_with("8") or group is starting_with("9") %}
+#### {{ group | split(pat="@@") | last }}
+{% for commit in commits %}\
+- {{ commit.message | split(pat="\n") | first | upper_first }} ({{ commit.id | truncate(length=7, end="") }})
+{% endfor %}\
+{% endif %}\
+{% endfor %}
+</details>
+{% endif %}
+"""
+footer = """
+
+---
+📦 **Install:** download the `.dmg` below and drag **Unstation** to Applications. On first launch of an unsigned build, clear the quarantine flag once: `xattr -dr com.apple.quarantine /Applications/Unstation.app`. To try it peer-to-peer, install on two Macs on the same Wi-Fi/LAN — see the README's "Test on a second Mac over your LAN".
+"""
+trim = true
+
+[git]
+conventional_commits = true
+# Keep non-conventional commits too (they land under "Other changes"), so the log is never empty.
+filter_unconventional = false
+filter_commits = false
+protect_breaking_commits = false
+sort_commits = "newest"
+tag_pattern = "v[0-9]*"
+commit_parsers = [
+  { message = "^feat", group = "0@@🚀 New & improved" },
+  { message = "^fix", group = "1@@🐛 Fixes" },
+  { message = "^perf", group = "2@@⚡ Performance" },
+  { message = "^refactor", group = "8@@Refactoring" },
+  { message = "^docs?", group = "8@@Documentation" },
+  { message = "^test", group = "8@@Tests" },
+  { message = "^(build|ci|chore|deps|bump|release)", group = "9@@Build & tooling" },
+  { message = "^.*", group = "9@@Other changes" },
+]

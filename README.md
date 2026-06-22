@@ -4,7 +4,7 @@
 
 *Broadcast and watch live video peer-to-peer — no servers, no CDN, no central point of failure.*
 
-![License](https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square)
+![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Windows%20%C2%B7%20Linux-lightgrey?style=flat-square)
 ![Status](https://img.shields.io/badge/status-experimental-orange?style=flat-square)
 
@@ -94,7 +94,7 @@ is covered by `cargo test -p hls-server --test go_live -- --ignored`.
 ## Test on a second Mac over your LAN
 
 Unstation is peer-to-peer, so the real test is two machines. The
-[`Build macOS DMG`](.github/workflows/release-macos.yml) workflow produces a universal
+[`Release macOS DMG`](.github/workflows/release-macos.yml) workflow produces a universal
 (Apple Silicon + Intel) `.dmg` you can install on a second Mac.
 
 ### 1. Build the DMG (GitHub Actions)
@@ -106,11 +106,10 @@ One-time setup in **Settings → Secrets and variables → Actions**:
 - Optional variables **`USERAGENT_KIT_REPO`** / **`USERAGENT_KIT_REF`** if the SDK isn't at
   `paritytech/useragent-kit@main`.
 
-Then build it either way:
-
-- **Actions → "Build macOS DMG" → Run workflow**, then download the `Unstation-macOS-universal`
-  artifact when the run finishes, **or**
-- **Push a tag** — `git tag v0.0.1 && git push --tags` — and the `.dmg` is attached to a GitHub Release.
+Then in **Actions → "Release macOS DMG" → Run workflow**, type a version tag (e.g. `v0.1.0`)
+and run it. The workflow creates the tag, builds the universal `.dmg`, writes user-facing release
+notes (with a collapsed "Technical details" section), and publishes a **GitHub Release** with the
+`.dmg` attached. Download the `.dmg` from the release page (or from the run's build artifact).
 
 ### 2. Install on both Macs
 
@@ -181,4 +180,4 @@ simulator must stay green.
 
 ## License
 
-[GPL-3.0-or-later](https://www.gnu.org/licenses/gpl-3.0).
+[AGPL-3.0-or-later](LICENSE).
