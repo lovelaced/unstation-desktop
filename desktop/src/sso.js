@@ -11,6 +11,14 @@ import { createPappAdapter } from "@novasamatech/host-papp";
 import { createLazyClient, createPapiStatementStoreAdapter } from "@novasamatech/statement-store";
 import { getWsProvider } from "@polkadot-api/ws-provider";
 import { onHostPappDebugMessage } from "@novasamatech/host-papp/debug";
+// For extracting the paired statement-store slot signing key (see
+// statementStoreSlotKey) — same primitives host-papp uses to encrypt it at rest.
+import { blake2b } from "@noble/hashes/blake2.js";
+import { gcm } from "@noble/ciphers/aes.js";
+
+// MUST match the `appId` passed to createPappAdapter below — it's both the
+// host-papp storage prefix and the AES salt for the allowance blob.
+const APP_ID = "unstation";
 
 // The desktop MUST subscribe to the SAME statement-store (People) chain the
 // Polkadot app posts its pairing handshake to. If they differ, the phone links
@@ -59,7 +67,7 @@ export function getAdapter() {
     );
     const statementStore = createPapiStatementStoreAdapter(lazyClient);
     adapter = createPappAdapter({
-      appId: "unstation",
+      appId: APP_ID,
       // HandshakeMetadata fields are exact: hostName / hostVersion / hostIcon /
       // platformType / platformVersion (anything else is dropped → nameless device).
       hostMetadata: {
@@ -125,6 +133,76 @@ export function awaitSession(timeoutMs = 2500) {
     }
     setTimeout(() => finish(false), timeoutMs);
   });
+}
+
+// ---------------------------------------------------------------------------
+// Paired statement-store signer extraction
+//
+// At pairing, the phone grants this device's per-app slot account an on-chain
+// statement-store *allowance* and host-papp persists that slot signing key
+// encrypted in localStorage. host-papp only vends a `StatementProver` (a sign
+// callback), not the raw key — but our mesh's chain writes happen in Rust, which
+// needs the key itself. So we read + decrypt the stored slot key here, mirroring
+// host-papp's exact scheme (AES-GCM, key = blake2b(appId,16), nonce =
+// blake2b("nonce",32); plaintext = SCALE Vector<{productId:str, resource:Enum,
+// slotAccountKey:Bytes}>), and hand it to Rust via `set_chain_identity`.
+//
+// NOTE: this depends on host-papp@0.8.10's internal storage format; revisit on
+// upgrade. Returns a Uint8Array (the slot secret) or null if not present.
+const strToBytes = (s) => new TextEncoder().encode(s);
+function fromHex(h) {
+  const s = h.startsWith("0x") ? h.slice(2) : h;
+  const out = new Uint8Array(s.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(s.substr(i * 2, 2), 16);
+  return out;
+}
+// Minimal SCALE compact-integer decode (modes 0–2 cover our sizes).
+function scaleCompact(buf, pos) {
+  const b0 = buf[pos], mode = b0 & 3;
+  if (mode === 0) return [b0 >>> 2, pos + 1];
+  if (mode === 1) return [((buf[pos] | (buf[pos + 1] << 8)) >>> 0) >>> 2, pos + 2];
+  if (mode === 2) {
+    const v = (buf[pos] + buf[pos + 1] * 256 + buf[pos + 2] * 65536 + buf[pos + 3] * 16777216);
+    return [Math.floor(v / 4), pos + 4];
+  }
+  const len = (b0 >>> 2) + 4; let v = 0;
+  for (let i = 0; i < len; i++) v += buf[pos + 1 + i] * Math.pow(256, i);
+  return [v, pos + 1 + len];
+}
+function parseAllowances(bytes) {
+  let pos = 0, n;
+  [n, pos] = scaleCompact(bytes, pos);
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    let plen; [plen, pos] = scaleCompact(bytes, pos);
+    const productId = new TextDecoder().decode(bytes.slice(pos, pos + plen)); pos += plen;
+    const resTag = bytes[pos]; pos += 1; // Enum: 0=bulletin, 1=statementStore
+    let klen; [klen, pos] = scaleCompact(bytes, pos);
+    const slotAccountKey = bytes.slice(pos, pos + klen); pos += klen;
+    out.push({ productId, resource: resTag === 1 ? "statementStore" : "bulletin", slotAccountKey });
+  }
+  return out;
+}
+
+/** The paired statement-store slot signing key (Uint8Array), or null. */
+export function statementStoreSlotKey() {
+  try {
+    const sessions = getAdapter().sessions.sessions.read();
+    if (!sessions || !sessions.length) return null;
+    const sessionId = sessions[0].id;
+    const lsKey = `polkadot_${APP_ID}_AllowanceKeys_${sessionId}`;
+    const stored = (typeof localStorage !== "undefined") ? localStorage.getItem(lsKey) : null;
+    if (!stored) { console.warn("[sso] no allowance blob at", lsKey); return null; }
+    const aes = gcm(blake2b(strToBytes(APP_ID), { dkLen: 16 }), blake2b(strToBytes("nonce"), { dkLen: 32 }));
+    const plain = aes.decrypt(fromHex(stored));
+    const entry = parseAllowances(plain).find((e) => e.resource === "statementStore");
+    if (!entry) { console.warn("[sso] no statementStore allowance entry yet"); return null; }
+    console.log("[sso] statement-store slot key found:", entry.slotAccountKey.length, "bytes, product", entry.productId);
+    return entry.slotAccountKey;
+  } catch (e) {
+    console.error("[sso] statementStoreSlotKey failed", e);
+    return null;
+  }
 }
 
 /**

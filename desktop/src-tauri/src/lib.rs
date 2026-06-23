@@ -16,9 +16,10 @@ use bytes::Bytes;
 use hls_server::HlsServer;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::task::JoinHandle;
 use unstation_core::config::{MeshConfig, Mode, Role};
@@ -39,6 +40,10 @@ struct AppState {
     signed_in: Mutex<bool>,
     watch: Mutex<Option<WatchSession>>,
     publish: Mutex<Option<PublishSession>>,
+    /// True once the statement store has been initialized with the paired
+    /// (allowance-backed) identity via `set_chain_identity`. Publishing/watching
+    /// requires this — an unprovisioned key can't write to the chain.
+    chain_ready: Mutex<bool>,
 }
 
 /// An active watch: the HLS server feeding the player, the viewer node's inbox,
@@ -47,8 +52,10 @@ struct AppState {
 struct WatchSession {
     _hls: HlsServer,
     node_tx: UnboundedSender<EngineEvent>,
-    _session: Session,
+    session: Session,
     tasks: Vec<JoinHandle<()>>,
+    /// Retained so the UI can rebuild the player when navigating back to it.
+    info: WatchInfo,
 }
 
 /// An active publish: RTMP ingest, the self-preview HLS, the feeder task, the
@@ -59,7 +66,14 @@ struct PublishSession {
     feeder: JoinHandle<()>,
     stats: JoinHandle<()>,
     pub_tx: UnboundedSender<EngineEvent>,
-    _session: Session,
+    session: Session,
+    /// Canonical stream name — lets `start_publish` re-attach instead of restarting.
+    name: String,
+    /// Retained so the UI can rebuild the Go-Live console when navigating back.
+    info: PublishInfo,
+    /// Whether fresh fragments are arriving right now (the feeder updates this);
+    /// read by `publish_status` so a re-attaching UI gets the true live state.
+    live: Arc<AtomicBool>,
 }
 
 /// A no-op sink for nodes that only cache + serve (publisher/seed), never render.
@@ -109,11 +123,43 @@ struct PublishHintMsg {
     message: String,
 }
 
+/// Live/idle state of the publisher, derived from whether fresh fragments are
+/// actually arriving — NOT from the ffmpeg process state, so the UI matches the
+/// video the viewer would see.
+#[derive(Serialize, Clone)]
+struct PublishStateMsg {
+    live: bool,
+}
+
+/// Chain/network status surfaced to the UI (so failures like a missing statement-
+/// store allowance aren't silent). `state` ∈ {"connecting","ready","error"}.
+#[derive(Serialize, Clone)]
+struct MeshStatusMsg {
+    state: String,
+    detail: String,
+}
+
 #[derive(Serialize, Clone)]
 struct PublishInfo {
     ingest_server: String,
     stream_key: String,
     hls_url: String,
+}
+
+/// Snapshot of the current publish session, for the UI to re-attach the console.
+#[derive(Serialize, Clone)]
+struct PublishStatus {
+    info: PublishInfo,
+    name: String,
+    live: bool,
+    viewers: usize,
+}
+
+/// Snapshot of the current watch session, for the UI to re-attach the player.
+#[derive(Serialize, Clone)]
+struct WatchStatus {
+    info: WatchInfo,
+    peers: usize,
 }
 
 fn cfg(mode: Mode, role: Role) -> MeshConfig {
@@ -174,16 +220,6 @@ fn stream_id_from(name: &str) -> StreamId {
 /// (`~/Library/Application Support/…` on macOS, `%APPDATA%` on Windows,
 /// `~/.local/share/…` on Linux). The SDK persists the signing key here, so the
 /// host keeps the same identity — and stays signed in — across launches.
-fn ss_key_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("app data dir: {e}"))?
-        .join("statement-store");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create key dir: {e}"))?;
-    Ok(dir)
-}
-
 /// The host OS (`macos` / `windows` / `linux`) — lets the UI choose native window
 /// chrome per platform instead of assuming macOS.
 #[tauri::command]
@@ -222,6 +258,9 @@ async fn start_watch(
     state: State<'_, AppState>,
     target: String,
 ) -> Result<WatchInfo, String> {
+    if !*state.chain_ready.lock().unwrap() {
+        return Err("Sign in with the Polkadot app to watch — peers need a verified identity.".into());
+    }
     let stream = stream_id_from(&target);
 
     // Localhost HLS re-server → the webview <video> plays from here.
@@ -233,8 +272,7 @@ async fn start_watch(
     let (view_tx, view_rx) = unbounded_channel::<EngineEvent>();
 
     // Boot chain signaling + WebRTC for this stream.
-    let key_dir = ss_key_dir(&app)?;
-    let session = Session::start(stream, 1, stun(), key_dir, view_tx.clone())?;
+    let session = Session::start(stream, 1, stun(), view_tx.clone())?;
 
     // Real viewer node: starts with no known segments; the live-edge poller feeds
     // it `LiveEdge { seq, id }` so it knows what to fetch and how to verify it.
@@ -289,20 +327,22 @@ async fn start_watch(
         }));
     }
 
-    *state.watch.lock().unwrap() = Some(WatchSession {
-        _hls: hls,
-        node_tx: view_tx,
-        _session: session,
-        tasks,
-    });
-
-    Ok(WatchInfo {
+    let info = WatchInfo {
         hls_url,
         stream_id: resolve_stream(target.clone()),
         publisher: target,
         peers: 0,
         rho: 0,
-    })
+    };
+    *state.watch.lock().unwrap() = Some(WatchSession {
+        _hls: hls,
+        node_tx: view_tx,
+        session,
+        tasks,
+        info: info.clone(),
+    });
+
+    Ok(info)
 }
 
 #[tauri::command]
@@ -316,6 +356,67 @@ fn stop_watch(state: State<'_, AppState>) {
     }
 }
 
+/// Bridge the QR-paired statement-store allowance to the Rust signer. The JS side
+/// extracts the per-app **slot signing key** (which the phone granted an on-chain
+/// allowance at pairing) and hands it here; we initialize the process-global
+/// statement store with it so every mesh write (presence/SDP/edge) is allowance-
+/// backed. Without this, a fresh unprovisioned key is rejected `noAllowance` and
+/// nothing is discoverable. Idempotent (the store is process-global; init once).
+#[tauri::command]
+fn set_chain_identity(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    slot_secret: Vec<u8>,
+) -> Result<(), String> {
+    if *state.chain_ready.lock().unwrap() {
+        return Ok(());
+    }
+    unstation_chain::init_statement_store_from_secret(&slot_secret)?;
+    *state.chain_ready.lock().unwrap() = true;
+    log::info!("statement store initialized with paired identity");
+    // Surface readiness (the subscription connects in the background) to the UI.
+    let appc = app.clone();
+    std::thread::spawn(move || {
+        let ok = unstation_chain::wait_ready(Duration::from_secs(20));
+        let _ = appc.emit(
+            "mesh-status",
+            MeshStatusMsg {
+                state: if ok { "ready" } else { "connecting" }.into(),
+                detail: if ok {
+                    "Connected to the network.".into()
+                } else {
+                    "Still connecting to the network…".into()
+                },
+            },
+        );
+    });
+    Ok(())
+}
+
+/// Is a publish session running, and what are its details? Lets the UI rebuild the
+/// Go-Live console on tab-back/relaunch without touching the running stream.
+#[tauri::command]
+fn publish_status(state: State<'_, AppState>) -> Option<PublishStatus> {
+    let g = state.publish.lock().unwrap();
+    g.as_ref().map(|s| PublishStatus {
+        info: s.info.clone(),
+        name: s.name.clone(),
+        live: s.live.load(Ordering::Relaxed),
+        viewers: s.session.peer_count(),
+    })
+}
+
+/// Is a watch session running, and what are its details? Lets the UI rebuild the
+/// player on tab-back without restarting it.
+#[tauri::command]
+fn watch_status(state: State<'_, AppState>) -> Option<WatchStatus> {
+    let g = state.watch.lock().unwrap();
+    g.as_ref().map(|s| WatchStatus {
+        info: s.info.clone(),
+        peers: s.session.peer_count(),
+    })
+}
+
 /// Go Live: start the local RTMP ingest (point OBS here), run a live publisher
 /// node, announce the stream on the statement store, and serve a self-preview.
 #[tauri::command]
@@ -324,27 +425,46 @@ async fn start_publish(
     state: State<'_, AppState>,
     title: Option<String>,
 ) -> Result<PublishInfo, String> {
+    if !*state.chain_ready.lock().unwrap() {
+        return Err("Sign in with the Polkadot app to go live — your stream is announced under your verified identity.".into());
+    }
     if !segmenter::ffmpeg_available() {
         return Err("ffmpeg not found. Install it (e.g. `brew install ffmpeg`), or set \
                     UNSTATION_FFMPEG to its full path, then try again."
             .into());
     }
-    // Replacing any prior publish session (e.g. reopening the ingest after an
-    // encoder disconnect): abort its background tasks now — the feeder's Drop also
-    // kills its ffmpeg ingest — so we don't leak them or fight over the RTMP port.
+    let name = title.unwrap_or_else(|| "unstation".into());
+    let canon = canonical_stream_name(&name);
+    let stream = stream_id_from(&name);
+
+    // Re-attach: if we're already publishing this exact stream, hand back its
+    // existing details instead of tearing it down. This is what lets the UI reopen
+    // the Go-Live console on tab-back / relaunch without interrupting the stream.
+    if let Some(s) = state.publish.lock().unwrap().as_ref() {
+        if s.name == canon {
+            return Ok(s.info.clone());
+        }
+    }
+    // A genuinely different stream (or a stale one): replace the prior session —
+    // aborting the feeder also kills its ffmpeg ingest (Drop) so we don't fight over
+    // the RTMP port.
     if let Some(prev) = state.publish.lock().unwrap().take() {
         prev.feeder.abort();
         prev.stats.abort();
+        let _ = prev.pub_tx.send(EngineEvent::Stop);
     }
-    let name = title.unwrap_or_else(|| "unstation".into());
-    let stream = stream_id_from(&name);
     let port = 21935u16;
     let key = "unstation";
     let url = segmenter::rtmp_url(port, key);
 
-    // The ingest dir. The feeder owns the ffmpeg listener and (re)starts it, so the
-    // ingest is always available regardless of when the encoder connects.
+    // The ingest dir — wiped to a clean slate each session. The dir is reused across
+    // streams, and stale fragments from a previous one belong to an unrelated encode
+    // timeline: leaving them makes the player replay old video and then stall at the
+    // discontinuity (the "counts up ~2 s then freezes, even after the encoder is gone"
+    // bug). A clean dir also keeps the feeder's index-based segment sequence correct.
     let dir = std::env::temp_dir().join("unstation-publish");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
 
     // Self-preview HLS + the publisher node inbox.
     let hls = HlsServer::start(1000).map_err(|e| e.to_string())?;
@@ -354,8 +474,7 @@ async fn start_publish(
 
     // Boot chain signaling + WebRTC, then the live publisher node (its PeerId is
     // the statement-store account it announces under).
-    let key_dir = ss_key_dir(&app)?;
-    let session = Session::start(stream, 1, stun(), key_dir, pub_tx.clone())?;
+    let session = Session::start(stream, 1, stun(), pub_tx.clone())?;
     let publisher = MeshNode::new_live_publisher(
         session.my_peer,
         cfg(Mode::Live, Role::Publisher),
@@ -372,87 +491,77 @@ async fn start_publish(
     session.spawn_edge_publisher(edge_rx);
 
     // Feeder: tail the ingest dir → preview sink + the publisher's mesh seed +
-    // the live-edge manifest. Announces `publish-live` on the first fragment.
+    // the live-edge manifest. Emits `publish-state` and keeps `live_flag` current so
+    // a re-attaching UI can read the true live state via `publish_status`.
     let ptx = pub_tx.clone();
     let appc = app.clone();
+    let live_flag = Arc::new(AtomicBool::new(false));
+    let live_w = live_flag.clone();
     let feeder = tokio::spawn(async move {
-        // One ingest listener per Go-Live. ffmpeg's RTMP `-listen` binds the port and
-        // waits for the encoder however long it takes, segments it, then exits when the
-        // encoder disconnects — at which point we end the session cleanly. (The previous
-        // self-healing respawn tore the ingest down + rebuilt it the instant ffmpeg
-        // exited, racing the player and the HLS reset; that churn is gone.) `seg` is
-        // owned, so dropping it on stop/disconnect kills ffmpeg and frees the port.
-        let mut seg = match segmenter::spawn(&segmenter::Source::RtmpListen { url: &url }, &dir, 1) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = appc.emit(
-                    "publish-hint",
-                    PublishHintMsg { message: format!("ingest failed to start: {e}") },
-                );
-                return;
-            }
-        };
+        // Keep an ingest listener available AT ALL TIMES so the encoder can connect or
+        // reconnect whenever — no ordering required. ffmpeg's RTMP `-listen` is one-shot,
+        // so we respawn it (into a clean dir, with a reset preview) whenever it isn't up.
+        // The UI's LIVE/idle state is driven by whether fresh fragments are actually
+        // arriving (below), NOT by the ffmpeg process — so the indicator always matches
+        // the video a viewer would see, and an encoder restart resumes on its own.
+        let mut seg: Option<segmenter::SegmenterProcess> = None;
         let mut seen = 0u64;
         let mut init_sent = false;
-        let mut announced = false;
-        let mut waited_ms = 0u64;
-        let mut hinted = false;
+        let mut live = false;
+        let mut state_sent = false;
+        let mut spawn_hinted = false;
+        let mut last_fresh = std::time::Instant::now();
         loop {
             tokio::time::sleep(Duration::from_millis(200)).await;
 
-            if !init_sent {
-                if let Some(init) = segmenter::load_init(&dir) {
-                    preview.push_init(init);
-                    init_sent = true;
-                }
-            }
-            if let Ok(news) = segmenter::load_segments_from(&dir, seen) {
-                for s in news {
-                    preview.push_segment(s.seq, s.bytes.clone());
-                    let _ = ptx.send(EngineEvent::Produced { seq: s.seq, id: s.id, bytes: s.bytes });
-                    let _ = edge_tx.send((s.seq, s.id));
-                    seen = s.seq + 1;
-                }
-                if !announced && seen > 0 {
-                    announced = true;
-                    let _ = appc.emit("publish-live", ());
+            // (Re)open the listener if it isn't running. Each new connection is a fresh
+            // encode timeline, so clear the dir + preview and restart sequencing.
+            let running = seg.as_mut().map(|s| s.running()).unwrap_or(false);
+            if !running {
+                let _ = std::fs::remove_dir_all(&dir);
+                let _ = std::fs::create_dir_all(&dir);
+                preview.reset();
+                seen = 0;
+                init_sent = false;
+                seg = segmenter::spawn(&segmenter::Source::RtmpListen { url: &url }, &dir, 1).ok();
+                if seg.is_none() && !spawn_hinted {
+                    spawn_hinted = true;
+                    let _ = appc.emit("publish-hint", PublishHintMsg {
+                        message: "Couldn't start the local ingest (ffmpeg). Reinstall ffmpeg, then reopen the stream.".into(),
+                    });
                 }
             }
 
-            // Encoder gone (ffmpeg exited)? End the session cleanly. The UI reopens a
-            // fresh ingest on `publish-ended`, so reconnecting an encoder just works.
-            if !seg.running() {
-                if announced {
-                    let _ = appc.emit("publish-ended", ());
-                } else {
-                    let log = std::fs::read_to_string(dir.join("ffmpeg.log")).unwrap_or_default();
-                    let mut tail: Vec<&str> = log.trim().lines().rev().take(3).collect();
-                    tail.reverse();
-                    let message = if tail.is_empty() {
-                        "Ingest stopped before any video arrived — is another app using the port?".to_string()
-                    } else {
-                        format!("Ingest stopped. ffmpeg: {}", tail.join(" · "))
-                    };
-                    let _ = appc.emit("publish-hint", PublishHintMsg { message });
+            // Consume only COMPLETE fragments — `load_live_segments_from` holds back the
+            // newest `.m4s` (the one ffmpeg is still writing), which would otherwise be
+            // a truncated, undecodable segment.
+            if let Ok(news) = segmenter::load_live_segments_from(&dir, seen) {
+                if !news.is_empty() {
+                    if !init_sent {
+                        if let Some(init) = segmenter::load_init(&dir) {
+                            preview.push_init(init);
+                            init_sent = true;
+                        }
+                    }
+                    if init_sent {
+                        for s in news {
+                            preview.push_segment(s.seq, s.bytes.clone());
+                            let _ = ptx.send(EngineEvent::Produced { seq: s.seq, id: s.id, bytes: s.bytes });
+                            let _ = edge_tx.send((s.seq, s.id));
+                            seen = s.seq + 1;
+                        }
+                        last_fresh = std::time::Instant::now();
+                    }
                 }
-                break;
             }
 
-            // Still waiting on the first frame? Surface ffmpeg's own log, don't hang.
-            if !announced {
-                waited_ms += 200;
-                if !hinted && waited_ms >= 8_000 {
-                    hinted = true;
-                    let log = std::fs::read_to_string(dir.join("ffmpeg.log")).unwrap_or_default();
-                    let mut tail: Vec<&str> = log.trim().lines().rev().take(3).collect();
-                    tail.reverse();
-                    let message = if tail.is_empty() {
-                        format!("No video yet — point your encoder at rtmp://127.0.0.1:{port}/live (key: unstation), then start streaming.")
-                    } else {
-                        format!("No video yet. ffmpeg: {}", tail.join(" · "))
-                    };
-                    let _ = appc.emit("publish-hint", PublishHintMsg { message });
-                }
+            // Live iff fresh fragments are arriving — accurate to the actual video.
+            let now_live = seen > 0 && last_fresh.elapsed() < Duration::from_millis(4000);
+            if now_live != live || !state_sent {
+                live = now_live;
+                state_sent = true;
+                live_w.store(live, Ordering::Relaxed);
+                let _ = appc.emit("publish-state", PublishStateMsg { live });
             }
         }
     });
@@ -469,19 +578,23 @@ async fn start_publish(
         })
     };
 
+    let info = PublishInfo {
+        ingest_server: format!("rtmp://127.0.0.1:{port}/live"),
+        stream_key: key.into(),
+        hls_url,
+    };
     *state.publish.lock().unwrap() = Some(PublishSession {
         _hls: hls,
         feeder,
         stats,
         pub_tx,
-        _session: session,
+        session,
+        name: canon,
+        info: info.clone(),
+        live: live_flag,
     });
 
-    Ok(PublishInfo {
-        ingest_server: format!("rtmp://127.0.0.1:{port}/live"),
-        stream_key: key.into(),
-        hls_url,
-    })
+    Ok(info)
 }
 
 #[tauri::command]
@@ -494,6 +607,14 @@ fn stop_publish(state: State<'_, AppState>) {
 }
 
 pub fn run() {
+    // Initialize logging so chain/transport/SDK errors are visible (default: info).
+    // Set RUST_LOG to override, e.g. `RUST_LOG=debug`.
+    let _ = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info,sqlx=warn,jsonrpsee=warn"),
+    )
+    .try_init();
+    log::info!("Unstation starting");
+
     tauri::Builder::default()
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
@@ -502,10 +623,13 @@ pub fn run() {
             begin_signin,
             complete_signin,
             resolve_stream,
+            set_chain_identity,
             start_watch,
             stop_watch,
+            watch_status,
             start_publish,
-            stop_publish
+            stop_publish,
+            publish_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running Unstation");

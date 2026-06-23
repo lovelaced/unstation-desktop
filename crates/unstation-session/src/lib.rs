@@ -57,12 +57,15 @@ impl Session {
         stream: StreamId,
         n_shards: u32,
         stun: Vec<String>,
-        key_dir: std::path::PathBuf,
         inbox: UnboundedSender<EngineEvent>,
     ) -> Result<Self, String> {
-        unstation_chain::init_statement_store_persisted(&key_dir);
+        // The statement store must already be initialized with the paired identity
+        // (see the host's `set_chain_identity`) — its key carries the on-chain
+        // allowance to write presence/signaling. We must NOT (re)init here: the SDK
+        // re-initializes on every init call, which would clobber the paired key with
+        // a fresh, unprovisioned one.
         let my_peer = unstation_chain::local_peer_id()
-            .ok_or("statement store did not expose a public key")?;
+            .ok_or("not signed in — pair the Polkadot app to publish or watch")?;
 
         let (sig_tx, sig_rx) = unbounded_channel::<SignalOut>();
         let transport = LibDcTransport::new(stun, inbox, sig_tx);

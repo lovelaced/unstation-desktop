@@ -35,6 +35,30 @@ pub fn init_statement_store(keypair: schnorrkel::Keypair) {
     ss::init_with_keypair(None, keypair, true);
 }
 
+/// Initialize the statement store from a raw 64-byte Substrate sr25519 secret
+/// (32-byte key ‖ 32-byte nonce) — e.g. the QR-paired per-app **slot signing key**
+/// the phone granted an on-chain statement-store allowance. Keeps `schnorrkel`
+/// version handling inside this crate so callers just pass bytes.
+pub fn init_statement_store_from_secret(secret: &[u8]) -> Result<(), String> {
+    let keypair = match secret.len() {
+        // Full Substrate sr25519 secret: 32-byte key ‖ 32-byte nonce.
+        64 => schnorrkel::SecretKey::from_bytes(secret)
+            .map_err(|e| format!("invalid 64-byte slot key: {e}"))?
+            .to_keypair(),
+        // Mini-secret (seed) — expand to a full keypair.
+        32 => {
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(secret);
+            schnorrkel::MiniSecretKey::from_bytes(&seed)
+                .map_err(|e| format!("invalid 32-byte slot seed: {e}"))?
+                .expand_to_keypair(schnorrkel::ExpansionMode::Ed25519)
+        }
+        n => return Err(format!("statement-store slot key must be 32 or 64 bytes, got {n}")),
+    };
+    ss::init_with_keypair(None, keypair, false);
+    Ok(())
+}
+
 /// Like [`init_statement_store`] but loads-or-generates a *persistent* signing key
 /// under `key_dir`, so the host keeps the same statement-store identity across
 /// launches (it stays signed in). `key_dir` should be a per-app, per-platform

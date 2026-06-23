@@ -18,10 +18,17 @@
     --glass-2: rgba(26, 31, 42, 0.5);
     --ui: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Inter", system-ui, sans-serif;
     --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+    /* Display face — a technical, slightly-condensed grotesque (bundled, no CDN) used
+       for headlines only; gives the product a distinct broadcast voice. */
+    --display: "Saira", -apple-system, "SF Pro Display", system-ui, sans-serif;
+    /* Depth tiers: recessed well (inputs/code) → raised glass cards → floating glass. */
+    --well: rgba(6, 8, 13, 0.55);
     --r-win: 14px; --r-card: 16px; --r-pill: 980px;
+    --sp-1: 6px; --sp-2: 10px; --sp-3: 16px; --sp-4: 24px; --sp-5: 38px;
     --spring: cubic-bezier(0.32, 0.72, 0, 1);
     --ease: cubic-bezier(0.4, 0, 0.2, 1);
   }
+  @font-face { font-family: "Saira"; src: url("./fonts/saira-700.woff2") format("woff2"); font-weight: 700; font-style: normal; font-display: swap; }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; font-family: var(--ui); color: var(--text); -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
   body { min-height: 100vh; display: grid; place-items: center; padding: 28px; overflow: hidden;
@@ -44,20 +51,34 @@
     box-shadow: 0 0 0 .5px rgba(0,0,0,.5), 0 30px 80px -20px rgba(0,0,0,.7), 0 8px 24px -8px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.06);
     overflow: hidden; display: flex; flex-direction: column; isolation: isolate; }
 
-  .titlebar { height: 46px; flex: 0 0 auto; display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
-    padding: 0 16px; background: var(--glass); backdrop-filter: blur(30px) saturate(1.7); -webkit-backdrop-filter: blur(30px) saturate(1.7);
+  /* Flex titlebar with non-overlapping zones (no shared grid columns): lights ·
+     tabs (left) · brand (pushed right) · window-controls (Win/Linux). */
+  .titlebar { height: 46px; flex: 0 0 auto; display: flex; align-items: center; gap: 14px;
+    padding: 0 12px; background: var(--glass); backdrop-filter: blur(30px) saturate(1.7); -webkit-backdrop-filter: blur(30px) saturate(1.7);
     border-bottom: 1px solid var(--line); user-select: none; }
-  .lights { display: flex; gap: 8px; align-items: center; }
+  .lights { display: flex; gap: 8px; align-items: center; flex: 0 0 auto; }
   .light { width: 12px; height: 12px; border-radius: 50%; }
   .light.r { background: #ff5f57; } .light.y { background: #febc2e; } .light.g { background: #28c840; }
-  .title-center { display: flex; align-items: center; gap: 9px; justify-self: center; font-family: var(--mono); font-size: 12.5px; letter-spacing: .2px; color: var(--dim); transition: opacity .4s var(--ease); }
-  .title-center .verified { display: inline-flex; align-items: center; gap: 5px; color: var(--accent); }
-  .title-center .verified svg { width: 13px; height: 13px; } .title-center .sep { color: var(--faint); }
-  .title-right { justify-self: end; display: flex; align-items: center; gap: 10px; }
-  .winbtn { width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; color: var(--dim); cursor: pointer; border: 1px solid transparent; transition: background .18s var(--ease), color .18s var(--ease), border-color .18s var(--ease); }
-  .winbtn:hover { background: rgba(255,255,255,.06); color: var(--text); border-color: var(--line); }
-  .winbtn svg { width: 16px; height: 16px; }
-  .winbtn.active { color: var(--accent); border-color: rgba(61,245,208,.3); background: rgba(61,245,208,.08); }
+  /* Persistent top-level tabs — always present, the current section highlighted. */
+  .tabs { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; }
+  .tabs[hidden] { display: none; }
+  .tab { -webkit-app-region: no-drag; font-family: var(--ui); font-size: 13px; font-weight: 510; color: var(--dim);
+    background: transparent; border: 1px solid transparent; border-radius: 9px; padding: 6px 12px; cursor: pointer;
+    display: flex; align-items: center; gap: 7px; white-space: nowrap;
+    transition: color .15s var(--ease), background .15s var(--ease), border-color .15s var(--ease); }
+  .tab:hover { color: var(--text); background: rgba(255,255,255,.05); }
+  .tab.active { color: var(--accent); background: rgba(61,245,208,.10); border-color: rgba(61,245,208,.28); }
+  .tab .rec { width: 7px; height: 7px; border-radius: 50%; background: var(--accent-2); box-shadow: 0 0 8px var(--accent-2); animation: pulse 1.6s var(--ease) infinite; }
+  .tab .rec[hidden] { display: none; }
+  /* Brand / current-stream title — pushed to the right edge, truncates instead of
+     colliding with the nav on narrow windows. */
+  .tb-brand { margin-left: auto; display: flex; align-items: center; gap: 9px; min-width: 0; flex: 0 1 auto;
+    font-family: var(--mono); font-size: 12.5px; letter-spacing: .2px; color: var(--dim);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: opacity .4s var(--ease); }
+  .tb-brand .verified { display: inline-flex; align-items: center; gap: 5px; color: var(--accent); flex: 0 0 auto; animation: verifyflash .9s var(--ease); }
+  @keyframes verifyflash { 0% { color: #fff; text-shadow: 0 0 14px var(--accent); } 100% { color: var(--accent); text-shadow: none; } }
+  .tb-brand .verified svg { width: 13px; height: 13px; } .tb-brand .sep { color: var(--faint); }
+  #titleText { overflow: hidden; text-overflow: ellipsis; }
 
   .stage { position: relative; flex: 1 1 auto; min-height: 0; }
   #mesh { position: absolute; inset: 0; width: 100%; height: 100%; display: block; z-index: 0; }
@@ -65,7 +86,7 @@
   .scene { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 22px; padding: 40px; text-align: center; opacity: 0; transform: scale(.985) translateY(6px); pointer-events: none; transition: opacity .5s var(--ease), transform .6s var(--spring); z-index: 2; }
   .scene.show { opacity: 1; transform: none; pointer-events: auto; }
   .eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: 2.4px; text-transform: uppercase; color: var(--faint); }
-  h1.display { margin: 0; font-weight: 700; letter-spacing: -.02em; line-height: 1.02; font-size: clamp(30px, 5vw, 46px); }
+  h1.display { margin: 0; font-family: var(--display); font-weight: 700; letter-spacing: -.005em; line-height: 1.02; font-size: clamp(31px, 5vw, 48px); }
   .sub { margin: 0; color: var(--dim); font-size: 15.5px; line-height: 1.5; max-width: 32ch; }
 
   .cmd { display: flex; align-items: center; gap: 8px; width: min(520px, 86%); padding: 7px 7px 7px 18px; border-radius: var(--r-pill);
@@ -112,7 +133,12 @@
   .frame video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: 1; background: transparent; display: none; }
   @keyframes drift { to { background-position: 100% 100%, 0% 0%, 50% 50%; } }
   .frame .grain { position: absolute; inset: 0; opacity: .5; mix-blend-mode: overlay; background-image: radial-gradient(rgba(255,255,255,.06) .5px, transparent .5px); background-size: 3px 3px; }
-  .frame .live-tag { position: absolute; top: 12px; left: 12px; z-index: 2; display: flex; align-items: center; gap: 7px; padding: 5px 10px 5px 9px; border-radius: var(--r-pill); background: rgba(8,10,15,.55); backdrop-filter: blur(10px); font-family: var(--mono); font-size: 11px; letter-spacing: 1.2px; }
+  .frame .live-tag { position: absolute; top: 12px; left: 12px; z-index: 3; display: flex; align-items: center; gap: 7px; padding: 5px 10px 5px 9px; border-radius: var(--r-pill); background: rgba(8,10,15,.55); backdrop-filter: blur(10px); font-family: var(--mono); font-size: 11px; letter-spacing: 1.2px;
+    text-shadow: -0.6px 0 rgba(255,90,90,.5), 0.6px 0 rgba(90,200,255,.5); animation: livecue 5s steps(1,end) infinite; }
+  @keyframes livecue { 0%, 96%, 100% { opacity: 1; } 97% { opacity: .55; } 98% { opacity: 1; } 99% { opacity: .7; } }
+  /* Faint CRT scanlines over the video — a quiet "this is a transmission" texture. */
+  .frame::after { content: ""; position: absolute; inset: 0; z-index: 1; pointer-events: none; opacity: .35; mix-blend-mode: multiply;
+    background: repeating-linear-gradient(180deg, rgba(0,0,0,.10) 0 1px, transparent 1px 3px); }
   .frame .scrim { position: absolute; inset: auto 0 0 0; height: 40%; z-index: 2; background: linear-gradient(transparent, rgba(0,0,0,.5)); }
   .frame .catchup { position: absolute; inset: 0; display: none; place-items: center; z-index: 3; background: rgba(5,7,11,.4); backdrop-filter: blur(2px); font-family: var(--mono); font-size: 12.5px; letter-spacing: .4px; }
   .frame .catchup .spin { width: 15px; height: 15px; margin-right: 9px; border: 2px solid rgba(255,255,255,.25); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; display: inline-block; vertical-align: middle; }
@@ -120,7 +146,7 @@
   .live-dot { width: 7px; height: 7px; border-radius: 50%; background: #ff5f57; box-shadow: 0 0 8px #ff5f57; animation: pulse 1.6s var(--ease) infinite; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
 
-  .hud { position: absolute; left: 0; right: 0; bottom: 0; z-index: 4; display: flex; justify-content: center; padding: 18px; pointer-events: none; opacity: 0; transform: translateY(8px); transition: opacity .5s var(--ease), transform .5s var(--spring); }
+  .hud { position: absolute; left: 0; right: 0; bottom: 0; z-index: 4; display: flex; gap: 10px; justify-content: center; align-items: center; padding: 18px; pointer-events: none; opacity: 0; transform: translateY(8px); transition: opacity .5s var(--ease), transform .5s var(--spring); }
   .hud.show { opacity: 1; transform: none; }
   .pill { pointer-events: auto; display: flex; align-items: center; gap: 10px; padding: 9px 14px; border-radius: var(--r-pill);
     background: var(--glass); backdrop-filter: blur(26px) saturate(1.6); -webkit-backdrop-filter: blur(26px) saturate(1.6);
@@ -164,7 +190,7 @@
     border: 1px solid var(--line-strong); box-shadow: inset 0 1px 0 rgba(255,255,255,.06), 0 16px 40px -16px rgba(0,0,0,.6); text-align: left; }
   .field { display: flex; align-items: center; gap: 10px; }
   .field .k { width: 92px; flex: 0 0 auto; font-size: 11px; letter-spacing: .5px; text-transform: uppercase; color: var(--faint); }
-  .field code { flex: 1 1 auto; min-width: 0; font-family: var(--mono); font-size: 13px; color: var(--text); background: rgba(0,0,0,.3); padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .field code { flex: 1 1 auto; min-width: 0; font-family: var(--mono); font-size: 13px; color: var(--text); background: var(--well); padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .field .copy { flex: 0 0 auto; font-family: var(--ui); font-size: 12px; font-weight: 510; color: var(--text); background: rgba(255,255,255,.06); border: 1px solid var(--line-strong); border-radius: 8px; padding: 7px 12px; cursor: pointer; transition: all .15s var(--ease); }
   .field .copy:hover { background: rgba(255,255,255,.1); } .field .copy.done { color: var(--accent); border-color: rgba(61,245,208,.4); }
   .ingest-hint { margin: 2px 0 0; font-size: 12.5px; color: var(--dim); line-height: 1.5; } .ingest-hint b { color: var(--text); font-weight: 590; }
@@ -173,8 +199,18 @@
   .await.live .dot-await { background: var(--accent); box-shadow: 0 0 10px var(--accent); animation: none; }
   .await.live { color: var(--accent); }
   .accent { color: var(--accent); }
-  .pub-live { display: flex; flex-direction: column; align-items: center; gap: 16px; width: min(900px, 94%); }
+  /* On-video diagnostic toast (real media errors only) — shared by both players. */
+  .diag { position: absolute; left: 10px; right: 10px; bottom: 10px; z-index: 6; font: 11px var(--mono); color: #fff; background: rgba(0,0,0,.66); padding: 6px 9px; border-radius: 7px; pointer-events: none; line-height: 1.45; }
+  .diag[hidden] { display: none; }
+  /* Go Live console: video hero (fills the stage) + a side rail for ingest, share,
+     and the explicit End control — mirrors the watch player's "video is the hero". */
+  .pub-live { display: flex; flex-direction: row; align-items: stretch; gap: 18px; width: 100%; height: 100%; }
   .pub-live[hidden] { display: none; }
+  .pub-stage { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; justify-content: center; }
+  .pub-rail { flex: 0 0 340px; max-width: 38%; display: flex; flex-direction: column; gap: 14px; min-height: 0; text-align: left; }
+  .pub-rail .ingest-card, .pub-rail .share-bar { width: 100%; }
+  .pub-rail .rail-spacer { flex: 1 1 auto; }
+  .pub-rail #endStream { align-self: stretch; text-align: center; }
   #streamTitle { font-family: var(--ui); font-size: 16px; font-weight: 510; }
   details.encoder { width: min(560px, 100%); border: 1px solid var(--line); border-radius: 12px; background: rgba(255,255,255,.03); text-align: left; }
   details.encoder > summary { cursor: pointer; list-style: none; padding: 11px 16px; font-size: 13px; color: var(--dim); font-weight: 510; user-select: none; }
@@ -183,7 +219,7 @@
   details.encoder[open] > summary::before { content: '▾'; }
   details.encoder > summary:hover { color: var(--text); }
   details.encoder .ingest-card { border: 0; box-shadow: none; background: transparent; padding: 0 16px 16px; width: 100%; }
-  .pub-frame { width: 100%; aspect-ratio: 16 / 9; }
+  .pub-frame { width: 100%; aspect-ratio: 16 / 9; max-height: 100%; }
   .share-bar { display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px 10px 8px 14px; border-radius: var(--r-pill); background: var(--glass-2); border: 1px solid var(--line-strong); }
   .share-bar .share-k { font-size: 11px; letter-spacing: .5px; text-transform: uppercase; color: var(--faint); }
   .share-bar code { flex: 1 1 auto; min-width: 0; font-family: var(--mono); font-size: 14px; color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -205,27 +241,40 @@
   @media (max-width: 760px) { .scene[data-scene="entry"] { flex-direction: column; gap: 24px; padding: 32px; } .entry-action, .entry-panel { width: min(480px, 90%); } .entry-action { align-items: center; text-align: center; } }
   /* Player fills the stage — the video is the hero, minimal margin around it. */
   #player .frame { width: min(1040px, 94%); }
-  .winbtn[hidden] { display: none; }
   /* Native window controls — a custom titlebar on Windows/Linux; macOS uses the OS overlay. */
-  .win-controls { display: none; align-items: center; gap: 2px; grid-column: 3; justify-self: end; }
+  .win-controls { display: none; align-items: center; gap: 2px; flex: 0 0 auto; }
   body.native.plat-windows .win-controls, body.native.plat-linux .win-controls { display: flex; }
-  /* Title-bar nav: macOS keeps it on the right (the OS traffic lights own the left);
-     Windows/Linux put nav on the left and the window controls on the right. */
-  .tb-nav { grid-column: 1; justify-self: start; display: flex; align-items: center; gap: 8px; }
-  body.plat-macos .tb-nav { grid-column: 3; justify-self: end; }
-  .lights { grid-column: 1; justify-self: start; }
-  .title-center { grid-column: 2; }
+  /* Leave-stream control beside the HUD pill (watching is a background activity —
+     switching tabs keeps it running; this is the explicit stop). */
+  .hud-leave { -webkit-app-region: no-drag; pointer-events: auto; font-family: var(--ui); font-size: 13px; font-weight: 510; color: var(--text);
+    background: var(--glass); backdrop-filter: blur(26px) saturate(1.6); -webkit-backdrop-filter: blur(26px) saturate(1.6);
+    border: 1px solid var(--line-strong); border-radius: var(--r-pill); padding: 9px 16px; cursor: pointer; transition: background .2s var(--ease); }
+  .hud-leave:hover { background: rgba(255,255,255,.12); }
   /* Native UI font per platform (the title text already uses the platform mono via --mono). */
   body.plat-macos { --ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; }
   body.plat-windows { --ui: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; }
   body.plat-linux { --ui: system-ui, "Inter", "Cantarell", "Ubuntu", "Noto Sans", sans-serif; }
   /* Go Live: two columns — name your stream (left) + the always-visible encoder card (right). */
-  .pub-setup { display: flex; flex-direction: row; align-items: center; gap: 36px; width: min(860px, 94%); text-align: left; }
-  .pub-left { display: flex; flex-direction: column; align-items: flex-start; gap: 16px; flex: 1 1 0; min-width: 0; }
-  .pub-left .cmd { width: 100%; }
-  .pub-encoder { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 12px; }
-  .pub-encoder .ingest-card { width: 100%; }
-  @media (max-width: 760px) { .pub-setup { flex-direction: column; align-items: stretch; gap: 22px; width: min(560px, 92%); } }
+  /* Publish scene fills the stage so the console / naming card uses the whole area. */
+  .scene[data-scene="publish"] { display: block; padding: 20px 24px 24px; text-align: left; }
+  /* Naming step — a focused, centered card. */
+  .pub-setup { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; width: 100%; height: 100%; text-align: center; }
+  .pub-setup[hidden] { display: none; }
+  .pub-setup .pub-left { display: flex; flex-direction: column; align-items: center; gap: 16px; width: min(540px, 92%); }
+  .pub-setup .cmd { width: 100%; }
+  .pub-setup .pub-actions { justify-content: center; }
+  @media (max-width: 820px) { .pub-live { flex-direction: column; } .pub-rail { flex: 0 0 auto; max-width: none; } }
+  /* Short windows (min height ~480px): let scenes scroll from the top instead of
+     clipping the primary action, and tighten the big elements. */
+  @media (max-height: 560px) {
+    .scene { justify-content: flex-start; overflow-y: auto; padding: 22px 32px; }
+    .scene[data-scene="entry"] { align-items: flex-start; }
+    .scene[data-scene="publish"] { padding: 14px 18px 18px; }
+    h1.display { font-size: clamp(22px, 4vw, 32px); }
+    .entry-action h1.display { font-size: clamp(24px, 4vw, 34px); }
+    .qr-card { padding: 18px; gap: 18px; } .qr { width: 104px; height: 104px; }
+    .pub-rail { overflow-y: auto; }
+  }
   .wc { width: 30px; height: 30px; display: grid; place-items: center; border: 0; background: transparent; color: var(--dim); cursor: pointer; border-radius: 7px; transition: background .15s var(--ease), color .15s var(--ease); }
   .wc svg { width: 13px; height: 13px; } .wc:hover { background: rgba(255,255,255,.08); color: var(--text); } .wc.wc-close:hover { background: #e81123; color: #fff; }
   .settings-card { display: flex; flex-direction: column; width: min(560px, 90%); border-radius: var(--r-card); background: var(--glass-2); border: 1px solid var(--line-strong); box-shadow: inset 0 1px 0 rgba(255,255,255,.06), 0 20px 50px -22px rgba(0,0,0,.7); overflow: hidden; text-align: left; }
@@ -241,21 +290,12 @@
 <div class="win" id="win" data-net="closed" data-health="p2p">
   <div class="titlebar" data-tauri-drag-region>
     <div class="lights"><span class="light r"></span><span class="light y"></span><span class="light g"></span></div>
-    <div class="title-center" id="titleCenter"><span id="titleText">Unstation</span></div>
-    <div class="tb-nav">
-      <div class="winbtn" id="homeBtn" title="Home" hidden>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/></svg>
-      </div>
-      <div class="winbtn" id="goLiveBtn" title="Go live" hidden>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2.6"/><path d="M8.5 8.5a5 5 0 0 0 0 7M15.5 8.5a5 5 0 0 1 0 7M5.6 5.6a9 9 0 0 0 0 12.8M18.4 5.6a9 9 0 0 1 0 12.8"/></svg>
-      </div>
-      <div class="winbtn" id="netToggle" title="Network" hidden>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2.4"/><circle cx="5" cy="6" r="1.8"/><circle cx="19" cy="6" r="1.8"/><circle cx="5" cy="18" r="1.8"/><circle cx="19" cy="18" r="1.8"/><path d="M10 11 6.5 7.2M14 11l3.5-3.8M10 13l-3.5 3.8M14 13l3.5 3.8"/></svg>
-      </div>
-      <div class="winbtn" id="settingsBtn" title="Settings" hidden>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-      </div>
-    </div>
+    <nav class="tabs" id="tabs">
+      <button class="tab" id="tabWatch" data-tab="watch" type="button">Watch</button>
+      <button class="tab" id="tabGoLive" data-tab="golive" type="button">Go Live<i class="rec" id="goLiveRec" hidden></i></button>
+      <button class="tab" id="tabSettings" data-tab="settings" type="button">Settings</button>
+    </nav>
+    <div class="tb-brand" id="titleCenter"><span id="titleText">Unstation</span></div>
     <div class="win-controls" id="winControls">
       <button class="wc" id="wcMin" title="Minimize"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M5 12h14"/></svg></button>
       <button class="wc" id="wcMax" title="Maximize"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="5" y="5" width="14" height="14" rx="1.5"/></svg></button>
@@ -332,10 +372,9 @@
     </div>
 
     <div class="scene" data-scene="publish">
-      <div class="eyebrow">Go live</div>
-      <h1 class="display" id="pubHeadline">What are you streaming?</h1>
-
       <div class="pub-setup" id="pubSetup">
+        <div class="eyebrow">Go live</div>
+        <h1 class="display" id="pubHeadline">Name your stream</h1>
         <div class="pub-left">
           <form class="cmd" id="titleForm" onsubmit="return false;">
             <span class="lead"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m22 8-6 4 6 4V8Z"/><rect x="2" y="6" width="14" height="12" rx="2"/></svg></span>
@@ -346,32 +385,40 @@
             <button class="btn" id="startStream" type="button">Go live</button>
             <button class="btn ghost" id="cancelPublish" type="button">Cancel</button>
           </div>
-          <div class="await" id="publishAwait" style="display:none"><span class="dot-await"></span>Waiting for your encoder…</div>
         </div>
-        <aside class="pub-encoder">
+      </div>
+
+      <div class="pub-live" id="pubLive" hidden>
+        <div class="pub-stage">
+          <div class="frame pub-frame">
+            <div class="video"></div>
+            <video id="pubVid" muted playsinline></video>
+            <div class="live-tag" id="pubLiveTag" hidden><span class="live-dot"></span>LIVE</div>
+            <div class="scrim"></div>
+            <div id="pubWaiting" style="position:absolute;inset:0;z-index:5;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:11px;text-align:center;padding:26px">
+              <span class="dot-await"></span>
+              <b style="font-size:15px">Waiting for your encoder…</b>
+              <div style="max-width:32rem;opacity:.72;font-size:12.5px;line-height:1.55">Point any encoder — OBS, or <code>scripts/mock-obs.sh</code> — at the server below and start streaming. Connect it any time, before or after this screen; it goes live on its own.</div>
+            </div>
+            <div id="pubVidDiag" class="diag" hidden></div>
+          </div>
+        </div>
+        <aside class="pub-rail">
           <div class="eyebrow">Connect your encoder</div>
           <div class="ingest-card">
             <div class="field"><span class="k">Server</span><code id="ingestServer">rtmp://127.0.0.1:21935/live</code><button class="copy" data-copy="ingestServer" type="button">Copy</button></div>
             <div class="field"><span class="k">Stream key</span><code id="ingestKey">unstation</code><button class="copy" data-copy="ingestKey" type="button">Copy</button></div>
-            <p class="ingest-hint">In OBS: <b>Settings → Stream → Service: Custom</b>, paste these in, then <b>Start Streaming</b>. Any encoder works — no plugins. Your preview appears the moment video arrives.</p>
+            <p class="ingest-hint">In OBS: <b>Settings → Stream → Service: Custom</b>, paste these in, then <b>Start Streaming</b>. Any encoder works — no plugins.</p>
           </div>
+          <div class="share-bar">
+            <span class="share-k">Share</span>
+            <code id="shareLink">friday-night-football</code>
+            <button class="copy" id="copyShare" data-copy="shareLink" type="button">Copy</button>
+            <span class="viewers"><span id="pubViewers">0</span> watching</span>
+          </div>
+          <div class="rail-spacer"></div>
+          <button class="btn ghost" id="endStream" type="button">End stream</button>
         </aside>
-      </div>
-
-      <div class="pub-live" id="pubLive" hidden>
-        <div class="frame pub-frame">
-          <div class="video"></div>
-          <video id="pubVid" muted playsinline></video>
-          <div class="live-tag"><span class="live-dot"></span>LIVE</div>
-          <div class="scrim"></div>
-        </div>
-        <div class="share-bar">
-          <span class="share-k">Share</span>
-          <code id="shareLink">friday-night-football</code>
-          <button class="copy" id="copyShare" data-copy="shareLink" type="button">Copy</button>
-          <span class="viewers"><span id="pubViewers">0</span> watching</span>
-        </div>
-        <button class="btn ghost" id="endStream" type="button">End stream</button>
       </div>
     </div>
 
@@ -383,10 +430,12 @@
         <div class="live-tag"><span class="live-dot"></span>LIVE</div>
         <div class="scrim"></div>
         <div class="catchup" id="catchup"><span class="spin"></span>Catching up…</div>
+        <div id="vidDiag" class="diag" hidden></div>
       </div>
     </div>
 
     <div class="hud" id="hud">
+      <button class="hud-leave" id="leaveWatchBtn" type="button">Leave</button>
       <div class="pill" id="pill">
         <span class="state"><span class="health-dot"></span><span><span class="mode" id="modeText">LIVE · P2P</span> <span class="sep">·</span> <span class="peers"><span id="peerCount">0</span> peers</span></span></span>
         <span class="chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 15 6-6 6 6"/></svg></span>
@@ -461,12 +510,17 @@ import * as sso from './sso.js';
   function showScene(name){ scenes.forEach(s=>s.classList.toggle('show', s.dataset.scene===name)); }
   function setTitle(stream,verified){ titleCenter.style.opacity=0; setTimeout(()=>{ if(verified){ titleCenter.innerHTML='<span class="verified"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/></svg></span>'+stream; } else { titleCenter.textContent=stream; } titleCenter.style.opacity=1; }, 200); }
 
-  const homeBtn=document.getElementById('homeBtn'), goLiveBtn=document.getElementById('goLiveBtn'), netToggleBtn=document.getElementById('netToggle'), settingsBtn=document.getElementById('settingsBtn');
-  function setNav(state, isLive){ homeBtn.hidden = (state==='entry' || state==='onboarding'); goLiveBtn.hidden = (state!=='entry'); netToggleBtn.hidden = !isLive; settingsBtn.hidden = (state==='onboarding' || state==='settings'); if(!isLive) netToggleBtn.classList.remove('active'); }
+  // Persistent top-level tabs. The current section is always highlighted; switching
+  // tabs never stops a running session (see enterGoLive/enterWatch + endPublish).
+  const tabsEl=document.getElementById('tabs'), tabEls=[...document.querySelectorAll('.tab')], goLiveRec=document.getElementById('goLiveRec');
+  let pubActive=false; // a publish session exists in the backend (live or waiting)
+  function tabForState(state){ if(state==='publish')return 'golive'; if(state==='settings')return 'settings'; if(state==='onboarding')return null; return 'watch'; }
+  function setActiveTab(state){ if(tabsEl) tabsEl.hidden=(state==='onboarding'); const t=tabForState(state); tabEls.forEach(b=>b.classList.toggle('active', b.dataset.tab===t)); }
+  function refreshGoLiveBadge(){ if(goLiveRec) goLiveRec.hidden=!pubActive; }
   function go(state){ clearSeq(); curStateName=state;
     document.querySelectorAll('.dock button').forEach(b=>b.classList.toggle('on', b.dataset.state===state));
     const isLive=['live','seed','catchup'].includes(state);
-    setNav(state, isLive);
+    setActiveTab(state);
     player.classList.toggle('show', isLive); hud.classList.toggle('show', isLive);
     document.getElementById('catchup').style.display = state==='catchup'?'grid':'none';
     if(isLive){ intensity=1; mode=state==='seed'?'seed':'p2p'; win.dataset.health=mode; document.getElementById('modeText').textContent=state==='seed'?'LIVE · via seed':'LIVE · P2P'; showScene(''); if(!NATIVE){ setTitle('hardfork.dot',true); animateGauge(state==='seed'?41:78); setMetrics(state==='seed'); } return; }
@@ -488,24 +542,68 @@ import * as sso from './sso.js';
   function setMetrics(seed){ document.getElementById('mSeed').textContent=seed?'54%':'19%'; document.getElementById('mChain').textContent=seed?'5%':'3%'; document.getElementById('mLat').innerHTML=(seed?'6.1':'4.2')+'<small> s</small>'; const ice=document.getElementById('mIce'); ice.textContent=seed?'relayed':'direct'; ice.className='v '+(seed?'am':'cy'); document.getElementById('mPub').textContent='hardfork.dot'; document.getElementById('netNote').textContent=seed?'peers thin — a volunteer seed is filling in':'verified · in-mesh gossip after first link'; }
 
   /* real stats from the engine */
-  function applyStats(s){ if(!s)return; const seed=s.mode==='seed'; win.dataset.health=seed?'seed':'p2p';
+  let lastPeers = 0, watchWatchdog = null;
+  function applyStats(s){ if(!s)return; lastPeers = s.peers||0; const seed=s.mode==='seed'; win.dataset.health=seed?'seed':'p2p';
     document.getElementById('modeText').textContent=seed?'LIVE · via seed':'LIVE · P2P';
     document.getElementById('peerCount').textContent=s.peers; document.getElementById('mPeers').textContent=s.peers;
     animateGauge(s.rho); document.getElementById('mSeed').textContent=(s.from_seed||0)+'%'; document.getElementById('mChain').textContent=(s.from_chain||0)+'%';
     document.getElementById('mLat').innerHTML=(s.latency_s?s.latency_s.toFixed(1):'—')+'<small> s</small>'; const ice=document.getElementById('mIce'); ice.textContent=s.ice||'—'; ice.className='v '+(seed?'am':'cy'); }
 
+  // Viewer-facing connection feedback. The catchup overlay carries the message; the
+  // watchdog turns a silent "no video" into a peer-aware, actionable explanation.
+  function setCatchup(html){ const c=document.getElementById('catchup'); if(c){ c.innerHTML=html; c.style.display='grid'; } }
+  function clearWatchUi(){ clearTimeout(watchWatchdog); const c=document.getElementById('catchup'); if(c){ c.style.display='none'; } }
+  function startWatchWatchdog(){
+    clearTimeout(watchWatchdog);
+    setCatchup('<span class="spin"></span>Connecting to the broadcaster…');
+    watchWatchdog = setTimeout(()=>{
+      const v=document.getElementById('vid'); if(v.readyState>=3 && !v.paused) return; // already playing
+      if(lastPeers>0) setCatchup('Connected to a peer, but no video is arriving — the broadcaster may have stopped streaming.');
+      else setCatchup('Can’t reach the broadcaster yet. Check the name matches exactly, that they’re live, and — for now — that both devices are on the same network.');
+    }, 18000);
+  }
+
   /* interactions */
-  function toggleNet(){ if(!hud.classList.contains('show'))return; const open=win.dataset.net==='open'; win.dataset.net=open?'closed':'open'; document.getElementById('netToggle').classList.toggle('active',!open); }
-  document.getElementById('netToggle').addEventListener('click',toggleNet);
+  function toggleNet(){ if(!hud.classList.contains('show'))return; const open=win.dataset.net==='open'; win.dataset.net=open?'closed':'open'; }
   document.getElementById('pill').addEventListener('click',toggleNet);
   document.querySelectorAll('[data-goto]').forEach(b=>b.addEventListener('click',()=>go(b.dataset.goto)));
 
-  function setVideo(url){ const v=document.getElementById('vid'); if(!url)return; try{ if(v.canPlayType('application/vnd.apple.mpegurl')){ v.src=url; v.style.display='block'; v.play().catch(()=>{}); } }catch(e){} }
-  // Surface media errors (blocked load, decode failure, …) so a missing picture is debuggable.
-  ['vid','pubVid'].forEach(id=>{ const el=document.getElementById(id); if(el) el.addEventListener('error', ()=>{ const e=el.error; console.error('[video]', id, 'error', e&&e.code, e&&e.message, 'src=', el.currentSrc); }); });
+  // Attach the viewer to its local HLS server. The mesh delivers segments a moment
+  // AFTER we attach, so the first playlist read is empty → the player reports
+  // "error 4 / source unsupported". So we keep re-loading (cache-busted, to re-read
+  // the now-growing playlist) until media actually plays, showing "Catching up…"
+  // meanwhile. If it never plays, the peer count in the HUD tells the real story.
+  function setVideo(url){
+    const v=document.getElementById('vid'), catchup=document.getElementById('catchup'); if(!url)return;
+    if(!(v.canPlayType('application/vnd.apple.mpegurl'))){ if(catchup){ catchup.textContent='This device can’t play the stream format.'; catchup.style.display='grid'; } return; }
+    const attempt=()=>{ if(v.readyState>=3 && !v.paused) return; try{ v.src=url+(url.includes('?')?'&':'?')+'t='+Date.now(); v.style.display='block'; v.load(); v.play().catch(()=>{}); }catch(e){} };
+    attempt();
+    clearInterval(v._retry);
+    v._retry=setInterval(()=>{ const playing=v.readyState>=3 && !v.paused; if(catchup && curStateName!=='catchup') catchup.style.display=playing?'none':'grid'; if(playing){ clearInterval(v._retry); clearTimeout(watchWatchdog); } else attempt(); }, 1500);
+  }
+  // Surface real media ERRORS on-screen (the bundled DMG has no devtools). We only
+  // show genuine `error` events — `stalled`/`waiting` fire routinely at the live edge
+  // during normal HLS playback, so showing those would be a constant false alarm.
+  // `onScreen=false` (the viewer) logs to console only — a transient "error 4" is
+  // EXPECTED while the mesh spins up (handled by setVideo's retry + the catchup
+  // overlay), so flashing it on screen would just be alarming. The publisher's local
+  // ingest, by contrast, has no retry, so its errors are shown.
+  function wireVideoDiag(vidId, diagId, onScreen){
+    const el=document.getElementById(vidId), diag=document.getElementById(diagId);
+    if(!el) return;
+    const CODES={1:'aborted',2:'network/blocked',3:'decode',4:'src unsupported'};
+    const hide=()=>{ if(diag) diag.hidden=true; };
+    el.addEventListener('error', ()=>{ const e=el.error; const m='video error '+((e&&e.code)||'?')+' ('+((e&&CODES[e.code])||'?')+')'+(e&&e.message?': '+e.message:'')+' — '+(el.currentSrc||'no src'); console.error('[video]',vidId,m); if(onScreen && diag){ diag.textContent=m; diag.hidden=false; } });
+    el.addEventListener('playing', hide);
+    el.addEventListener('loadeddata', hide);
+    el.addEventListener('timeupdate', hide);
+  }
+  wireVideoDiag('pubVid','pubVidDiag', true);
+  wireVideoDiag('vid','vidDiag', false);
 
   document.getElementById('watchForm').addEventListener('submit', async (e)=>{ e.preventDefault(); const target=(document.getElementById('streamInput').value||'').trim(); if(!target){ document.getElementById('streamInput').focus(); return; } go('finding');
-    if(NATIVE && invoke){ try{ const info=await invoke('start_watch',{ target }); setVideo(info.hls_url); setTitle(target,true); document.getElementById('mPub').textContent=info.publisher; go('live'); applyStats({peers:info.peers,rho:info.rho,mode:'p2p',from_seed:0,from_chain:0,latency_s:0,ice:'connecting'}); }catch(err){ console.error('start_watch failed',err); go('entry'); } } });
+    if(NATIVE && invoke){ try{ const info=await invoke('start_watch',{ target }); document.getElementById('mPub').textContent=info.publisher; lastPeers=0; go('live'); setTitle(target,true); applyStats({peers:0,rho:0,mode:'p2p',from_seed:0,from_chain:0,latency_s:0,ice:'connecting'}); startWatchWatchdog(); setVideo(info.hls_url); }catch(err){ console.error('start_watch failed',err); document.getElementById('progEyebrow').textContent='Problem'; document.getElementById('progTitle').textContent='Couldn’t start watching'; document.getElementById('progSub').textContent=((err&&err.message)||(''+err)); clearSeq(); } }
+    else { setTimeout(()=>go('live'),1200); } });
 
   document.getElementById('pairedBtn').addEventListener('click', async ()=>{ if(NATIVE && invoke){ try{ await invoke('complete_signin'); }catch(e){} } go('entry'); });
 
@@ -518,96 +616,122 @@ import * as sso from './sso.js';
   const shareName = t => slugify(t);
   const titleEl = document.getElementById('streamTitle');
   const startStreamBtn = document.getElementById('startStream');
-  const awaitEl = document.getElementById('publishAwait');
-  const setAwait = (msg, show = true) => { awaitEl.style.display = show ? 'flex' : 'none'; if (msg != null) awaitEl.innerHTML = '<span class="dot-await"></span>' + msg; };
   titleEl.addEventListener('input', ()=>{ document.getElementById('sharePreview').textContent = shareName(titleEl.value); });
 
   // Step 1 — name the stream. We deliberately do NOT open the ingest yet: the
   // stream's identity is derived from this name, so it must be fixed before we
   // publish presence. (Opening on entry with an empty box made every stream
-  // "my-stream" and broke discovery — that's the bug this fixes.)
+  // "my-stream" and broke discovery.)
   function showPubSetup(){
     document.getElementById('pubSetup').hidden = false;
     document.getElementById('pubLive').hidden = true;
     document.getElementById('pubHeadline').textContent = 'Name your stream';
     titleEl.readOnly = false;
     startStreamBtn.hidden = false;
-    setAwait(null, false);
     document.getElementById('sharePreview').textContent = shareName(titleEl.value);
   }
 
-  // Step 2 — lock the name in and open the ingest under it.
+  // Step 2 — lock the name in, open the ingest, and enter the console. From here the
+  // ingest stays available (the Rust feeder keeps the listener up), so the encoder
+  // can connect ANY time, in any order — `publish-state` flips the console
+  // LIVE/waiting to match the actual video.
   async function goLiveStart(){
     if(!publishing) return;
     pubName = shareName(titleEl.value);
-    titleEl.value = pubName;            // echo the canonical name back to the user
+    titleEl.value = pubName;
     titleEl.readOnly = true;
-    startStreamBtn.hidden = true;
-    document.getElementById('pubHeadline').textContent = 'Waiting for your encoder…';
-    document.getElementById('sharePreview').textContent = pubName;
-    setAwait('Waiting for your encoder…');
-    if(NATIVE && invoke){
-      try {
-        const info = await invoke('start_publish', { title: pubName });
-        pubHlsUrl = info.hls_url;
-        document.getElementById('ingestServer').textContent = info.ingest_server;
-        document.getElementById('ingestKey').textContent = info.stream_key;
-      } catch(err){ setAwait(''+err); }
-    } else {
-      setTimeout(()=>{ if(publishing) markPublishLive(); }, 1800); // preview demo
-    }
-  }
-
-  function markPublishLive(){
-    document.getElementById('pubHeadline').textContent = 'You’re live.';
+    document.getElementById('shareLink').textContent = pubName;
+    document.getElementById('pubViewers').textContent = '0';
     document.getElementById('pubSetup').hidden = true;
     document.getElementById('pubLive').hidden = false;
-    document.getElementById('shareLink').textContent = pubName || shareName(titleEl.value);
-    const v = document.getElementById('pubVid');
-    if(NATIVE && pubHlsUrl){ try{ if(v.canPlayType('application/vnd.apple.mpegurl')){ v.src=pubHlsUrl + (pubHlsUrl.includes('?')?'&':'?') + 't=' + Date.now(); v.style.display='block'; v.load(); v.play().catch(()=>{}); } }catch(e){} }
-    clearInterval(pubViewersTimer);
-    document.getElementById('pubViewers').textContent = '0'; // real count arrives via the 'publish-stats' event
-  }
-
-  async function startPublish(){
-    go('publish'); publishing = true;
-    if(pubName) titleEl.value = pubName;
-    showPubSetup();
-    titleEl.focus(); if(titleEl.select) titleEl.select();
-  }
-
-  // Encoder disconnected after we went live. Reopen the ingest under the SAME name
-  // and wait — OBS and most encoders auto-reconnect, so the stream resumes on its
-  // own with no action needed.
-  async function reopenIngest(){
-    if(!publishing) return;
-    const v=document.getElementById('pubVid'); try{ v.pause(); }catch(e){} v.removeAttribute('src'); v.style.display='none';
-    document.getElementById('pubSetup').hidden = false;
-    document.getElementById('pubLive').hidden = true;
-    document.getElementById('pubHeadline').textContent = 'Encoder disconnected';
-    titleEl.readOnly = true; startStreamBtn.hidden = true;
-    setAwait('Encoder disconnected — your stream resumes automatically when it reconnects.');
+    applyPublishState(false); // enter the console in the waiting state
     if(NATIVE && invoke){
       try {
         const info = await invoke('start_publish', { title: pubName });
-        pubHlsUrl = info.hls_url;
+        pubHlsUrl = info.hls_url; pubActive = true; refreshGoLiveBadge();
         document.getElementById('ingestServer').textContent = info.ingest_server;
         document.getElementById('ingestKey').textContent = info.stream_key;
-      } catch(err){ setAwait(''+err); }
+      } catch(err){ const w=document.getElementById('pubWaiting'); const b=w&&w.querySelector('b'); if(b) b.textContent=''+err; }
+    } else {
+      pubActive = true; refreshGoLiveBadge();
+      setTimeout(()=>{ if(publishing) applyPublishState(true); }, 1800); // preview demo
     }
   }
+
+  // Reflect the REAL stream state — `publish-state` fires from the feeder based on
+  // whether fresh fragments are actually arriving, so LIVE always matches the video.
+  function applyPublishState(live){
+    // Only drive the console when it's actually on screen — a background publish
+    // still emits publish-state while the user is on another tab.
+    if(!publishing || document.getElementById('pubLive').hidden) return;
+    const tag = document.getElementById('pubLiveTag');
+    const waiting = document.getElementById('pubWaiting');
+    const v = document.getElementById('pubVid');
+    if(tag) tag.style.display = live ? '' : 'none';
+    if(waiting) waiting.style.display = live ? 'none' : 'flex';
+    document.getElementById('pubHeadline').textContent = live ? 'You’re live.' : 'Waiting for your encoder…';
+    if(live){
+      if(NATIVE && pubHlsUrl){ try{ if(v.canPlayType('application/vnd.apple.mpegurl')){ v.src=pubHlsUrl + (pubHlsUrl.includes('?')?'&':'?') + 't=' + Date.now(); v.style.display='block'; v.load(); v.play().catch(()=>{}); } }catch(e){} }
+    } else {
+      try{ v.pause(); }catch(e){} v.removeAttribute('src'); v.style.display='none';
+    }
+  }
+
+  // Go Live tab — re-attach to a running stream (tab-back) instead of restarting it,
+  // or open the name-entry step if nothing is publishing yet.
+  async function enterGoLive(){
+    go('publish');
+    let status = null;
+    if(NATIVE && invoke){ try{ status = await invoke('publish_status'); }catch(e){} }
+    if(status){
+      publishing = true; pubActive = true; pubName = status.name; pubHlsUrl = status.info.hls_url;
+      titleEl.value = status.name; titleEl.readOnly = true;
+      document.getElementById('ingestServer').textContent = status.info.ingest_server;
+      document.getElementById('ingestKey').textContent = status.info.stream_key;
+      document.getElementById('shareLink').textContent = status.name;
+      document.getElementById('pubViewers').textContent = status.viewers;
+      document.getElementById('pubSetup').hidden = true;
+      document.getElementById('pubLive').hidden = false;
+      refreshGoLiveBadge();
+      applyPublishState(!!status.live);
+    } else {
+      publishing = true;
+      showPubSetup();
+      titleEl.focus(); if(titleEl.select) titleEl.select();
+    }
+  }
+  // Watch tab — re-attach to a running watch, else go to the browse/entry screen.
+  async function enterWatch(){
+    let status = null;
+    if(NATIVE && invoke){ try{ status = await invoke('watch_status'); }catch(e){} }
+    if(status){ document.getElementById('mPub').textContent = status.info.publisher; go('live'); setTitle(status.info.publisher, true); startWatchWatchdog(); setVideo(status.info.hls_url); }
+    else { go('entry'); }
+  }
   async function endPublish(){
-    publishing = false; pubName = ''; clearInterval(pubViewersTimer);
+    publishing = false; pubActive = false; pubName = ''; clearInterval(pubViewersTimer);
+    refreshGoLiveBadge();
     if(NATIVE && invoke){ try{ await invoke('stop_publish'); }catch(e){} }
     titleEl.readOnly = false;
+    document.getElementById('pubLive').hidden = true;
+    const tag=document.getElementById('pubLiveTag'); if(tag) tag.style.display='none';
     const v=document.getElementById('pubVid'); try{ v.pause(); }catch(e){} v.removeAttribute('src'); v.style.display='none';
     go('entry');
   }
-  async function leaveWatch(){ if(NATIVE && invoke){ try{ await invoke('stop_watch'); }catch(e){} } const v=document.getElementById('vid'); try{ v.pause(); }catch(e){} v.removeAttribute('src'); v.style.display='none'; go('entry'); }
-  document.getElementById('goLiveLink').addEventListener('click', startPublish);
-  document.getElementById('goLiveBtn').addEventListener('click', startPublish);
-  document.getElementById('homeBtn').addEventListener('click', async ()=>{ if(publishing){ await endPublish(); } else if(['live','seed','catchup'].includes(curStateName)){ await leaveWatch(); } else { go('entry'); } });
-  document.getElementById('settingsBtn').addEventListener('click', ()=>{ let acct='—'; try{ acct = sso.hasSession() ? 'Signed in' : 'Not signed in'; }catch(e){} document.getElementById('setAccount').textContent = acct; go('settings'); });
+  async function leaveWatch(){ if(NATIVE && invoke){ try{ await invoke('stop_watch'); }catch(e){} } const v=document.getElementById('vid'); clearInterval(v._retry); clearWatchUi(); try{ v.pause(); }catch(e){} v.removeAttribute('src'); v.style.display='none'; go('entry'); }
+  // Use the async session check (the sync one races storage hydration and wrongly
+  // shows "Not signed in" right after pairing). Show a transient "Checking…" first.
+  async function openSettings(){
+    go('settings');
+    const el = document.getElementById('setAccount'); el.textContent = 'Checking…';
+    let signedIn = false; try { signedIn = await sso.awaitSession(); } catch(e){}
+    el.textContent = signedIn ? 'Signed in' : 'Not signed in';
+  }
+
+  document.getElementById('tabWatch').addEventListener('click', enterWatch);
+  document.getElementById('tabGoLive').addEventListener('click', enterGoLive);
+  document.getElementById('tabSettings').addEventListener('click', openSettings);
+  document.getElementById('goLiveLink').addEventListener('click', enterGoLive);
+  document.getElementById('leaveWatchBtn').addEventListener('click', leaveWatch);
   document.getElementById('rePairBtn').addEventListener('click', ()=>{ const pb=document.getElementById('pairedBtn'); if(pb) pb.style.display=''; go('onboarding'); beginPairing(); });
   document.getElementById('cancelPublish').addEventListener('click', endPublish);
   document.getElementById('endStream').addEventListener('click', endPublish);
@@ -660,9 +784,24 @@ import * as sso from './sso.js';
         }
       );
       console.log('[sso] signIn result:', res);
-      if(res && res.ok){ setStatus('Linked ✓'); setTimeout(()=>go('entry'), 400); }
+      if(res && res.ok){ setStatus('Linked ✓'); await pushChainIdentity(); setTimeout(()=>go('entry'), 400); }
       else if(explain){ explain.textContent = 'Sign-in didn’t finish' + (res && res.error ? (' (' + res.error + ')') : '') + '. You can Skip for now and try again later.'; }
     } catch(e){ console.error('[sso] beginPairing threw', e); setStatus('Error: ' + ((e && e.message) || e)); }
+  }
+
+  // Bridge the paired statement-store allowance to the Rust signer: extract the
+  // slot key (decrypted from host-papp's storage) and hand it to the backend so all
+  // mesh chain writes are allowance-backed. Without this, presence/signaling are
+  // rejected on-chain and nothing connects. Safe to call repeatedly (Rust is idempotent).
+  async function pushChainIdentity(){
+    if(!(NATIVE && invoke)) return false;
+    try {
+      const key = sso.statementStoreSlotKey();
+      if(!key){ console.warn('[chain] no paired statement-store key yet'); return false; }
+      await invoke('set_chain_identity', { slotSecret: Array.from(key) });
+      console.log('[chain] paired identity sent to backend');
+      return true;
+    } catch(e){ console.error('[chain] set_chain_identity failed', e); return false; }
   }
 
   async function boot(){
@@ -673,11 +812,15 @@ import * as sso from './sso.js';
       // Windows/Linux use a custom titlebar; wire its min/max/close to the native window.
       const appWindow = (TAURI.window && TAURI.window.getCurrentWindow) ? TAURI.window.getCurrentWindow() : null;
       if(appWindow){ const wire=(id,fn)=>{ const b=document.getElementById(id); if(b) b.onclick=()=>{ try{ fn(); }catch(e){} }; }; wire('wcMin',()=>appWindow.minimize()); wire('wcMax',()=>appWindow.toggleMaximize()); wire('wcClose',()=>appWindow.close()); }
-      if(listen){ try{ await listen('mesh-stats', e=>applyStats(e.payload)); await listen('publish-live', ()=>markPublishLive()); await listen('publish-stats', e=>{ const el=document.getElementById('pubViewers'); if(el && e.payload) el.textContent=e.payload.viewers; }); await listen('publish-hint', e=>{ const a=document.getElementById('publishAwait'); if(a && e.payload && e.payload.message){ a.innerHTML='<span class="dot-await"></span>'+e.payload.message; } }); await listen('publish-ended', ()=>reopenIngest()); }catch(e){} }
+      if(listen){ try{ await listen('mesh-stats', e=>applyStats(e.payload)); await listen('publish-state', e=>applyPublishState(!!(e.payload && e.payload.live))); await listen('publish-stats', e=>{ const el=document.getElementById('pubViewers'); if(el && e.payload) el.textContent=e.payload.viewers; }); await listen('publish-hint', e=>{ const w=document.getElementById('pubWaiting'); const b=w&&w.querySelector('b'); if(b && e.payload && e.payload.message){ b.textContent=e.payload.message; } }); await listen('mesh-status', e=>{ const p=e&&e.payload; if(!p) return; console.log('[mesh-status]', p.state, p.detail); if(p.state==='error'){ const b=document.querySelector('#pubWaiting b'); if(b && !document.getElementById('pubLive').hidden) b.textContent=p.detail; } }); }catch(e){} }
+      // Re-attach: if a publish session is still running in the backend (a webview
+      // reload, or relaunch while the process lived), light the Go-Live tab badge so
+      // the user can tab straight back into it.
+      if(invoke){ try{ const ps = await invoke('publish_status'); if(ps){ pubActive = true; pubName = ps.name; pubHlsUrl = ps.info.hls_url; publishing = true; refreshGoLiveBadge(); } }catch(e){} }
       try {
         // Wait for the saved session to hydrate from storage (async) before
         // deciding — a sync check here races hydration and re-prompts for the QR.
-        if(await sso.awaitSession()){ go('entry'); }
+        if(await sso.awaitSession()){ await pushChainIdentity(); go('entry'); }
         else { go('onboarding'); document.getElementById('pairedBtn').style.display='none'; beginPairing(); }
       } catch(e){ go('entry'); }
     } else { document.body.classList.add('plat-macos'); go('entry'); }

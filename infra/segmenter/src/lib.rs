@@ -210,14 +210,35 @@ pub fn load(out_dir: &Path) -> std::io::Result<Cmaf> {
     Ok(Cmaf { init, segments })
 }
 
-/// Load fragments with sequence >= `from` (the live tail). The publisher loop
-/// calls this each tick to feed newly-written fragments into the mesh.
+/// Load fragments with sequence >= `from`, from a snapshot of the dir. Reads every
+/// `.m4s` present — use [`load_live_segments_from`] for a live tail, where the
+/// newest file may still be being written.
 pub fn load_segments_from(out_dir: &Path, from: Seq) -> std::io::Result<Vec<Segment>> {
+    let paths = sorted_segment_paths(out_dir)?;
+    segments_from_paths(&paths, from)
+}
+
+/// Like [`load_segments_from`] but holds back the newest fragment — for the LIVE
+/// tail, where the highest-numbered `.m4s` is the one ffmpeg is still writing.
+/// Reading it would capture a truncated, undecodable segment (the player then shows
+/// nothing). ffmpeg only opens segment N+1 after closing N, so any fragment that has
+/// a higher-numbered sibling is guaranteed complete.
+pub fn load_live_segments_from(out_dir: &Path, from: Seq) -> std::io::Result<Vec<Segment>> {
+    let mut paths = sorted_segment_paths(out_dir)?;
+    paths.pop(); // drop the in-progress (newest) fragment
+    segments_from_paths(&paths, from)
+}
+
+fn sorted_segment_paths(out_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut paths: Vec<_> = std::fs::read_dir(out_dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("m4s"))
         .collect();
     paths.sort();
+    Ok(paths)
+}
+
+fn segments_from_paths(paths: &[PathBuf], from: Seq) -> std::io::Result<Vec<Segment>> {
     let mut out = Vec::new();
     for (i, p) in paths.iter().enumerate() {
         let seq = i as Seq;

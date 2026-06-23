@@ -42,7 +42,7 @@ impl HlsSink {
     /// Clear the current init + segments — used when the ingest restarts a session,
     /// so the player loads the fresh feed cleanly instead of stale fragments.
     pub fn reset(&self) {
-        let mut g = self.shared.lock().unwrap();
+        let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         g.init = None;
         g.segments.clear();
         drop(g);
@@ -52,10 +52,10 @@ impl HlsSink {
 
 impl MediaSink for HlsSink {
     fn push_init(&self, bytes: Bytes) {
-        self.shared.lock().unwrap().init = Some(bytes);
+        self.shared.lock().unwrap_or_else(|e| e.into_inner()).init = Some(bytes);
     }
     fn push_segment(&self, seq: u64, bytes: Bytes) {
-        self.shared.lock().unwrap().segments.insert(seq, bytes);
+        self.shared.lock().unwrap_or_else(|e| e.into_inner()).segments.insert(seq, bytes);
     }
     fn on_play_head(&self) -> u64 {
         self.play_head.load(Ordering::SeqCst)
@@ -131,7 +131,7 @@ fn not_found() -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
 fn handle(req: tiny_http::Request, shared: &Arc<Mutex<Shared>>, play_head: &Arc<AtomicU64>) {
     let raw = req.url().to_string();
     let url = raw.split('?').next().unwrap_or(&raw); // tolerate cache-busting queries
-    let g = shared.lock().unwrap();
+    let g = shared.lock().unwrap_or_else(|e| e.into_inner());
     let resp = if url == "/live.m3u8" {
         tiny_http::Response::from_data(media_playlist(g.target_ms, &g.segments).into_bytes())
             .with_header(content_type("application/vnd.apple.mpegurl"))
