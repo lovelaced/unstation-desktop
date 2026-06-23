@@ -430,7 +430,13 @@ fn handle_cmd(
         }
         Cmd::Close(peer) => {
             orphan_cands.remove(&peer);
-            peers.remove(&peer);
+            // Keep the live count honest and tell the node, same as a disconnect.
+            if let Some(p) = peers.remove(&peer) {
+                if p.announced {
+                    connected.fetch_sub(1, Ordering::Relaxed);
+                    let _ = inbox.send(EngineEvent::PeerDisconnected { peer });
+                }
+            }
         }
     }
 }

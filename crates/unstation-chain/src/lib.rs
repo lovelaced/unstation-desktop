@@ -1,5 +1,5 @@
-//! Real chain integration for Unstation, backed by the Parity **UserAgent Kit**
-//! SDK (`useragent-native`). Implements `unstation-core`'s [`Signaling`] trait
+//! Real chain integration for Unstation, backed by an external Polkadot Rust SDK.
+//! Implements `unstation-core`'s [`Signaling`] trait
 //! over the Polkadot People-chain statement store, replacing the in-memory mock
 //! (`statement_store_mem`).
 //!
@@ -33,6 +33,14 @@ use useragent_native::chain::statement_store as ss;
 /// requests a metered allowance on testnet builds.
 pub fn init_statement_store(keypair: schnorrkel::Keypair) {
     ss::init_with_keypair(None, keypair, true);
+}
+
+/// Like [`init_statement_store`] but loads-or-generates a *persistent* signing key
+/// under `key_dir`, so the host keeps the same statement-store identity across
+/// launches (it stays signed in). `key_dir` should be a per-app, per-platform
+/// data directory (e.g. the OS app-data dir).
+pub fn init_statement_store_persisted(key_dir: &std::path::Path) {
+    ss::init_with_options(Some(key_dir), true);
 }
 
 /// Best-effort wait for the background subscription to connect.

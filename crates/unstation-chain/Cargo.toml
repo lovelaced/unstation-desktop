@@ -8,7 +8,7 @@ license = "AGPL-3.0-or-later"
 
 [dependencies]
 unstation-core = { path = "../unstation-core" }
-# The Parity UserAgent Kit native facade (statement store, wallet, VRF, bulletin).
+# The chain SDK's native facade (statement store, wallet, VRF, bulletin).
 # Mirrors truhost/desktop/src-tauri's dependency on the same crate.
 useragent-native = { package = "useragent-native", path = "../../../useragent-kit/crates/host-native" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros"] }

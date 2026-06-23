@@ -45,13 +45,47 @@ pub enum Source<'a> {
     RtmpListen { url: &'a str },
 }
 
-/// Is ffmpeg available on this machine?
+/// Resolve the `ffmpeg` binary to a path we can actually spawn.
+///
+/// macOS GUI apps (a launched `.app`) do NOT inherit the shell `PATH`, so a bare
+/// `ffmpeg` lookup that works under `tauri dev` (terminal) fails in the bundled
+/// app — Homebrew's `/opt/homebrew/bin` simply isn't on the GUI `PATH`. So we try,
+/// in order: an explicit `UNSTATION_FFMPEG` override, then `PATH`, then the usual
+/// install locations.
+pub fn ffmpeg_path() -> Option<PathBuf> {
+    let runs = |bin: &std::ffi::OsStr| {
+        Command::new(bin)
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+    if let Ok(p) = std::env::var("UNSTATION_FFMPEG") {
+        let pb = PathBuf::from(p);
+        if runs(pb.as_os_str()) {
+            return Some(pb);
+        }
+    }
+    if runs(std::ffi::OsStr::new("ffmpeg")) {
+        return Some(PathBuf::from("ffmpeg"));
+    }
+    for cand in [
+        "/opt/homebrew/bin/ffmpeg", // Apple Silicon Homebrew
+        "/usr/local/bin/ffmpeg",    // Intel Homebrew
+        "/opt/local/bin/ffmpeg",    // MacPorts
+        "/usr/bin/ffmpeg",
+    ] {
+        let pb = PathBuf::from(cand);
+        if pb.is_file() && runs(pb.as_os_str()) {
+            return Some(pb);
+        }
+    }
+    None
+}
+
+/// Is ffmpeg available anywhere we know to look (PATH or a common install dir)?
 pub fn ffmpeg_available() -> bool {
-    Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    ffmpeg_path().is_some()
 }
 
 /// The publish URL to hand an encoder for a local ingest `port` + stream `key`.
@@ -62,8 +96,10 @@ pub fn rtmp_url(port: u16, key: &str) -> String {
 
 /// Build the ffmpeg command for `source` → CMAF in `out_dir`.
 fn ffmpeg_command(source: &Source, out_dir: &Path, seg_secs: u32) -> Command {
-    let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-y", "-hide_banner", "-loglevel", "error"]);
+    // Resolve an absolute path so this works in a bundled macOS app (no shell PATH).
+    let bin = ffmpeg_path().unwrap_or_else(|| PathBuf::from("ffmpeg"));
+    let mut cmd = Command::new(bin);
+    cmd.args(["-y", "-hide_banner"]);
 
     let live = match source {
         Source::TestPattern { secs } => {
@@ -83,6 +119,10 @@ fn ffmpeg_command(source: &Source, out_dir: &Path, seg_secs: u32) -> Command {
             true
         }
     };
+
+    // Quiet for batch; verbose for the live ingest so ffmpeg.log shows the encoder
+    // connecting (or why it didn't).
+    cmd.args(["-loglevel", if live { "info" } else { "error" }]);
 
     cmd.args([
         "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
@@ -134,12 +174,25 @@ impl SegmenterProcess {
     }
 }
 
+impl Drop for SegmenterProcess {
+    /// Kill ffmpeg when the handle goes away (a respawn, or the publish session
+    /// ending) so the RTMP port is freed and no orphan encoder lingers.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Spawn ffmpeg to segment `source` into `out_dir` live; returns immediately.
 /// For [`Source::RtmpListen`] ffmpeg binds the port and waits for a publisher.
 pub fn spawn(source: &Source, out_dir: &Path, seg_secs: u32) -> std::io::Result<SegmenterProcess> {
     std::fs::create_dir_all(out_dir)?;
     let mut cmd = ffmpeg_command(source, out_dir, seg_secs);
     cmd.stdin(Stdio::null());
+    // Capture ffmpeg's own log so a stuck or failed ingest is diagnosable.
+    if let Ok(log) = std::fs::File::create(out_dir.join("ffmpeg.log")) {
+        cmd.stderr(Stdio::from(log));
+    }
     let child = cmd.spawn()?;
     Ok(SegmenterProcess { child, out_dir: out_dir.to_path_buf() })
 }

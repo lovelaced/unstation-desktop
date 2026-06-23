@@ -73,13 +73,58 @@ export function getAdapter() {
   return adapter;
 }
 
-/** Does a paired session already exist? */
+/** Does a paired session already exist? (Synchronous — may be `false` before the
+ *  persisted session has hydrated from storage; use {@link awaitSession} at boot.) */
 export function hasSession() {
   try {
     return getAdapter().sessions.sessions.read().length > 0;
   } catch (e) {
     return false;
   }
+}
+
+/**
+ * Resolve to `true` once a paired session exists, or `false` after `timeoutMs`.
+ *
+ * host-papp hydrates the persisted session from storage **asynchronously** (its
+ * session repo reads `localStorage` through a `ResultAsync`, so the in-memory
+ * `sessions` list is empty for a microtask or two after `getAdapter()` returns).
+ * A synchronous `hasSession()` at startup therefore races that hydration and
+ * almost always loses — which made the app demand a fresh QR link on every
+ * launch even though the pairing was saved. This subscribes and waits for the
+ * real answer instead of guessing on an empty list.
+ */
+export function awaitSession(timeoutMs = 2500) {
+  return new Promise((resolve) => {
+    let mgr;
+    try {
+      mgr = getAdapter().sessions;
+    } catch (e) {
+      resolve(false);
+      return;
+    }
+    if (mgr.read().length > 0) {
+      resolve(true);
+      return;
+    }
+    let done = false;
+    let unsub = null;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      try { unsub && unsub(); } catch (e) { /* ignore */ }
+      resolve(v);
+    };
+    try {
+      unsub = mgr.subscribe((sessions) => {
+        if (sessions && sessions.length > 0) finish(true);
+      });
+    } catch (e) {
+      resolve(false);
+      return;
+    }
+    setTimeout(() => finish(false), timeoutMs);
+  });
 }
 
 /**

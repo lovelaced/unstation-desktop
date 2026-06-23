@@ -57,10 +57,10 @@ impl Session {
         stream: StreamId,
         n_shards: u32,
         stun: Vec<String>,
-        keypair: schnorrkel::Keypair,
+        key_dir: std::path::PathBuf,
         inbox: UnboundedSender<EngineEvent>,
     ) -> Result<Self, String> {
-        unstation_chain::init_statement_store(keypair);
+        unstation_chain::init_statement_store_persisted(&key_dir);
         let my_peer = unstation_chain::local_peer_id()
             .ok_or("statement store did not expose a public key")?;
 

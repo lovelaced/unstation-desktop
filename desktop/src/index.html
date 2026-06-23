@@ -36,7 +36,7 @@
   body.native .win { width: 100%; height: 100vh; border-radius: 0; border: 0; box-shadow: none;
     background: linear-gradient(180deg, rgba(12,16,24,.72), rgba(8,10,15,.82)); }
   body.native .lights { display: none; }           /* OS draws the traffic lights */
-  body.native .titlebar { padding-left: 82px; }     /* room for them */
+  body.native.plat-macos .titlebar { padding-left: 82px; }  /* room for the OS traffic lights */
 
   .win { position: relative; z-index: 1; width: min(1080px, 100%); height: min(720px, calc(100vh - 56px));
     border-radius: var(--r-win); background: linear-gradient(180deg, #0c1018 0%, var(--ground) 100%);
@@ -173,7 +173,7 @@
   .await.live .dot-await { background: var(--accent); box-shadow: 0 0 10px var(--accent); animation: none; }
   .await.live { color: var(--accent); }
   .accent { color: var(--accent); }
-  .pub-setup, .pub-live { display: flex; flex-direction: column; align-items: center; gap: 16px; width: min(620px, 90%); }
+  .pub-live { display: flex; flex-direction: column; align-items: center; gap: 16px; width: min(900px, 94%); }
   .pub-live[hidden] { display: none; }
   #streamTitle { font-family: var(--ui); font-size: 16px; font-weight: 510; }
   details.encoder { width: min(560px, 100%); border: 1px solid var(--line); border-radius: 12px; background: rgba(255,255,255,.03); text-align: left; }
@@ -188,6 +188,51 @@
   .share-bar .share-k { font-size: 11px; letter-spacing: .5px; text-transform: uppercase; color: var(--faint); }
   .share-bar code { flex: 1 1 auto; min-width: 0; font-family: var(--mono); font-size: 14px; color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .share-bar .viewers { font-family: var(--mono); font-size: 12px; color: var(--dim); white-space: nowrap; }
+  /* Two-column entry — action + assurances side by side, so the home screen reads
+     as a filled, intentional layout instead of a centered void. */
+  .scene[data-scene="entry"] { flex-direction: row; align-items: center; justify-content: center; gap: 52px; text-align: left; padding: 44px 60px; }
+  .entry-action { display: flex; flex-direction: column; align-items: flex-start; gap: 18px; width: min(480px, 48%); }
+  .entry-action h1.display { font-size: clamp(32px, 4.4vw, 50px); }
+  .entry-action .cmd { width: 100%; }
+  .entry-panel { width: min(360px, 42%); display: flex; flex-direction: column; gap: 16px; padding: 24px; border-radius: var(--r-card);
+    background: var(--glass-2); backdrop-filter: blur(20px) saturate(1.5); -webkit-backdrop-filter: blur(20px) saturate(1.5);
+    border: 1px solid var(--line-strong); box-shadow: inset 0 1px 0 rgba(255,255,255,.06), 0 20px 50px -22px rgba(0,0,0,.7); }
+  .assure { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 14px; }
+  .assure li { display: flex; gap: 11px; align-items: flex-start; font-size: 13px; color: var(--dim); line-height: 1.45; }
+  .assure li svg { width: 18px; height: 18px; flex: 0 0 auto; margin-top: 1px; color: var(--accent); }
+  .assure li b { color: var(--text); font-weight: 590; display: block; font-size: 13.5px; margin-bottom: 2px; }
+  .entry-panel .btn.ghost { margin-top: 2px; align-self: stretch; text-align: center; }
+  @media (max-width: 760px) { .scene[data-scene="entry"] { flex-direction: column; gap: 24px; padding: 32px; } .entry-action, .entry-panel { width: min(480px, 90%); } .entry-action { align-items: center; text-align: center; } }
+  /* Player fills the stage — the video is the hero, minimal margin around it. */
+  #player .frame { width: min(1040px, 94%); }
+  .winbtn[hidden] { display: none; }
+  /* Native window controls — a custom titlebar on Windows/Linux; macOS uses the OS overlay. */
+  .win-controls { display: none; align-items: center; gap: 2px; grid-column: 3; justify-self: end; }
+  body.native.plat-windows .win-controls, body.native.plat-linux .win-controls { display: flex; }
+  /* Title-bar nav: macOS keeps it on the right (the OS traffic lights own the left);
+     Windows/Linux put nav on the left and the window controls on the right. */
+  .tb-nav { grid-column: 1; justify-self: start; display: flex; align-items: center; gap: 8px; }
+  body.plat-macos .tb-nav { grid-column: 3; justify-self: end; }
+  .lights { grid-column: 1; justify-self: start; }
+  .title-center { grid-column: 2; }
+  /* Native UI font per platform (the title text already uses the platform mono via --mono). */
+  body.plat-macos { --ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; }
+  body.plat-windows { --ui: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; }
+  body.plat-linux { --ui: system-ui, "Inter", "Cantarell", "Ubuntu", "Noto Sans", sans-serif; }
+  /* Go Live: two columns — name your stream (left) + the always-visible encoder card (right). */
+  .pub-setup { display: flex; flex-direction: row; align-items: center; gap: 36px; width: min(860px, 94%); text-align: left; }
+  .pub-left { display: flex; flex-direction: column; align-items: flex-start; gap: 16px; flex: 1 1 0; min-width: 0; }
+  .pub-left .cmd { width: 100%; }
+  .pub-encoder { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+  .pub-encoder .ingest-card { width: 100%; }
+  @media (max-width: 760px) { .pub-setup { flex-direction: column; align-items: stretch; gap: 22px; width: min(560px, 92%); } }
+  .wc { width: 30px; height: 30px; display: grid; place-items: center; border: 0; background: transparent; color: var(--dim); cursor: pointer; border-radius: 7px; transition: background .15s var(--ease), color .15s var(--ease); }
+  .wc svg { width: 13px; height: 13px; } .wc:hover { background: rgba(255,255,255,.08); color: var(--text); } .wc.wc-close:hover { background: #e81123; color: #fff; }
+  .settings-card { display: flex; flex-direction: column; width: min(560px, 90%); border-radius: var(--r-card); background: var(--glass-2); border: 1px solid var(--line-strong); box-shadow: inset 0 1px 0 rgba(255,255,255,.06), 0 20px 50px -22px rgba(0,0,0,.7); overflow: hidden; text-align: left; }
+  .set-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 15px 20px; border-bottom: 1px solid var(--line); }
+  .set-row:last-child { border-bottom: 0; }
+  .set-k { font-size: 10.5px; letter-spacing: .5px; text-transform: uppercase; color: var(--faint); }
+  .set-v { font-size: 14px; color: var(--text); margin-top: 3px; line-height: 1.4; max-width: 42ch; }
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
   @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition-duration: .01ms !important; } }
 </style>
@@ -197,10 +242,24 @@
   <div class="titlebar" data-tauri-drag-region>
     <div class="lights"><span class="light r"></span><span class="light y"></span><span class="light g"></span></div>
     <div class="title-center" id="titleCenter"><span id="titleText">Unstation</span></div>
-    <div class="title-right">
-      <div class="winbtn" id="netToggle" title="Network">
+    <div class="tb-nav">
+      <div class="winbtn" id="homeBtn" title="Home" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/></svg>
+      </div>
+      <div class="winbtn" id="goLiveBtn" title="Go live" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2.6"/><path d="M8.5 8.5a5 5 0 0 0 0 7M15.5 8.5a5 5 0 0 1 0 7M5.6 5.6a9 9 0 0 0 0 12.8M18.4 5.6a9 9 0 0 1 0 12.8"/></svg>
+      </div>
+      <div class="winbtn" id="netToggle" title="Network" hidden>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2.4"/><circle cx="5" cy="6" r="1.8"/><circle cx="19" cy="6" r="1.8"/><circle cx="5" cy="18" r="1.8"/><circle cx="19" cy="18" r="1.8"/><path d="M10 11 6.5 7.2M14 11l3.5-3.8M10 13l-3.5 3.8M14 13l3.5 3.8"/></svg>
       </div>
+      <div class="winbtn" id="settingsBtn" title="Settings" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </div>
+    </div>
+    <div class="win-controls" id="winControls">
+      <button class="wc" id="wcMin" title="Minimize"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M5 12h14"/></svg></button>
+      <button class="wc" id="wcMax" title="Maximize"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="5" y="5" width="14" height="14" rx="1.5"/></svg></button>
+      <button class="wc wc-close" id="wcClose" title="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
     </div>
   </div>
 
@@ -208,15 +267,25 @@
     <canvas id="mesh"></canvas>
 
     <div class="scene" data-scene="entry">
-      <div class="eyebrow">Peer-to-peer live</div>
-      <h1 class="display">Watch what can't<br>be taken down.</h1>
-      <form class="cmd" id="watchForm">
-        <span class="lead"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg></span>
-        <input id="streamInput" inputmode="url" spellcheck="false" placeholder="paste a stream link or  name.dot" value="hardfork.dot" />
-        <button class="btn" type="submit">Watch</button>
-      </form>
-      <div class="hint">No account. No server. The stream comes from <b>peers</b>, verified byte-for-byte.</div>
-      <button class="golive-link" id="goLiveLink" type="button">Go live instead →</button>
+      <div class="entry-action">
+        <div class="eyebrow">Peer-to-peer live</div>
+        <h1 class="display">Watch what can't<br>be taken down.</h1>
+        <form class="cmd" id="watchForm">
+          <span class="lead"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg></span>
+          <input id="streamInput" inputmode="url" spellcheck="false" placeholder="enter the stream name" value="" />
+          <button class="btn" type="submit">Watch</button>
+        </form>
+        <div class="hint">No account. No server. The stream comes from <b>peers</b>, verified byte-for-byte.</div>
+      </div>
+      <aside class="entry-panel">
+        <div class="eyebrow">Why it's different</div>
+        <ul class="assure">
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2.4"/><circle cx="5" cy="6" r="1.8"/><circle cx="19" cy="6" r="1.8"/><circle cx="5" cy="18" r="1.8"/><circle cx="19" cy="18" r="1.8"/><path d="M10 11 6.5 7.2M14 11l3.5-3.8M10 13l-3.5 3.8M14 13l3.5 3.8"/></svg><span><b>No server in the path</b>Peers relay the video to each other — nothing to throttle or take down.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/></svg><span><b>Verified byte-for-byte</b>Every segment is content-addressed and signed by the publisher.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg><span><b>Keys stay on your phone</b>Sign in once with your Polkadot app; this device only holds a revocable allowance.</span></li>
+        </ul>
+        <button class="btn ghost" id="goLiveLink" type="button">Go live instead →</button>
+      </aside>
     </div>
 
     <div class="scene" data-scene="onboarding">
@@ -252,28 +321,41 @@
       <div class="row" style="display:flex;gap:10px;"><button class="btn" data-goto="finding" type="button">Watch the recording</button><button class="btn ghost" data-goto="entry" type="button">Back</button></div>
     </div>
 
+    <div class="scene" data-scene="settings">
+      <div class="eyebrow">Settings</div>
+      <div class="settings-card">
+        <div class="set-row"><div><div class="set-k">Account</div><div class="set-v" id="setAccount">—</div></div><button class="btn ghost" id="rePairBtn" type="button">Re-pair Polkadot app</button></div>
+        <div class="set-row"><div><div class="set-k">Network</div><div class="set-v">Paseo People · statement store</div></div></div>
+        <div class="set-row"><div><div class="set-k">Connection health</div><div class="set-v">A glanceable badge shows P2P health while you watch — open it for peers, offload, latency, and connection type.</div></div></div>
+        <div class="set-row"><div><div class="set-k">About</div><div class="set-v">Unstation · v0.0.0 · AGPL-3.0-or-later</div></div></div>
+      </div>
+    </div>
+
     <div class="scene" data-scene="publish">
       <div class="eyebrow">Go live</div>
       <h1 class="display" id="pubHeadline">What are you streaming?</h1>
 
       <div class="pub-setup" id="pubSetup">
-        <form class="cmd" id="titleForm" onsubmit="return false;">
-          <span class="lead"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m22 8-6 4 6 4V8Z"/><rect x="2" y="6" width="14" height="12" rx="2"/></svg></span>
-          <input id="streamTitle" maxlength="60" spellcheck="false" placeholder="Friday Night Football" />
-        </form>
-        <div class="hint">share link&nbsp;&nbsp;<b id="sharePreview" class="accent">friday-night-football.dot</b></div>
-
-        <details class="encoder">
-          <summary>Connect your encoder (OBS, ffmpeg, …)</summary>
+        <div class="pub-left">
+          <form class="cmd" id="titleForm" onsubmit="return false;">
+            <span class="lead"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m22 8-6 4 6 4V8Z"/><rect x="2" y="6" width="14" height="12" rx="2"/></svg></span>
+            <input id="streamTitle" maxlength="60" spellcheck="false" placeholder="Friday Night Football" />
+          </form>
+          <div class="hint">viewers tune in with&nbsp;&nbsp;<b id="sharePreview" class="accent">friday-night-football</b></div>
+          <div class="pub-actions" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <button class="btn" id="startStream" type="button">Go live</button>
+            <button class="btn ghost" id="cancelPublish" type="button">Cancel</button>
+          </div>
+          <div class="await" id="publishAwait" style="display:none"><span class="dot-await"></span>Waiting for your encoder…</div>
+        </div>
+        <aside class="pub-encoder">
+          <div class="eyebrow">Connect your encoder</div>
           <div class="ingest-card">
             <div class="field"><span class="k">Server</span><code id="ingestServer">rtmp://127.0.0.1:21935/live</code><button class="copy" data-copy="ingestServer" type="button">Copy</button></div>
             <div class="field"><span class="k">Stream key</span><code id="ingestKey">unstation</code><button class="copy" data-copy="ingestKey" type="button">Copy</button></div>
-            <p class="ingest-hint">In OBS: <b>Settings → Stream → Service: Custom</b>, paste the Server and Stream Key, then <b>Start Streaming</b>. Works with your existing setup — no plugins.</p>
+            <p class="ingest-hint">In OBS: <b>Settings → Stream → Service: Custom</b>, paste these in, then <b>Start Streaming</b>. Any encoder works — no plugins. Your preview appears the moment video arrives.</p>
           </div>
-        </details>
-
-        <div class="await" id="publishAwait"><span class="dot-await"></span>Waiting for your encoder…</div>
-        <button class="btn ghost" id="cancelPublish" type="button">Cancel</button>
+        </aside>
       </div>
 
       <div class="pub-live" id="pubLive" hidden>
@@ -285,7 +367,7 @@
         </div>
         <div class="share-bar">
           <span class="share-k">Share</span>
-          <code id="shareLink">friday-night-football.dot</code>
+          <code id="shareLink">friday-night-football</code>
           <button class="copy" id="copyShare" data-copy="shareLink" type="button">Copy</button>
           <span class="viewers"><span id="pubViewers">0</span> watching</span>
         </div>
@@ -306,7 +388,7 @@
 
     <div class="hud" id="hud">
       <div class="pill" id="pill">
-        <span class="state"><span class="health-dot"></span><span><span class="mode" id="modeText">LIVE · P2P</span> <span class="sep">·</span> <span class="peers"><span id="peerCount">1</span> peers</span></span></span>
+        <span class="state"><span class="health-dot"></span><span><span class="mode" id="modeText">LIVE · P2P</span> <span class="sep">·</span> <span class="peers"><span id="peerCount">0</span> peers</span></span></span>
         <span class="chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 15 6-6 6 6"/></svg></span>
       </div>
     </div>
@@ -319,7 +401,7 @@
           <div class="label"><div class="pct"><span id="rhoPct">0</span><small>%</small></div><div class="cap">from peers</div></div>
         </div>
         <div class="metrics">
-          <div class="metric"><div class="k">Peers</div><div class="v cy" id="mPeers">1</div></div>
+          <div class="metric"><div class="k">Peers</div><div class="v cy" id="mPeers">0</div></div>
           <div class="metric"><div class="k">From seeds</div><div class="v" id="mSeed">0%</div></div>
           <div class="metric"><div class="k">From chain</div><div class="v" id="mChain">0%</div></div>
           <div class="metric"><div class="k">Latency</div><div class="v" id="mLat">—</div></div>
@@ -379,9 +461,12 @@ import * as sso from './sso.js';
   function showScene(name){ scenes.forEach(s=>s.classList.toggle('show', s.dataset.scene===name)); }
   function setTitle(stream,verified){ titleCenter.style.opacity=0; setTimeout(()=>{ if(verified){ titleCenter.innerHTML='<span class="verified"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/></svg></span>'+stream; } else { titleCenter.textContent=stream; } titleCenter.style.opacity=1; }, 200); }
 
+  const homeBtn=document.getElementById('homeBtn'), goLiveBtn=document.getElementById('goLiveBtn'), netToggleBtn=document.getElementById('netToggle'), settingsBtn=document.getElementById('settingsBtn');
+  function setNav(state, isLive){ homeBtn.hidden = (state==='entry' || state==='onboarding'); goLiveBtn.hidden = (state!=='entry'); netToggleBtn.hidden = !isLive; settingsBtn.hidden = (state==='onboarding' || state==='settings'); if(!isLive) netToggleBtn.classList.remove('active'); }
   function go(state){ clearSeq(); curStateName=state;
     document.querySelectorAll('.dock button').forEach(b=>b.classList.toggle('on', b.dataset.state===state));
     const isLive=['live','seed','catchup'].includes(state);
+    setNav(state, isLive);
     player.classList.toggle('show', isLive); hud.classList.toggle('show', isLive);
     document.getElementById('catchup').style.display = state==='catchup'?'grid':'none';
     if(isLive){ intensity=1; mode=state==='seed'?'seed':'p2p'; win.dataset.health=mode; document.getElementById('modeText').textContent=state==='seed'?'LIVE · via seed':'LIVE · P2P'; showScene(''); if(!NATIVE){ setTitle('hardfork.dot',true); animateGauge(state==='seed'?41:78); setMetrics(state==='seed'); } return; }
@@ -416,59 +501,118 @@ import * as sso from './sso.js';
   document.querySelectorAll('[data-goto]').forEach(b=>b.addEventListener('click',()=>go(b.dataset.goto)));
 
   function setVideo(url){ const v=document.getElementById('vid'); if(!url)return; try{ if(v.canPlayType('application/vnd.apple.mpegurl')){ v.src=url; v.style.display='block'; v.play().catch(()=>{}); } }catch(e){} }
+  // Surface media errors (blocked load, decode failure, …) so a missing picture is debuggable.
+  ['vid','pubVid'].forEach(id=>{ const el=document.getElementById(id); if(el) el.addEventListener('error', ()=>{ const e=el.error; console.error('[video]', id, 'error', e&&e.code, e&&e.message, 'src=', el.currentSrc); }); });
 
-  document.getElementById('watchForm').addEventListener('submit', async (e)=>{ e.preventDefault(); const target=(document.getElementById('streamInput').value||'hardfork.dot').trim(); go('finding');
-    if(NATIVE && invoke){ try{ const info=await invoke('start_watch',{ target }); setVideo(info.hls_url); setTitle(target,true); document.getElementById('mPub').textContent=info.publisher; go('live'); applyStats({peers:info.peers,rho:info.rho,mode:'p2p',from_seed:0,from_chain:0,latency_s:4.2,ice:'direct'}); }catch(err){ console.error('start_watch failed',err); go('entry'); } } });
+  document.getElementById('watchForm').addEventListener('submit', async (e)=>{ e.preventDefault(); const target=(document.getElementById('streamInput').value||'').trim(); if(!target){ document.getElementById('streamInput').focus(); return; } go('finding');
+    if(NATIVE && invoke){ try{ const info=await invoke('start_watch',{ target }); setVideo(info.hls_url); setTitle(target,true); document.getElementById('mPub').textContent=info.publisher; go('live'); applyStats({peers:info.peers,rho:info.rho,mode:'p2p',from_seed:0,from_chain:0,latency_s:0,ice:'connecting'}); }catch(err){ console.error('start_watch failed',err); go('entry'); } } });
 
   document.getElementById('pairedBtn').addEventListener('click', async ()=>{ if(NATIVE && invoke){ try{ await invoke('complete_signin'); }catch(e){} } go('entry'); });
 
   /* Go Live (publisher) — name your stream, share a friendly link, watch it back */
-  let publishing = false, pubHlsUrl = null, pubViewersTimer = null;
+  let publishing = false, pubHlsUrl = null, pubViewersTimer = null, pubName = '';
   const slugify = t => ((t||'').trim().toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'') || 'my-stream');
-  const shareName = t => slugify(t) + '.dot';
+  // The stream's shareable name — just the text a viewer types. No ".dot": chain-
+  // backed `.dot` resolution lands later, and the Rust side hashes the same
+  // canonical name whether or not a ".dot" is present.
+  const shareName = t => slugify(t);
   const titleEl = document.getElementById('streamTitle');
-  titleEl.addEventListener('input', ()=>{ const s = shareName(titleEl.value); document.getElementById('sharePreview').textContent = s; document.getElementById('shareLink').textContent = s; });
+  const startStreamBtn = document.getElementById('startStream');
+  const awaitEl = document.getElementById('publishAwait');
+  const setAwait = (msg, show = true) => { awaitEl.style.display = show ? 'flex' : 'none'; if (msg != null) awaitEl.innerHTML = '<span class="dot-await"></span>' + msg; };
+  titleEl.addEventListener('input', ()=>{ document.getElementById('sharePreview').textContent = shareName(titleEl.value); });
 
+  // Step 1 — name the stream. We deliberately do NOT open the ingest yet: the
+  // stream's identity is derived from this name, so it must be fixed before we
+  // publish presence. (Opening on entry with an empty box made every stream
+  // "my-stream" and broke discovery — that's the bug this fixes.)
   function showPubSetup(){
     document.getElementById('pubSetup').hidden = false;
     document.getElementById('pubLive').hidden = true;
-    document.getElementById('pubHeadline').textContent = 'What are you streaming?';
-    const a = document.getElementById('publishAwait'); a.className='await'; a.innerHTML='<span class="dot-await"></span>Waiting for your encoder…';
+    document.getElementById('pubHeadline').textContent = 'Name your stream';
+    titleEl.readOnly = false;
+    startStreamBtn.hidden = false;
+    setAwait(null, false);
+    document.getElementById('sharePreview').textContent = shareName(titleEl.value);
   }
-  function markPublishLive(){
-    document.getElementById('pubHeadline').textContent = 'You’re live.';
-    document.getElementById('pubSetup').hidden = true;
-    document.getElementById('pubLive').hidden = false;
-    document.getElementById('shareLink').textContent = shareName(titleEl.value);
-    const v = document.getElementById('pubVid');
-    if(NATIVE && pubHlsUrl){ try{ if(v.canPlayType('application/vnd.apple.mpegurl')){ v.src=pubHlsUrl; v.style.display='block'; v.play().catch(()=>{}); } }catch(e){} }
-    let vw = 0; document.getElementById('pubViewers').textContent = vw;
-    clearInterval(pubViewersTimer);
-    pubViewersTimer = setInterval(()=>{ vw = Math.max(0, vw + (Math.random()<0.6?1:0) - (Math.random()<0.15?1:0)); document.getElementById('pubViewers').textContent = vw; }, 2500);
-  }
-  async function startPublish(){
-    go('publish'); publishing = true; showPubSetup();
-    titleEl.focus();
+
+  // Step 2 — lock the name in and open the ingest under it.
+  async function goLiveStart(){
+    if(!publishing) return;
+    pubName = shareName(titleEl.value);
+    titleEl.value = pubName;            // echo the canonical name back to the user
+    titleEl.readOnly = true;
+    startStreamBtn.hidden = true;
+    document.getElementById('pubHeadline').textContent = 'Waiting for your encoder…';
+    document.getElementById('sharePreview').textContent = pubName;
+    setAwait('Waiting for your encoder…');
     if(NATIVE && invoke){
       try {
-        const info = await invoke('start_publish', { title: titleEl.value });
+        const info = await invoke('start_publish', { title: pubName });
         pubHlsUrl = info.hls_url;
         document.getElementById('ingestServer').textContent = info.ingest_server;
         document.getElementById('ingestKey').textContent = info.stream_key;
-      } catch(err){ const a=document.getElementById('publishAwait'); a.innerHTML='<span class="dot-await"></span>'+(''+err); }
+      } catch(err){ setAwait(''+err); }
     } else {
       setTimeout(()=>{ if(publishing) markPublishLive(); }, 1800); // preview demo
     }
   }
+
+  function markPublishLive(){
+    document.getElementById('pubHeadline').textContent = 'You’re live.';
+    document.getElementById('pubSetup').hidden = true;
+    document.getElementById('pubLive').hidden = false;
+    document.getElementById('shareLink').textContent = pubName || shareName(titleEl.value);
+    const v = document.getElementById('pubVid');
+    if(NATIVE && pubHlsUrl){ try{ if(v.canPlayType('application/vnd.apple.mpegurl')){ v.src=pubHlsUrl + (pubHlsUrl.includes('?')?'&':'?') + 't=' + Date.now(); v.style.display='block'; v.load(); v.play().catch(()=>{}); } }catch(e){} }
+    clearInterval(pubViewersTimer);
+    document.getElementById('pubViewers').textContent = '0'; // real count arrives via the 'publish-stats' event
+  }
+
+  async function startPublish(){
+    go('publish'); publishing = true;
+    if(pubName) titleEl.value = pubName;
+    showPubSetup();
+    titleEl.focus(); if(titleEl.select) titleEl.select();
+  }
+
+  // Encoder disconnected after we went live. Reopen the ingest under the SAME name
+  // and wait — OBS and most encoders auto-reconnect, so the stream resumes on its
+  // own with no action needed.
+  async function reopenIngest(){
+    if(!publishing) return;
+    const v=document.getElementById('pubVid'); try{ v.pause(); }catch(e){} v.removeAttribute('src'); v.style.display='none';
+    document.getElementById('pubSetup').hidden = false;
+    document.getElementById('pubLive').hidden = true;
+    document.getElementById('pubHeadline').textContent = 'Encoder disconnected';
+    titleEl.readOnly = true; startStreamBtn.hidden = true;
+    setAwait('Encoder disconnected — your stream resumes automatically when it reconnects.');
+    if(NATIVE && invoke){
+      try {
+        const info = await invoke('start_publish', { title: pubName });
+        pubHlsUrl = info.hls_url;
+        document.getElementById('ingestServer').textContent = info.ingest_server;
+        document.getElementById('ingestKey').textContent = info.stream_key;
+      } catch(err){ setAwait(''+err); }
+    }
+  }
   async function endPublish(){
-    publishing = false; clearInterval(pubViewersTimer);
+    publishing = false; pubName = ''; clearInterval(pubViewersTimer);
     if(NATIVE && invoke){ try{ await invoke('stop_publish'); }catch(e){} }
+    titleEl.readOnly = false;
     const v=document.getElementById('pubVid'); try{ v.pause(); }catch(e){} v.removeAttribute('src'); v.style.display='none';
     go('entry');
   }
+  async function leaveWatch(){ if(NATIVE && invoke){ try{ await invoke('stop_watch'); }catch(e){} } const v=document.getElementById('vid'); try{ v.pause(); }catch(e){} v.removeAttribute('src'); v.style.display='none'; go('entry'); }
   document.getElementById('goLiveLink').addEventListener('click', startPublish);
+  document.getElementById('goLiveBtn').addEventListener('click', startPublish);
+  document.getElementById('homeBtn').addEventListener('click', async ()=>{ if(publishing){ await endPublish(); } else if(['live','seed','catchup'].includes(curStateName)){ await leaveWatch(); } else { go('entry'); } });
+  document.getElementById('settingsBtn').addEventListener('click', ()=>{ let acct='—'; try{ acct = sso.hasSession() ? 'Signed in' : 'Not signed in'; }catch(e){} document.getElementById('setAccount').textContent = acct; go('settings'); });
+  document.getElementById('rePairBtn').addEventListener('click', ()=>{ const pb=document.getElementById('pairedBtn'); if(pb) pb.style.display=''; go('onboarding'); beginPairing(); });
   document.getElementById('cancelPublish').addEventListener('click', endPublish);
   document.getElementById('endStream').addEventListener('click', endPublish);
+  document.getElementById('startStream').addEventListener('click', goLiveStart);
+  document.getElementById('titleForm').addEventListener('submit', (e)=>{ e.preventDefault(); goLiveStart(); }); // Enter in the name field
   document.querySelectorAll('.copy').forEach(btn => btn.addEventListener('click', async ()=>{
     const el = document.getElementById(btn.dataset.copy); const txt = el ? el.textContent : '';
     try { await navigator.clipboard.writeText(txt); } catch(e){}
@@ -524,12 +668,19 @@ import * as sso from './sso.js';
   async function boot(){
     if(NATIVE){
       document.body.classList.add('native');
-      if(listen){ try{ await listen('mesh-stats', e=>applyStats(e.payload)); await listen('publish-live', ()=>markPublishLive()); }catch(e){} }
+      let plat='macos'; try{ plat = await invoke('platform'); }catch(e){}
+      document.body.classList.add('plat-'+plat);
+      // Windows/Linux use a custom titlebar; wire its min/max/close to the native window.
+      const appWindow = (TAURI.window && TAURI.window.getCurrentWindow) ? TAURI.window.getCurrentWindow() : null;
+      if(appWindow){ const wire=(id,fn)=>{ const b=document.getElementById(id); if(b) b.onclick=()=>{ try{ fn(); }catch(e){} }; }; wire('wcMin',()=>appWindow.minimize()); wire('wcMax',()=>appWindow.toggleMaximize()); wire('wcClose',()=>appWindow.close()); }
+      if(listen){ try{ await listen('mesh-stats', e=>applyStats(e.payload)); await listen('publish-live', ()=>markPublishLive()); await listen('publish-stats', e=>{ const el=document.getElementById('pubViewers'); if(el && e.payload) el.textContent=e.payload.viewers; }); await listen('publish-hint', e=>{ const a=document.getElementById('publishAwait'); if(a && e.payload && e.payload.message){ a.innerHTML='<span class="dot-await"></span>'+e.payload.message; } }); await listen('publish-ended', ()=>reopenIngest()); }catch(e){} }
       try {
-        if(sso.hasSession()){ go('entry'); }
+        // Wait for the saved session to hydrate from storage (async) before
+        // deciding — a sync check here races hydration and re-prompts for the QR.
+        if(await sso.awaitSession()){ go('entry'); }
         else { go('onboarding'); document.getElementById('pairedBtn').style.display='none'; beginPairing(); }
       } catch(e){ go('entry'); }
-    } else { go('entry'); }
+    } else { document.body.classList.add('plat-macos'); go('entry'); }
   }
   boot();
 })();

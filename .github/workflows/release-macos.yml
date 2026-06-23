@@ -6,9 +6,8 @@ name: Release macOS DMG
 # with the .dmg attached. See the README → "Test on a second Mac over your LAN".
 #
 # Required once, in Settings → Secrets and variables → Actions:
-#   • Secret  USERAGENT_KIT_TOKEN — a GitHub PAT with read access to the UserAgent Kit SDK repo.
-#   • (optional) Variables USERAGENT_KIT_REPO / USERAGENT_KIT_REF if the SDK isn't at
-#     paritytech/useragent-kit @ main.
+#   • Secret   SDK_TOKEN — a token with read access to the private chain-SDK repo.
+#   • Variable SDK_REPO — the SDK repo's owner/name; optional SDK_REF (branch/tag).
 
 on:
   workflow_dispatch:
@@ -36,14 +35,18 @@ jobs:
           path: unstation-desktop
           fetch-depth: 0
 
-      # The desktop app depends on the UserAgent Kit Rust SDK by relative path
-      # (../../../useragent-kit). Check it out as a sibling so cargo resolves it.
-      - name: Check out the UserAgent Kit SDK
+      # The app builds against a chain SDK by relative path; check it out as the
+      # expected sibling directory so cargo resolves it. Set the SDK_REPO variable
+      # to that repo's owner/name.
+      - name: Check out the chain SDK
         uses: actions/checkout@v4
         with:
-          repository: ${{ vars.USERAGENT_KIT_REPO || 'paritytech/useragent-kit' }}
-          ref: ${{ vars.USERAGENT_KIT_REF || 'main' }}
-          token: ${{ secrets.USERAGENT_KIT_TOKEN }}
+          repository: ${{ vars.SDK_REPO }}
+          ref: ${{ vars.SDK_REF || 'main' }}
+          # Falls back to the built-in token so the step never fails with
+          # "token not supplied". A private SDK repo still needs SDK_TOKEN (a token
+          # with read access) — the built-in token can't reach other repos.
+          token: ${{ secrets.SDK_TOKEN || github.token }}
           path: useragent-kit
 
       - name: Install Rust (stable + universal targets)
@@ -99,6 +102,8 @@ jobs:
         with:
           config: unstation-desktop/cliff.toml
           args: --workdir unstation-desktop --tag ${{ inputs.version }} --unreleased
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Create the tag + release
         uses: softprops/action-gh-release@v2

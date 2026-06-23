@@ -5,7 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-datachannel = "0.16.0"
+# `vendored` builds libdatachannel's OpenSSL from source (openssl-src) for the
+# target arch and links it statically. This is what makes the universal
+# (arm64 + x86_64) macOS build link: Homebrew only ships one arch's OpenSSL, so
+# the cross-arch slice can't find matching symbols. It also drops the system
+# OpenSSL dependency entirely, so CI and clean machines build without setup.
+datachannel = { version = "0.16.0", features = ["vendored"] }
 unstation-core = { path = "../unstation-core" }
 tokio = { workspace = true }
 serde_json = "1"

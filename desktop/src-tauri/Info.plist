@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    The localhost HLS re-server hands the <video> element a plaintext-HTTP URL
+    (http://127.0.0.1:<port>/live.m3u8). App Transport Security blocks plaintext
+    HTTP by default, which leaves the player on a black/placeholder frame even
+    when segments are flowing. NSAllowsLocalNetworking permits loopback / .local
+    connections only — no broad NSAllowsArbitraryLoads.
+  -->
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsLocalNetworking</key>
+    <true/>
+  </dict>
+</dict>
+</plist>

@@ -27,11 +27,13 @@ segmenter = { path = "../../infra/segmenter" }
 bytes = "1"
 
 # Real chain integration: discovery + SDP-over-statement signaling + WebRTC
-# orchestration, and the UserAgent Kit wallet that signs statement-store writes.
+# orchestration, and the chain SDK's wallet that signs statement-store writes.
 unstation-session = { path = "../../crates/unstation-session" }
 useragent-native = { package = "useragent-native", path = "../../../useragent-kit/crates/host-native" }
 # Enable the testnet allowance helper crate-wide (Cargo feature unification) so a
 # fresh statement-store key auto-provisions a metered allowance on Paseo.
+# NOTE: this embeds Alice's dev sudo key, so the SDK refuses to compile it in an
+# optimized release build — debug/dev builds only. See the LAN-test note in README.
 useragent-chain = { package = "useragent-chain", path = "../../../useragent-kit/crates/host-chain", features = ["testnet-provisioning"] }
 schnorrkel = "0.11"
 bip39 = { version = "2", features = ["rand"] }
@@ -40,3 +42,18 @@ bip39 = { version = "2", features = ["rand"] }
 # Enables the system webview private API needed for native macOS window vibrancy.
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+
+# This crate is excluded from the engine workspace (see ../../Cargo.toml), so it
+# needs its own release profile. These optimized DMGs are PRIVATE LAN test builds
+# between our own machines — NOT public distribution. We keep `debug-assertions`
+# on so the SDK's testnet allowance helper (which embeds Alice's dev key, and is
+# hard-blocked by the SDK when debug_assertions is off) stays permitted while we
+# still get an optimized binary for realistic testing.
+#
+# BEFORE ANY PUBLIC RELEASE: drop `debug-assertions` here AND the
+# `testnet-provisioning` feature on the `useragent-chain` dep above, then provision
+# the statement-store allowance through real (phone-QR) personhood instead.
+[profile.release]
+debug-assertions = true
+opt-level = 3
+lto = "thin"

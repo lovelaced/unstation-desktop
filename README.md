@@ -41,12 +41,8 @@ signaling ride the Polkadot statement store, and a durable copy lives on the Bul
 - **Rust** (stable) — `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - **Node + pnpm** — `npm i -g pnpm`
 - **ffmpeg** — required to publish (RTMP → CMAF). `brew install ffmpeg` on macOS.
-- **UserAgent Kit SDK** — checked out next to this repo (the desktop app depends on it by path):
-
-  ```bash
-  # alongside unstation-desktop/
-  git clone <useragent-kit-url> ../useragent-kit
-  ```
+- **The chain SDK** — a private Polkadot Rust SDK this app builds against, checked out as a
+  sibling of this repo. Ask the maintainers for access.
 
 </details>
 
@@ -101,15 +97,24 @@ Unstation is peer-to-peer, so the real test is two machines. The
 
 One-time setup in **Settings → Secrets and variables → Actions**:
 
-- Add secret **`USERAGENT_KIT_TOKEN`** — a GitHub personal access token with read access to the
-  UserAgent Kit SDK repo (the desktop app depends on it).
-- Optional variables **`USERAGENT_KIT_REPO`** / **`USERAGENT_KIT_REF`** if the SDK isn't at
-  `paritytech/useragent-kit@main`.
+- Add secret **`SDK_TOKEN`** — a token with read access to the private chain-SDK repo.
+- Set variable **`SDK_REPO`** (the SDK repo's `owner/name`); optional **`SDK_REF`** (branch/tag, default `main`).
 
 Then in **Actions → "Release macOS DMG" → Run workflow**, type a version tag (e.g. `v0.1.0`)
 and run it. The workflow creates the tag, builds the universal `.dmg`, writes user-facing release
 notes (with a collapsed "Technical details" section), and publishes a **GitHub Release** with the
 `.dmg` attached. Download the `.dmg` from the release page (or from the run's build artifact).
+
+> **No CI credential?** The workflow needs a token that can read the private SDK repo, which
+> may require org approval. To skip that entirely, build on your own machine — you already have
+> the SDK checked out next to this repo:
+>
+> ```bash
+> scripts/release-macos.sh            # build only → prints the .dmg path to AirDrop to the other Mac
+> scripts/release-macos.sh v0.1.0     # build + cut a GitHub release (needs `gh`, logged in)
+> ```
+>
+> Same universal `.dmg` and the same git-cliff notes, no tokens involved.
 
 ### 2. Install on both Macs
 

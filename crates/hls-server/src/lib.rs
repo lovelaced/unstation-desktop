@@ -38,6 +38,16 @@ impl HlsSink {
             play_head: Arc::new(AtomicU64::new(0)),
         }
     }
+
+    /// Clear the current init + segments — used when the ingest restarts a session,
+    /// so the player loads the fresh feed cleanly instead of stale fragments.
+    pub fn reset(&self) {
+        let mut g = self.shared.lock().unwrap();
+        g.init = None;
+        g.segments.clear();
+        drop(g);
+        self.play_head.store(0, Ordering::SeqCst);
+    }
 }
 
 impl MediaSink for HlsSink {
@@ -119,7 +129,8 @@ fn not_found() -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
 }
 
 fn handle(req: tiny_http::Request, shared: &Arc<Mutex<Shared>>, play_head: &Arc<AtomicU64>) {
-    let url = req.url().to_string();
+    let raw = req.url().to_string();
+    let url = raw.split('?').next().unwrap_or(&raw); // tolerate cache-busting queries
     let g = shared.lock().unwrap();
     let resp = if url == "/live.m3u8" {
         tiny_http::Response::from_data(media_playlist(g.target_ms, &g.segments).into_bytes())
@@ -140,7 +151,7 @@ fn handle(req: tiny_http::Request, shared: &Arc<Mutex<Shared>>, play_head: &Arc<
                 // The player's fetch is our play-head signal.
                 play_head.store(seq, Ordering::SeqCst);
                 tiny_http::Response::from_data(b.to_vec())
-                    .with_header(content_type("video/iso.segment"))
+                    .with_header(content_type("video/mp4"))
             }
             None => not_found(),
         }

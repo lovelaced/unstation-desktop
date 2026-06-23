@@ -9,7 +9,7 @@
 //!     and plays the verified segments through the localhost HLS re-server.
 //!
 //! Identity: each process derives a fresh statement-store signing keypair from a
-//! generated mnemonic (UserAgent Kit `WalletManager`); the `Session` boots the
+//! generated mnemonic (the chain SDK's `WalletManager`); the `Session` boots the
 //! statement store with it. Stable/phone-paired identity (spec §7) is M4.
 
 use bytes::Bytes;
@@ -18,7 +18,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::task::JoinHandle;
 use unstation_core::config::{MeshConfig, Mode, Role};
@@ -54,9 +54,10 @@ struct WatchSession {
 /// An active publish: RTMP ingest, the self-preview HLS, the feeder task, the
 /// publisher node's inbox, and the session.
 struct PublishSession {
-    segmenter: segmenter::SegmenterProcess,
     _hls: HlsServer,
+    /// Owns the ffmpeg ingest listener; aborting it kills ffmpeg via `Drop`.
     feeder: JoinHandle<()>,
+    stats: JoinHandle<()>,
     pub_tx: UnboundedSender<EngineEvent>,
     _session: Session,
 }
@@ -99,6 +100,16 @@ struct MeshStatsMsg {
 }
 
 #[derive(Serialize, Clone)]
+struct PublishStatsMsg {
+    viewers: usize,
+}
+
+#[derive(Serialize, Clone)]
+struct PublishHintMsg {
+    message: String,
+}
+
+#[derive(Serialize, Clone)]
 struct PublishInfo {
     ingest_server: String,
     stream_key: String,
@@ -125,23 +136,59 @@ fn stun() -> Vec<String> {
 
 /// A stream's 32-byte id, derived from its human name (both sides resolve the
 /// same name to the same id, so discovery topics line up).
-fn stream_id_from(name: &str) -> StreamId {
-    StreamId(crypto::blake2b256(name.as_bytes()))
+/// Canonicalize a stream name so the publisher and a viewer derive the SAME id.
+///
+/// The publisher names a stream from a free-text title (e.g. "Friday Night
+/// Football") while a viewer types the friendly share link ("friday-night-
+/// football.dot"). Both must hash to one canonical string or discovery never
+/// matches. This mirrors the UI's `slugify`: drop an optional `.dot` suffix,
+/// lowercase, collapse runs of non-alphanumerics to single hyphens (trimmed).
+/// Empty input → "my-stream" (same fallback the UI uses).
+fn canonical_stream_name(input: &str) -> String {
+    let s = input.trim();
+    let s = s.strip_suffix(".dot").unwrap_or(s);
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "my-stream".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
-/// Derive a fresh statement-store signing keypair from a generated mnemonic.
-/// Each process gets a distinct identity (so a viewer never mistakes the
-/// publisher's presence for its own).
-fn fresh_session_keypair() -> Result<schnorrkel::Keypair, String> {
-    use useragent_native::wallet::WalletManager;
-    let mnemonic = bip39::Mnemonic::generate(12).map_err(|e| format!("mnemonic gen: {e}"))?;
-    let mut wallet = WalletManager::new_ephemeral();
-    wallet
-        .load_from_mnemonic(&mnemonic.to_string())
-        .map_err(|e| format!("wallet load: {e:?}"))?;
-    wallet
-        .statement_store_keypair()
-        .map_err(|e| format!("statement-store keypair: {e:?}"))
+fn stream_id_from(name: &str) -> StreamId {
+    StreamId(crypto::blake2b256(canonical_stream_name(name).as_bytes()))
+}
+
+/// Per-app statement-store key directory — the OS-native app-data location
+/// (`~/Library/Application Support/…` on macOS, `%APPDATA%` on Windows,
+/// `~/.local/share/…` on Linux). The SDK persists the signing key here, so the
+/// host keeps the same identity — and stays signed in — across launches.
+fn ss_key_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app data dir: {e}"))?
+        .join("statement-store");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create key dir: {e}"))?;
+    Ok(dir)
+}
+
+/// The host OS (`macos` / `windows` / `linux`) — lets the UI choose native window
+/// chrome per platform instead of assuming macOS.
+#[tauri::command]
+fn platform() -> &'static str {
+    std::env::consts::OS
 }
 
 #[tauri::command]
@@ -186,8 +233,8 @@ async fn start_watch(
     let (view_tx, view_rx) = unbounded_channel::<EngineEvent>();
 
     // Boot chain signaling + WebRTC for this stream.
-    let keypair = fresh_session_keypair()?;
-    let session = Session::start(stream, 1, stun(), keypair, view_tx.clone())?;
+    let key_dir = ss_key_dir(&app)?;
+    let session = Session::start(stream, 1, stun(), key_dir, view_tx.clone())?;
 
     // Real viewer node: starts with no known segments; the live-edge poller feeds
     // it `LiveEdge { seq, id }` so it knows what to fetch and how to verify it.
@@ -278,7 +325,16 @@ async fn start_publish(
     title: Option<String>,
 ) -> Result<PublishInfo, String> {
     if !segmenter::ffmpeg_available() {
-        return Err("ffmpeg not found — install ffmpeg to publish".into());
+        return Err("ffmpeg not found. Install it (e.g. `brew install ffmpeg`), or set \
+                    UNSTATION_FFMPEG to its full path, then try again."
+            .into());
+    }
+    // Replacing any prior publish session (e.g. reopening the ingest after an
+    // encoder disconnect): abort its background tasks now — the feeder's Drop also
+    // kills its ffmpeg ingest — so we don't leak them or fight over the RTMP port.
+    if let Some(prev) = state.publish.lock().unwrap().take() {
+        prev.feeder.abort();
+        prev.stats.abort();
     }
     let name = title.unwrap_or_else(|| "unstation".into());
     let stream = stream_id_from(&name);
@@ -286,11 +342,9 @@ async fn start_publish(
     let key = "unstation";
     let url = segmenter::rtmp_url(port, key);
 
-    // Fresh ingest dir, then ffmpeg listens for the encoder (OBS).
+    // The ingest dir. The feeder owns the ffmpeg listener and (re)starts it, so the
+    // ingest is always available regardless of when the encoder connects.
     let dir = std::env::temp_dir().join("unstation-publish");
-    let _ = std::fs::remove_dir_all(&dir);
-    let seg = segmenter::spawn(&segmenter::Source::RtmpListen { url: &url }, &dir, 1)
-        .map_err(|e| e.to_string())?;
 
     // Self-preview HLS + the publisher node inbox.
     let hls = HlsServer::start(1000).map_err(|e| e.to_string())?;
@@ -300,8 +354,8 @@ async fn start_publish(
 
     // Boot chain signaling + WebRTC, then the live publisher node (its PeerId is
     // the statement-store account it announces under).
-    let keypair = fresh_session_keypair()?;
-    let session = Session::start(stream, 1, stun(), keypair, pub_tx.clone())?;
+    let key_dir = ss_key_dir(&app)?;
+    let session = Session::start(stream, 1, stun(), key_dir, pub_tx.clone())?;
     let publisher = MeshNode::new_live_publisher(
         session.my_peer,
         cfg(Mode::Live, Role::Publisher),
@@ -322,11 +376,30 @@ async fn start_publish(
     let ptx = pub_tx.clone();
     let appc = app.clone();
     let feeder = tokio::spawn(async move {
+        // One ingest listener per Go-Live. ffmpeg's RTMP `-listen` binds the port and
+        // waits for the encoder however long it takes, segments it, then exits when the
+        // encoder disconnects — at which point we end the session cleanly. (The previous
+        // self-healing respawn tore the ingest down + rebuilt it the instant ffmpeg
+        // exited, racing the player and the HLS reset; that churn is gone.) `seg` is
+        // owned, so dropping it on stop/disconnect kills ffmpeg and frees the port.
+        let mut seg = match segmenter::spawn(&segmenter::Source::RtmpListen { url: &url }, &dir, 1) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = appc.emit(
+                    "publish-hint",
+                    PublishHintMsg { message: format!("ingest failed to start: {e}") },
+                );
+                return;
+            }
+        };
         let mut seen = 0u64;
         let mut init_sent = false;
         let mut announced = false;
+        let mut waited_ms = 0u64;
+        let mut hinted = false;
         loop {
             tokio::time::sleep(Duration::from_millis(200)).await;
+
             if !init_sent {
                 if let Some(init) = segmenter::load_init(&dir) {
                     preview.push_init(init);
@@ -345,13 +418,61 @@ async fn start_publish(
                     let _ = appc.emit("publish-live", ());
                 }
             }
+
+            // Encoder gone (ffmpeg exited)? End the session cleanly. The UI reopens a
+            // fresh ingest on `publish-ended`, so reconnecting an encoder just works.
+            if !seg.running() {
+                if announced {
+                    let _ = appc.emit("publish-ended", ());
+                } else {
+                    let log = std::fs::read_to_string(dir.join("ffmpeg.log")).unwrap_or_default();
+                    let mut tail: Vec<&str> = log.trim().lines().rev().take(3).collect();
+                    tail.reverse();
+                    let message = if tail.is_empty() {
+                        "Ingest stopped before any video arrived — is another app using the port?".to_string()
+                    } else {
+                        format!("Ingest stopped. ffmpeg: {}", tail.join(" · "))
+                    };
+                    let _ = appc.emit("publish-hint", PublishHintMsg { message });
+                }
+                break;
+            }
+
+            // Still waiting on the first frame? Surface ffmpeg's own log, don't hang.
+            if !announced {
+                waited_ms += 200;
+                if !hinted && waited_ms >= 8_000 {
+                    hinted = true;
+                    let log = std::fs::read_to_string(dir.join("ffmpeg.log")).unwrap_or_default();
+                    let mut tail: Vec<&str> = log.trim().lines().rev().take(3).collect();
+                    tail.reverse();
+                    let message = if tail.is_empty() {
+                        format!("No video yet — point your encoder at rtmp://127.0.0.1:{port}/live (key: unstation), then start streaming.")
+                    } else {
+                        format!("No video yet. ffmpeg: {}", tail.join(" · "))
+                    };
+                    let _ = appc.emit("publish-hint", PublishHintMsg { message });
+                }
+            }
         }
     });
 
+    // Stream the live viewer count (peers connected over WebRTC) to the UI.
+    let stats = {
+        let s = session.clone();
+        let appc = app.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = appc.emit("publish-stats", PublishStatsMsg { viewers: s.peer_count() });
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        })
+    };
+
     *state.publish.lock().unwrap() = Some(PublishSession {
-        segmenter: seg,
         _hls: hls,
         feeder,
+        stats,
         pub_tx,
         _session: session,
     });
@@ -366,9 +487,9 @@ async fn start_publish(
 #[tauri::command]
 fn stop_publish(state: State<'_, AppState>) {
     if let Some(sess) = state.publish.lock().unwrap().take() {
-        sess.feeder.abort();
+        sess.feeder.abort(); // dropping the feeder kills the ffmpeg ingest (Drop)
+        sess.stats.abort();
         let _ = sess.pub_tx.send(EngineEvent::Stop);
-        sess.segmenter.stop();
     }
 }
 
@@ -376,6 +497,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
+            platform,
             signin_status,
             begin_signin,
             complete_signin,
