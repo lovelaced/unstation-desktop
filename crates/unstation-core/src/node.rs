@@ -31,6 +31,16 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 /// 16 KiB — the safe cross-platform SCTP message size (TECH_SPEC §6.3).
 const CHUNK: usize = 16 * 1024;
+/// Re-request a segment if the peer hasn't fully delivered it within this window.
+/// The bulk channel is unreliable (no retransmits), so a single lost chunk would
+/// otherwise pin the seq in `pending` forever and freeze playback.
+const PENDING_TIMEOUT_MS: u64 = 2_000;
+/// RTT-probe cadence (Ping/Pong) — measured RTT feeds the picker's peer ranking.
+const PING_INTERVAL_MS: u64 = 1_000;
+/// Buffer-map advertise cadence — on change, else at most this often (vs every tick).
+const BUFFERMAP_INTERVAL_MS: u64 = 500;
+/// Reject absurd segment sizes from a hostile peer before allocating a reassembler.
+const MAX_SEGMENT_BYTES: u32 = 4 * 1024 * 1024;
 
 #[derive(Debug, Default, Clone)]
 pub struct NodeStats {
@@ -51,9 +61,13 @@ pub struct MeshNode {
     reasm: HashMap<Seq, Reassembler>,
     segment_ids: HashMap<Seq, SegmentId>,
     known_peers: HashSet<PeerId>,
-    pending: HashMap<Seq, PeerId>,
+    /// In-flight segment requests: seq → (peer we asked, when we asked, in `now_ms`).
+    pending: HashMap<Seq, (PeerId, u64)>,
     rng: ChaCha8Rng,
     now_ms: u64,
+    last_ping_ms: u64,
+    last_bm_ms: u64,
+    last_bm_count: usize,
     stats: NodeStats,
 }
 
@@ -126,6 +140,9 @@ impl MeshNode {
             pending: HashMap::new(),
             rng: ChaCha8Rng::seed_from_u64(me.0[0] as u64 + 1),
             now_ms: 0,
+            last_ping_ms: 0,
+            last_bm_ms: 0,
+            last_bm_count: usize::MAX, // force the first buffer-map advertise
             stats: NodeStats::default(),
         }
     }
@@ -176,6 +193,18 @@ impl MeshNode {
             EngineEvent::PeerDisconnected { peer } => {
                 self.links.remove(&peer);
                 self.eng.peers.remove(&peer);
+                // Release in-flight requests to this peer (and any partial reassembly)
+                // so the picker re-requests them from someone else next tick.
+                let dropped: Vec<Seq> = self
+                    .pending
+                    .iter()
+                    .filter(|(_, (p, _))| *p == peer)
+                    .map(|(s, _)| *s)
+                    .collect();
+                for seq in dropped {
+                    self.pending.remove(&seq);
+                    self.reasm.remove(&seq);
+                }
             }
             EngineEvent::Inbound { peer, channel, bytes } => self.on_inbound(peer, channel, &bytes),
             EngineEvent::Produced { seq, id, bytes } => {
@@ -216,14 +245,52 @@ impl MeshNode {
             self.eng.play_seq = head;
         }
 
-        // Advertise our current buffer map.
-        let bm = MeshMsg::BufferMap {
-            base_seq: self.eng.local.base(),
-            bitfield: self.eng.local.to_bytes(),
-        };
-        let encoded = bm.encode();
-        for link in self.links.values() {
-            link.send(Channel::Ctrl, encoded.clone());
+        // Expire stale in-flight requests (a lost chunk on the unreliable bulk channel
+        // never completes and never hash-fails) so the picker re-requests them.
+        let now = self.now_ms;
+        let seg_bytes = self.eng.seg_bytes;
+        let stale: Vec<Seq> = self
+            .pending
+            .iter()
+            .filter(|(_, (_, sent))| now.saturating_sub(*sent) >= PENDING_TIMEOUT_MS)
+            .map(|(s, _)| *s)
+            .collect();
+        for seq in stale {
+            if let Some((pid, _)) = self.pending.remove(&seq) {
+                self.reasm.remove(&seq); // re-request starts fresh
+                if let Some(p) = self.eng.peers.get_mut(&pid) {
+                    p.pending_bytes = p.pending_bytes.saturating_sub(seg_bytes);
+                }
+            }
+        }
+
+        // Advertise the buffer map only on change, or at most every BUFFERMAP_INTERVAL_MS
+        // (was every 100ms tick — pure overhead that scales with peer count).
+        let count = self.eng.local.count();
+        if count != self.last_bm_count
+            || self.now_ms.saturating_sub(self.last_bm_ms) >= BUFFERMAP_INTERVAL_MS
+        {
+            self.last_bm_count = count;
+            self.last_bm_ms = self.now_ms;
+            let bm = MeshMsg::BufferMap {
+                base_seq: self.eng.local.base(),
+                bitfield: self.eng.local.to_bytes(),
+            };
+            let encoded = bm.encode();
+            for link in self.links.values() {
+                link.send(Channel::Ctrl, encoded.clone());
+            }
+        }
+
+        // Probe RTT periodically; the Pong handler feeds the picker real latency.
+        if !self.links.is_empty()
+            && self.now_ms.saturating_sub(self.last_ping_ms) >= PING_INTERVAL_MS
+        {
+            self.last_ping_ms = self.now_ms;
+            let ping = MeshMsg::Ping { nonce: self.now_ms, t_send_ms: self.now_ms }.encode();
+            for link in self.links.values() {
+                link.send(Channel::Ctrl, ping.clone());
+            }
         }
 
         // Run the picker and issue Wants to peers.
@@ -239,7 +306,7 @@ impl MeshNode {
                         deadline_hint_ms: 0,
                     };
                     link.send(Channel::Ctrl, want.encode());
-                    self.pending.insert(r.seq, pid);
+                    self.pending.insert(r.seq, (pid, self.now_ms));
                     if let Some(p) = self.eng.peers.get_mut(&pid) {
                         p.pending_bytes = p.pending_bytes.saturating_add(self.eng.seg_bytes);
                     }
@@ -291,7 +358,14 @@ impl MeshNode {
                     }
                 }
             }
-            // Cancel / Choke / Unchoke / Pong: no-ops for now.
+            MeshMsg::Pong { t_send_ms, .. } => {
+                if let Some(p) = self.eng.peers.get_mut(&peer) {
+                    let rtt = self.now_ms.saturating_sub(t_send_ms) as f64;
+                    p.rtt_ms.update(rtt.max(1.0));
+                }
+            }
+            // Cancel / Choke / Unchoke: no-ops (we never hedge — `pending` dedups per
+            // seq — so there's no losing request to cancel).
             _ => {}
         }
     }
@@ -316,6 +390,10 @@ impl MeshNode {
         if self.eng.local.has(seq) {
             return;
         }
+        // Reject absurd/zero sizes before allocating a reassembler (hostile peer guard).
+        if total_len == 0 || total_len > MAX_SEGMENT_BYTES {
+            return;
+        }
         {
             let r = self.reasm.entry(seq).or_insert_with(|| Reassembler::new(total_len));
             r.add(offset, bytes);
@@ -325,18 +403,24 @@ impl MeshNode {
         }
         let r = self.reasm.remove(&seq).expect("present and complete");
         let expected = self.segment_ids.get(&seq).copied();
+        let now = self.now_ms;
+        let seg_bytes = self.eng.seg_bytes;
         match expected.and_then(|id| r.finish_verified(&id).map(|b| (id, b))) {
             Some((id, data)) => {
-                self.stats.peer_bytes += data.len() as u64;
+                let n = data.len();
+                self.stats.peer_bytes += n as u64;
                 let b = Bytes::from(data);
                 self.eng.store.insert(seq, id, b.clone());
                 self.eng.local.set(seq);
                 self.sink.push_segment(seq, b);
-                self.pending.remove(&seq);
+                // Real throughput: bytes delivered / time since we asked.
+                let sent = self.pending.remove(&seq).map(|(_, t)| t);
                 if let Some(p) = self.eng.peers.get_mut(&peer) {
-                    p.throughput_bps.update(20_000_000.0);
-                    p.rtt_ms.update(5.0);
-                    p.pending_bytes = p.pending_bytes.saturating_sub(self.eng.seg_bytes);
+                    if let Some(sent_ms) = sent {
+                        let elapsed = now.saturating_sub(sent_ms).max(1);
+                        p.throughput_bps.update((n as f64) * 8_000.0 / (elapsed as f64));
+                    }
+                    p.pending_bytes = p.pending_bytes.saturating_sub(seg_bytes);
                 }
             }
             None => {

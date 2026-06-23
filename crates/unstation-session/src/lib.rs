@@ -143,6 +143,12 @@ impl Session {
         self.transport.dial(publisher);
     }
 
+    /// Tear down a peer connection (e.g. to abandon a stalled dial before retrying —
+    /// the transport ignores a re-`dial` while the peer entry still exists).
+    pub fn close(&self, peer: PeerId) {
+        self.transport.close(peer);
+    }
+
     /// Number of peers currently connected over real WebRTC (a live UI stat).
     pub fn peer_count(&self) -> usize {
         self.transport.peer_count()

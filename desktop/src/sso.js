@@ -20,6 +20,12 @@ import { gcm } from "@noble/ciphers/aes.js";
 // host-papp storage prefix and the AES salt for the allowance blob.
 const APP_ID = "unstation";
 
+// The per-app "product" the statement-store allowance is allocated under. The
+// phone enforces no allowlist (any string works); it only needs to be STABLE so
+// the cached grant (`onExisting: 'Ignore'`) is reused on later launches instead
+// of re-prompting. It's the `productId` we pass to `getStatementStoreProver`.
+const PRODUCT_ID = "unstation-mesh";
+
 // The desktop MUST subscribe to the SAME statement-store (People) chain the
 // Polkadot app posts its pairing handshake to. If they differ, the phone links
 // successfully but the desktop never sees the response statement — the link just
@@ -104,15 +110,21 @@ export function hasSession() {
  */
 export function awaitSession(timeoutMs = 2500) {
   return new Promise((resolve) => {
-    let mgr;
+    // `adapter.sessions` is the session MANAGER; the live user-session list (with
+    // `read()`/`subscribe()`) is `adapter.sessions.sessions` — the SAME path
+    // hasSession()/statementStoreSlotKey() use. Reading `.sessions.read()` instead
+    // throws (it's undefined), which rejected this promise and dropped boot into
+    // its catch (→ entry screen, never prompting to pair). Every read is guarded so
+    // this can only ever resolve a boolean, never reject.
+    let list;
     try {
-      mgr = getAdapter().sessions;
+      list = getAdapter().sessions.sessions;
+      if (list.read().length > 0) {
+        resolve(true);
+        return;
+      }
     } catch (e) {
       resolve(false);
-      return;
-    }
-    if (mgr.read().length > 0) {
-      resolve(true);
       return;
     }
     let done = false;
@@ -124,7 +136,7 @@ export function awaitSession(timeoutMs = 2500) {
       resolve(v);
     };
     try {
-      unsub = mgr.subscribe((sessions) => {
+      unsub = list.subscribe((sessions) => {
         if (sessions && sessions.length > 0) finish(true);
       });
     } catch (e) {
@@ -195,7 +207,8 @@ export function statementStoreSlotKey() {
     if (!stored) { console.warn("[sso] no allowance blob at", lsKey); return null; }
     const aes = gcm(blake2b(strToBytes(APP_ID), { dkLen: 16 }), blake2b(strToBytes("nonce"), { dkLen: 32 }));
     const plain = aes.decrypt(fromHex(stored));
-    const entry = parseAllowances(plain).find((e) => e.resource === "statementStore");
+    const all = parseAllowances(plain).filter((e) => e.resource === "statementStore");
+    const entry = all.find((e) => e.productId === PRODUCT_ID) || all[0];
     if (!entry) { console.warn("[sso] no statementStore allowance entry yet"); return null; }
     console.log("[sso] statement-store slot key found:", entry.slotAccountKey.length, "bytes, product", entry.productId);
     return entry.slotAccountKey;
@@ -203,6 +216,82 @@ export function statementStoreSlotKey() {
     console.error("[sso] statementStoreSlotKey failed", e);
     return null;
   }
+}
+
+/**
+ * Request this device's statement-store allowance from the paired phone.
+ *
+ * This is the step that actually provisions the on-chain allowance: host-papp's
+ * `getStatementStoreProver` checks its local cache and, on a miss, sends a
+ * `requestResourceAllocation` to the phone. The phone shows an approval prompt;
+ * on approval it allocates a per-app slot account on-chain and returns the slot
+ * key, which host-papp persists (the encrypted `AllowanceKeys_<sessionId>` blob
+ * we later decrypt in {@link statementStoreSlotKey}). MUST run while the session
+ * is live — without it the phone has nothing to grant and tears the link down.
+ *
+ * `onExisting: 'Ignore'` (set inside host-papp) makes this a no-op cache read on
+ * later launches, so it only prompts the first time. Resolves `true` on grant /
+ * cache-hit, `false` on rejection, no session, or error.
+ */
+export async function requestStatementStoreAllowance() {
+  let res;
+  try {
+    const a = getAdapter();
+    const sessions = a.sessions.sessions.read();
+    if (!sessions || !sessions.length) {
+      console.warn("[sso] requestStatementStoreAllowance: no live session");
+      return false;
+    }
+    const sessionId = sessions[0].id;
+    res = await a.allowance.getStatementStoreProver(sessionId, PRODUCT_ID);
+  } catch (e) {
+    console.error("[sso] requestStatementStoreAllowance threw", e);
+    return false;
+  }
+  // host-papp returns a neverthrow Result (ResultAsync awaited).
+  try {
+    if (res && typeof res.match === "function") {
+      return res.match(
+        () => { console.log("[sso] statement-store allowance granted/cached"); return true; },
+        (err) => { console.warn("[sso] allowance request failed:", err && (err.reason || err.message)); return false; },
+      );
+    }
+    if (res && typeof res.isOk === "function") {
+      if (res.isOk()) return true;
+      console.warn("[sso] allowance request failed:", res.error && (res.error.reason || res.error.message));
+      return false;
+    }
+    return !!res; // best-effort if a future SDK returns a plain value
+  } catch (e) {
+    console.error("[sso] requestStatementStoreAllowance result-handling threw", e);
+    return false;
+  }
+}
+
+/**
+ * Wipe all paired state for a clean re-pair. host-papp persists everything under
+ * the `polkadot_<appId>_*` localStorage prefix (sessions, user secrets, device
+ * identity, allowance keys). A half-finished pairing — session torn down before
+ * the allowance was granted — leaves stale entries that suppress a fresh prompt
+ * (`onExisting: 'Ignore'` reuses a cached grant, and the dead session blocks a new
+ * request). Clearing them + dropping the in-memory adapter forces a true restart.
+ */
+export function resetPairing() {
+  try {
+    if (typeof localStorage !== "undefined") {
+      const prefix = `polkadot_${APP_ID}_`;
+      const keys = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith(prefix)) keys.push(k);
+      }
+      keys.forEach((k) => localStorage.removeItem(k));
+      console.log("[sso] resetPairing cleared", keys.length, "key(s)");
+    }
+  } catch (e) {
+    console.error("[sso] resetPairing failed", e);
+  }
+  adapter = null; // next getAdapter() rebuilds against the now-empty storage
 }
 
 /**

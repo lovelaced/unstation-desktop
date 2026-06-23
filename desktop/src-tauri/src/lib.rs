@@ -174,10 +174,15 @@ fn cfg(mode: Mode, role: Role) -> MeshConfig {
     }
 }
 
-/// Default ICE servers. Host candidates carry a LAN on their own; a public STUN
-/// server lets cross-subnet/NAT pairs find a route too (full relay/TURN is M4).
+/// ICE servers. Host candidates carry a LAN on their own; a public STUN server lets
+/// cross-subnet/NAT pairs find a route too (full relay/TURN is M4). Overridable via
+/// `UNSTATION_STUN` (comma-separated URIs; set it empty for host-candidate-only,
+/// e.g. an offline/air-gapped LAN where reaching a public STUN would only add delay).
 fn stun() -> Vec<String> {
-    vec!["stun:stun.l.google.com:19302".into()]
+    match std::env::var("UNSTATION_STUN") {
+        Ok(v) => v.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).map(String::from).collect(),
+        Err(_) => vec!["stun:stun.l.google.com:19302".into()],
+    }
 }
 
 /// A stream's 32-byte id, derived from its human name (both sides resolve the
@@ -292,13 +297,38 @@ async fn start_watch(
     // Learn the live edge (segment ids) from the publisher.
     session.spawn_edge_poller(view_tx.clone());
 
-    // Discover the publisher and dial it (in the background — watch returns now so
-    // the UI can attach the player while the mesh comes up).
+    // Discover the publisher and dial it, then keep the connection alive: if the dial
+    // stalls (no connect within the timeout) or the peer later drops, re-discover and
+    // re-dial. (watch returns now so the UI can attach the player while this runs.)
     {
         let s = session.clone();
+        let appc = app.clone();
         tasks.push(tokio::spawn(async move {
-            let publisher = s.discover_publisher().await;
-            s.dial(publisher);
+            loop {
+                let publisher = s.discover_publisher().await; // loops until presence is found
+                s.dial(publisher);
+                // Wait up to ~12s for both data channels to open.
+                let mut waited = 0u64;
+                while s.peer_count() == 0 && waited < 12_000 {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    waited += 500;
+                }
+                if s.peer_count() == 0 {
+                    // Stalled handshake (lost signal / ICE failure): abandon this
+                    // attempt so the transport accepts a fresh dial, then retry.
+                    let _ = appc.emit(
+                        "mesh-status",
+                        MeshStatusMsg { state: "connecting".into(), detail: "Still reaching the broadcaster…".into() },
+                    );
+                    s.close(publisher);
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+                // Connected — hold until the peer drops, then loop to re-establish.
+                while s.peer_count() > 0 {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
         }));
     }
 

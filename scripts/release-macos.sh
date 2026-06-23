@@ -10,9 +10,14 @@
 # Usage:
 #   scripts/release-macos.sh                 # just build; prints the .dmg path to AirDrop
 #   scripts/release-macos.sh v0.1.0          # build + cut a GitHub release (needs gh, logged in)
+#
+# Build target (default = universal, for release). For fast test iteration on an
+# Apple-Silicon Mac, build arm64-only — skips the x86_64 OpenSSL compile + lipo:
+#   UNSTATION_BUILD_TARGET=aarch64-apple-darwin scripts/release-macos.sh
 set -euo pipefail
 
 VERSION="${1:-}"
+TARGET="${UNSTATION_BUILD_TARGET:-universal-apple-darwin}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
@@ -23,13 +28,16 @@ if [ ! -d "$SDK" ]; then
   exit 1
 fi
 
-echo "==> ensuring universal Rust targets"
-rustup target add aarch64-apple-darwin x86_64-apple-darwin >/dev/null
+echo "==> ensuring Rust targets for $TARGET"
+case "$TARGET" in
+  universal-apple-darwin) rustup target add aarch64-apple-darwin x86_64-apple-darwin >/dev/null ;;
+  *)                      rustup target add "$TARGET" >/dev/null ;;
+esac
 
-echo "==> building the universal macOS DMG (this takes a while)"
-(cd desktop && pnpm install && pnpm tauri build --target universal-apple-darwin)
+echo "==> building the macOS DMG for $TARGET (this takes a while)"
+(cd desktop && pnpm install && pnpm tauri build --target "$TARGET")
 
-DMG="$(find desktop/src-tauri/target/universal-apple-darwin/release/bundle/dmg -name '*.dmg' | head -1)"
+DMG="$(find "desktop/src-tauri/target/$TARGET/release/bundle/dmg" -name '*.dmg' | head -1)"
 [ -n "$DMG" ] || { echo "error: no .dmg was produced"; exit 1; }
 echo "==> built: $DMG"
 

@@ -33,6 +33,12 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use unstation_core::transport::EngineEvent;
 use unstation_core::types::PeerId;
 
+/// Drop bulk (video) sends when the channel's send buffer exceeds this. For a live
+/// stream skipping stale frames is correct — buffering them just grows latency and
+/// memory, and the bulk channel is lossy anyway (the receiver re-requests on
+/// timeout). The reliable `ctrl` channel is never dropped.
+const BULK_BUFFER_MAX: usize = 1024 * 1024; // 1 MiB
+
 /// Locally-generated signaling the orchestrator must relay to the peer over the
 /// statement store (as `SignalMsg::Offer/Answer/IceCandidate`). The `sdp`/`cand`
 /// payloads are JSON of datachannel-rs's `SessionDescription` / `IceCandidate`.
@@ -291,6 +297,12 @@ fn handle_cmd(
 ) {
     match cmd {
         Cmd::Dial(peer) => {
+            // Glare/duplicate guard: never overwrite an in-flight or live connection
+            // (insert below would Drop the existing PC mid-handshake).
+            if peers.contains_key(&peer) {
+                log::debug!("[libdc] dial {peer:?}: already connecting/connected, ignoring");
+                return;
+            }
             let conf = rtc_config(stun);
             let mut pc = match RtcPeerConnection::new(&conf, new_conn(peer, reactor_cmd, signals, inbox)) {
                 Ok(pc) => pc,
@@ -300,14 +312,16 @@ fn handle_cmd(
                 }
             };
             // ctrl: reliable + ordered (default). bulk: unordered, no retransmits.
-            let ctrl = pc
-                .create_data_channel("ctrl", dc_sink(peer, Channel::Ctrl, reactor_cmd, inbox))
-                .ok();
+            let ctrl = match pc.create_data_channel("ctrl", dc_sink(peer, Channel::Ctrl, reactor_cmd, inbox)) {
+                Ok(dc) => Some(dc),
+                Err(e) => { log::warn!("[libdc] dial {peer:?}: ctrl channel create failed: {e}"); None }
+            };
             let bulk_init =
                 DataChannelInit::default().reliability(Reliability::default().unordered().max_retransmits(0));
-            let bulk = pc
-                .create_data_channel_ex("bulk", dc_sink(peer, Channel::Bulk, reactor_cmd, inbox), &bulk_init)
-                .ok();
+            let bulk = match pc.create_data_channel_ex("bulk", dc_sink(peer, Channel::Bulk, reactor_cmd, inbox), &bulk_init) {
+                Ok(dc) => Some(dc),
+                Err(e) => { log::warn!("[libdc] dial {peer:?}: bulk channel create failed: {e}"); None }
+            };
             peers.insert(
                 peer,
                 Peer {
@@ -324,6 +338,12 @@ fn handle_cmd(
             );
         }
         Cmd::Accept(peer, offer_json) => {
+            // Duplicate-offer guard: keep the existing handshake rather than dropping
+            // its PeerConnection by overwriting the map entry.
+            if peers.contains_key(&peer) {
+                log::debug!("[libdc] accept {peer:?}: already have a connection, ignoring duplicate offer");
+                return;
+            }
             let conf = rtc_config(stun);
             let mut pc = match RtcPeerConnection::new(&conf, new_conn(peer, reactor_cmd, signals, inbox)) {
                 Ok(pc) => pc,
@@ -387,6 +407,16 @@ fn handle_cmd(
                     Channel::Bulk => p.bulk.as_mut(),
                 };
                 if let Some(dc) = dc {
+                    // Backpressure: never let the bulk send buffer grow without bound.
+                    // For live video, drop the chunk (receiver re-requests on timeout)
+                    // rather than buffer stale frames and balloon latency/memory.
+                    if matches!(channel, Channel::Bulk) && dc.buffered_amount() > BULK_BUFFER_MAX {
+                        log::debug!(
+                            "[libdc] {peer:?}: bulk buffer {}B over limit — dropping chunk",
+                            dc.buffered_amount()
+                        );
+                        return;
+                    }
                     if let Err(e) = dc.send(&bytes) {
                         log::debug!("[libdc] {peer:?}: send on {channel:?} failed: {e}");
                     }
@@ -416,9 +446,14 @@ fn handle_cmd(
                 }
             }
         }
-        Cmd::StateChange(peer, state) => {
-            if matches!(state, ConnectionState::Disconnected | ConnectionState::Failed | ConnectionState::Closed)
-            {
+        Cmd::StateChange(peer, state) => match state {
+            // `Disconnected` is transient (brief packet loss) and usually recovers to
+            // `Connected` on its own — tearing down here would turn a blip into a
+            // permanent drop. Wait for the terminal `Failed`/`Closed`.
+            ConnectionState::Disconnected => {
+                log::debug!("[libdc] {peer:?}: ICE disconnected (transient) — awaiting recover/fail");
+            }
+            ConnectionState::Failed | ConnectionState::Closed => {
                 orphan_cands.remove(&peer);
                 if let Some(p) = peers.remove(&peer) {
                     if p.announced {
@@ -427,7 +462,8 @@ fn handle_cmd(
                     }
                 }
             }
-        }
+            _ => {}
+        },
         Cmd::Close(peer) => {
             orphan_cands.remove(&peer);
             // Keep the live count honest and tell the node, same as a disconnect.

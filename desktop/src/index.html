@@ -334,8 +334,8 @@
         <div class="qr-copy">
           <div class="eyebrow">First time here</div>
           <h2>Pair your Polkadot app</h2>
-          <p>Scan once to prove you're a person — not a bot — so you can join streams. Your keys never leave your phone; this device only gets a small, revocable allowance.</p>
-          <div class="row"><button class="btn" id="pairedBtn" type="button">I've scanned it</button><button class="btn ghost" data-goto="entry" type="button">Skip for now</button></div>
+          <p>Two quick steps on your phone: <b>scan</b> this code, then <b>approve the network-access request</b> (you may need to sign — give it a moment). Your keys never leave your phone; this device only gets a small, revocable allowance. Sign-in is required to watch or go live.</p>
+          <div class="row"><button class="btn" id="pairedBtn" type="button">I've scanned it</button><button class="btn ghost" data-goto="entry" type="button">Not now</button></div>
           <div class="await" id="pairStatus" style="display:none;margin-top:4px;"><span class="dot-await"></span><span id="pairStatusText">Linking…</span></div>
         </div>
       </div>
@@ -601,7 +601,7 @@ import * as sso from './sso.js';
   wireVideoDiag('pubVid','pubVidDiag', true);
   wireVideoDiag('vid','vidDiag', false);
 
-  document.getElementById('watchForm').addEventListener('submit', async (e)=>{ e.preventDefault(); const target=(document.getElementById('streamInput').value||'').trim(); if(!target){ document.getElementById('streamInput').focus(); return; } go('finding');
+  document.getElementById('watchForm').addEventListener('submit', async (e)=>{ e.preventDefault(); const target=(document.getElementById('streamInput').value||'').trim(); if(!target){ document.getElementById('streamInput').focus(); return; } if(!ensureSignedIn()) return; go('finding');
     if(NATIVE && invoke){ try{ const info=await invoke('start_watch',{ target }); document.getElementById('mPub').textContent=info.publisher; lastPeers=0; go('live'); setTitle(target,true); applyStats({peers:0,rho:0,mode:'p2p',from_seed:0,from_chain:0,latency_s:0,ice:'connecting'}); startWatchWatchdog(); setVideo(info.hls_url); }catch(err){ console.error('start_watch failed',err); document.getElementById('progEyebrow').textContent='Problem'; document.getElementById('progTitle').textContent='Couldn’t start watching'; document.getElementById('progSub').textContent=((err&&err.message)||(''+err)); clearSeq(); } }
     else { setTimeout(()=>go('live'),1200); } });
 
@@ -637,6 +637,7 @@ import * as sso from './sso.js';
   // LIVE/waiting to match the actual video.
   async function goLiveStart(){
     if(!publishing) return;
+    if(!ensureSignedIn()) return;
     pubName = shareName(titleEl.value);
     titleEl.value = pubName;
     titleEl.readOnly = true;
@@ -679,7 +680,19 @@ import * as sso from './sso.js';
 
   // Go Live tab — re-attach to a running stream (tab-back) instead of restarting it,
   // or open the name-entry step if nothing is publishing yet.
+  // Sign-in is required to watch or publish — every mesh write (presence, signaling,
+  // edge) needs the paired statement-store allowance. Soft-gate the entry points:
+  // bounce to pairing when there's no live session yet. (Sync hasSession() is reliable
+  // here — boot awaits hydration before any of these controls are reachable.)
+  function ensureSignedIn(){
+    if(!NATIVE) return true;
+    try { if(sso.hasSession()) return true; } catch(e){}
+    const pb=document.getElementById('pairedBtn'); if(pb) pb.style.display='none';
+    go('onboarding'); beginPairing();
+    return false;
+  }
   async function enterGoLive(){
+    if(!ensureSignedIn()) return;
     go('publish');
     let status = null;
     if(NATIVE && invoke){ try{ status = await invoke('publish_status'); }catch(e){} }
@@ -702,6 +715,7 @@ import * as sso from './sso.js';
   }
   // Watch tab — re-attach to a running watch, else go to the browse/entry screen.
   async function enterWatch(){
+    if(!ensureSignedIn()) return;
     let status = null;
     if(NATIVE && invoke){ try{ status = await invoke('watch_status'); }catch(e){} }
     if(status){ document.getElementById('mPub').textContent = status.info.publisher; go('live'); setTitle(status.info.publisher, true); startWatchWatchdog(); setVideo(status.info.hls_url); }
@@ -732,7 +746,7 @@ import * as sso from './sso.js';
   document.getElementById('tabSettings').addEventListener('click', openSettings);
   document.getElementById('goLiveLink').addEventListener('click', enterGoLive);
   document.getElementById('leaveWatchBtn').addEventListener('click', leaveWatch);
-  document.getElementById('rePairBtn').addEventListener('click', ()=>{ const pb=document.getElementById('pairedBtn'); if(pb) pb.style.display=''; go('onboarding'); beginPairing(); });
+  document.getElementById('rePairBtn').addEventListener('click', ()=>{ try{ sso.resetPairing(); }catch(e){} const pb=document.getElementById('pairedBtn'); if(pb) pb.style.display=''; go('onboarding'); beginPairing(); });
   document.getElementById('cancelPublish').addEventListener('click', endPublish);
   document.getElementById('endStream').addEventListener('click', endPublish);
   document.getElementById('startStream').addEventListener('click', goLiveStart);
@@ -784,7 +798,17 @@ import * as sso from './sso.js';
         }
       );
       console.log('[sso] signIn result:', res);
-      if(res && res.ok){ setStatus('Linked ✓'); await pushChainIdentity(); setTimeout(()=>go('entry'), 400); }
+      if(res && res.ok){
+        setStatus('Linked ✓ — one more step on your phone');
+        // Let the phone leave its pairing screen before we request the allowance:
+        // firing it instantly races the pairing-complete transition and the
+        // approval prompt flashes away before it can be acted on.
+        await new Promise(r=>setTimeout(r, 1600));
+        const ok = await pushChainIdentity(setStatus);
+        if(ok){ setStatus('Network access granted ✓'); setTimeout(()=>go('entry'), 800); }
+        // On failure pushChainIdentity left an explanatory status; stay on the
+        // onboarding screen so the QR + "I've scanned it" remain for a retry.
+      }
       else if(explain){ explain.textContent = 'Sign-in didn’t finish' + (res && res.error ? (' (' + res.error + ')') : '') + '. You can Skip for now and try again later.'; }
     } catch(e){ console.error('[sso] beginPairing threw', e); setStatus('Error: ' + ((e && e.message) || e)); }
   }
@@ -793,11 +817,18 @@ import * as sso from './sso.js';
   // slot key (decrypted from host-papp's storage) and hand it to the backend so all
   // mesh chain writes are allowance-backed. Without this, presence/signaling are
   // rejected on-chain and nothing connects. Safe to call repeatedly (Rust is idempotent).
-  async function pushChainIdentity(){
+  async function pushChainIdentity(onStatus){
     if(!(NATIVE && invoke)) return false;
+    const say = (t)=>{ try{ onStatus && onStatus(t); }catch(e){} };
     try {
+      // Provision the statement-store allowance from the phone FIRST. On the initial
+      // pairing this prompts for approval on the device; on later launches it's a
+      // cached no-op. Only after a grant does the slot-key blob exist to decrypt.
+      say('Open your Polkadot app and approve network access — you may need to sign a transaction. This can take a minute; keep the app open.');
+      const granted = await sso.requestStatementStoreAllowance();
+      if(!granted){ console.warn('[chain] statement-store allowance not granted'); say('Couldn’t confirm network access. Approve the request on your phone, then Re-pair to retry.'); return false; }
       const key = sso.statementStoreSlotKey();
-      if(!key){ console.warn('[chain] no paired statement-store key yet'); return false; }
+      if(!key){ console.warn('[chain] allowance granted but slot-key blob missing'); return false; }
       await invoke('set_chain_identity', { slotSecret: Array.from(key) });
       console.log('[chain] paired identity sent to backend');
       return true;
@@ -820,7 +851,7 @@ import * as sso from './sso.js';
       try {
         // Wait for the saved session to hydrate from storage (async) before
         // deciding — a sync check here races hydration and re-prompts for the QR.
-        if(await sso.awaitSession()){ await pushChainIdentity(); go('entry'); }
+        if(await sso.awaitSession()){ go('entry'); pushChainIdentity(); }
         else { go('onboarding'); document.getElementById('pairedBtn').style.display='none'; beginPairing(); }
       } catch(e){ go('entry'); }
     } else { document.body.classList.add('plat-macos'); go('entry'); }

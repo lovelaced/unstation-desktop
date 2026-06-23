@@ -16,9 +16,11 @@ impl Reassembler {
         Self { total_len, chunks: BTreeMap::new() }
     }
 
-    /// Add a chunk at `offset`. Duplicates and out-of-range offsets are ignored.
+    /// Add a chunk at `offset`. Duplicates, out-of-range, and **overshooting**
+    /// chunks are ignored — a peer must not be able to write past `total_len`
+    /// (which would make `is_complete` unsatisfiable / waste memory).
     pub fn add(&mut self, offset: u32, bytes: &[u8]) {
-        if offset > self.total_len {
+        if offset.saturating_add(bytes.len() as u32) > self.total_len {
             return;
         }
         self.chunks.entry(offset).or_insert_with(|| bytes.to_vec());
