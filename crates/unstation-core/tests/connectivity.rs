@@ -1,0 +1,298 @@
+//! Connectivity tests: multi-peer mesh formation, resilience to churn, and the
+//! signaling/discovery layer — all over the deterministic in-memory transport and
+//! statement store (no real network), so they run in CI.
+//!
+//! Covers the failure modes that broke real LAN sessions: a peer vanishing mid
+//! stream, a peer joining late, duplicate connects (glare), an adversarial peer
+//! feeding corrupt bytes, presence that must expire, and per-recipient signaling.
+
+use bytes::Bytes;
+use parity_scale_codec::Encode;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::mpsc::{self, UnboundedSender};
+use unstation_core::clock::VirtualClock;
+use unstation_core::config::{MeshConfig, Mode, PickerWeights, Role};
+use unstation_core::crypto;
+use unstation_core::media::MediaSink;
+use unstation_core::node::MeshNode;
+use unstation_core::protocol::MeshMsg;
+use unstation_core::signaling::SignalMsg;
+use unstation_core::statement_store_mem::{MemStatementStore, StatementSignaling};
+use unstation_core::transport::{Channel, EngineEvent};
+use unstation_core::transport_mem::wire;
+use unstation_core::types::{PeerId, SegmentId, Seq, StreamId};
+
+// ---- shared test rig ----
+
+#[derive(Default)]
+struct Rec {
+    segs: Mutex<BTreeMap<u64, Bytes>>,
+}
+impl MediaSink for Rec {
+    fn push_init(&self, _: Bytes) {}
+    fn push_segment(&self, seq: u64, bytes: Bytes) {
+        self.segs.lock().unwrap().insert(seq, bytes);
+    }
+    fn on_play_head(&self) -> u64 {
+        0
+    }
+}
+impl Rec {
+    fn count(&self) -> usize {
+        self.segs.lock().unwrap().len()
+    }
+    fn get(&self, s: u64) -> Option<Bytes> {
+        self.segs.lock().unwrap().get(&s).cloned()
+    }
+}
+
+struct NullSink;
+impl MediaSink for NullSink {
+    fn push_init(&self, _: Bytes) {}
+    fn push_segment(&self, _: u64, _: Bytes) {}
+    fn on_play_head(&self) -> u64 {
+        0
+    }
+}
+
+fn cfg(role: Role) -> MeshConfig {
+    MeshConfig {
+        mode: Mode::Vod,
+        role,
+        window: 16,
+        tick: Duration::from_millis(10),
+        seg_ms: 500,
+        upload_budget_bps: 50_000_000,
+        weights: PickerWeights::default(),
+    }
+}
+
+/// A `n`-segment VOD: the raw bytes and the authenticated seq→id map a viewer needs.
+fn make_vod(n: usize, seg_len: usize) -> (Vec<Bytes>, HashMap<Seq, SegmentId>) {
+    let segs: Vec<Bytes> = (0..n)
+        .map(|i| Bytes::from(vec![(i as u8).wrapping_mul(7).wrapping_add(1); seg_len]))
+        .collect();
+    let ids = segs
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (i as Seq, crypto::segment_id(b)))
+        .collect();
+    (segs, ids)
+}
+
+/// Spawn a publisher preloaded with `segs`, wired to `viewid`. Returns the publisher's
+/// own inbox sender (so the test can `Stop` it) and the link to hand the viewer.
+fn spawn_publisher(
+    pubid: PeerId,
+    viewid: PeerId,
+    view_tx: &UnboundedSender<EngineEvent>,
+    segs: Vec<Bytes>,
+    seg_len: usize,
+) -> UnboundedSender<EngineEvent> {
+    let (ptx, prx) = mpsc::unbounded_channel::<EngineEvent>();
+    let (link_for_pub, link_for_view) = wire(pubid, ptx.clone(), viewid, view_tx.clone());
+    ptx.send(EngineEvent::PeerConnected { peer: viewid, link: link_for_pub }).unwrap();
+    view_tx.send(EngineEvent::PeerConnected { peer: pubid, link: link_for_view }).unwrap();
+    let publisher =
+        MeshNode::new_publisher(pubid, cfg(Role::Publisher), seg_len as u64, Arc::new(NullSink), segs);
+    tokio::spawn(publisher.run(prx, Duration::from_millis(10), None));
+    ptx
+}
+
+#[tokio::test]
+async fn viewer_fetches_from_two_publishers() {
+    let (n, seg_len) = (12usize, 24_000usize);
+    let (segs, ids) = make_vod(n, seg_len);
+    let viewid = PeerId::from_u64(100);
+    let (vtx, vrx) = mpsc::unbounded_channel::<EngineEvent>();
+
+    let p1 = spawn_publisher(PeerId::from_u64(1), viewid, &vtx, segs.clone(), seg_len);
+    let p2 = spawn_publisher(PeerId::from_u64(2), viewid, &vtx, segs.clone(), seg_len);
+
+    let rec = Arc::new(Rec::default());
+    let viewer = MeshNode::new_viewer(viewid, cfg(Role::Viewer), seg_len as u64, rec.clone(), ids, (n - 1) as Seq);
+    let stats = tokio::time::timeout(Duration::from_secs(8), viewer.run(vrx, Duration::from_millis(10), Some(n)))
+        .await
+        .expect("two-publisher mesh should deliver within 8s");
+
+    assert_eq!(stats.delivered, n, "all segments delivered across two peers");
+    assert_eq!(stats.hash_failures, 0, "no corruption");
+    assert_eq!(rec.count(), n, "all fed to the player");
+    let _ = p1.send(EngineEvent::Stop);
+    let _ = p2.send(EngineEvent::Stop);
+}
+
+#[tokio::test]
+async fn recovers_after_peer_disconnect_midstream() {
+    let (n, seg_len) = (16usize, 20_000usize);
+    let (segs, ids) = make_vod(n, seg_len);
+    let viewid = PeerId::from_u64(100);
+    let (vtx, vrx) = mpsc::unbounded_channel::<EngineEvent>();
+
+    let p1id = PeerId::from_u64(1);
+    let p1 = spawn_publisher(p1id, viewid, &vtx, segs.clone(), seg_len);
+    let p2 = spawn_publisher(PeerId::from_u64(2), viewid, &vtx, segs.clone(), seg_len);
+
+    // Drop publisher #1 shortly after the stream starts — the viewer must finish from #2.
+    let vtx_drop = vtx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let _ = vtx_drop.send(EngineEvent::PeerDisconnected { peer: p1id });
+        let _ = p1.send(EngineEvent::Stop);
+    });
+
+    let rec = Arc::new(Rec::default());
+    let viewer = MeshNode::new_viewer(viewid, cfg(Role::Viewer), seg_len as u64, rec.clone(), ids, (n - 1) as Seq);
+    let stats = tokio::time::timeout(Duration::from_secs(8), viewer.run(vrx, Duration::from_millis(10), Some(n)))
+        .await
+        .expect("viewer should recover from a mid-stream peer drop");
+
+    assert_eq!(stats.delivered, n, "all segments delivered despite a peer vanishing");
+    assert_eq!(stats.hash_failures, 0);
+    let _ = p2.send(EngineEvent::Stop);
+}
+
+#[tokio::test]
+async fn late_joining_publisher_serves() {
+    let (n, seg_len) = (10usize, 20_000usize);
+    let (segs, ids) = make_vod(n, seg_len);
+    let viewid = PeerId::from_u64(100);
+    let (vtx, vrx) = mpsc::unbounded_channel::<EngineEvent>();
+
+    // The viewer starts with NO peers; a publisher appears only after a delay.
+    let vtx_late = vtx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        spawn_publisher(PeerId::from_u64(1), viewid, &vtx_late, segs, seg_len);
+    });
+
+    let rec = Arc::new(Rec::default());
+    let viewer = MeshNode::new_viewer(viewid, cfg(Role::Viewer), seg_len as u64, rec.clone(), ids, (n - 1) as Seq);
+    let stats = tokio::time::timeout(Duration::from_secs(8), viewer.run(vrx, Duration::from_millis(10), Some(n)))
+        .await
+        .expect("viewer should pick up a late-joining publisher");
+    assert_eq!(stats.delivered, n, "late publisher's segments all delivered");
+}
+
+#[tokio::test]
+async fn duplicate_peer_connected_is_safe() {
+    // Glare: the same peer is announced twice. The node must not double-count or panic.
+    let (n, seg_len) = (8usize, 16_000usize);
+    let (segs, ids) = make_vod(n, seg_len);
+    let viewid = PeerId::from_u64(100);
+    let pubid = PeerId::from_u64(1);
+    let (vtx, vrx) = mpsc::unbounded_channel::<EngineEvent>();
+
+    let (ptx, prx) = mpsc::unbounded_channel::<EngineEvent>();
+    let (l_pub, l_view) = wire(pubid, ptx.clone(), viewid, vtx.clone());
+    ptx.send(EngineEvent::PeerConnected { peer: viewid, link: l_pub }).unwrap();
+    // Two PeerConnected for the same peer (a second link object).
+    let (_l_pub2, l_view2) = wire(pubid, ptx.clone(), viewid, vtx.clone());
+    vtx.send(EngineEvent::PeerConnected { peer: pubid, link: l_view }).unwrap();
+    vtx.send(EngineEvent::PeerConnected { peer: pubid, link: l_view2 }).unwrap();
+    let publisher = MeshNode::new_publisher(pubid, cfg(Role::Publisher), seg_len as u64, Arc::new(NullSink), segs);
+    tokio::spawn(publisher.run(prx, Duration::from_millis(10), None));
+
+    let rec = Arc::new(Rec::default());
+    let viewer = MeshNode::new_viewer(viewid, cfg(Role::Viewer), seg_len as u64, rec.clone(), ids, (n - 1) as Seq);
+    let stats = tokio::time::timeout(Duration::from_secs(6), viewer.run(vrx, Duration::from_millis(10), Some(n)))
+        .await
+        .expect("duplicate connects must not wedge delivery");
+    assert_eq!(stats.delivered, n);
+    let _ = ptx.send(EngineEvent::Stop);
+}
+
+#[tokio::test]
+async fn corrupt_chunk_is_rejected_then_recovered() {
+    // An adversarial peer injects wrong bytes for seq 0. The viewer must reject it
+    // (hash mismatch), keep the real bytes out of the player, and re-fetch the
+    // correct segment from the honest publisher.
+    let (n, seg_len) = (6usize, 20_000usize);
+    let (segs, ids) = make_vod(n, seg_len);
+    let viewid = PeerId::from_u64(100);
+    let badid = PeerId::from_u64(9);
+    let (vtx, vrx) = mpsc::unbounded_channel::<EngineEvent>();
+
+    let honest = spawn_publisher(PeerId::from_u64(1), viewid, &vtx, segs.clone(), seg_len);
+
+    // Forge a complete-but-wrong chunk for seq 0 from a peer the viewer never dialed.
+    let forged = MeshMsg::SegmentData {
+        seq: 0,
+        track_id: 0,
+        total_len: seg_len as u32,
+        offset: 0,
+        bytes: vec![0xFF; seg_len],
+    }
+    .encode();
+    vtx.send(EngineEvent::Inbound { peer: badid, channel: Channel::Bulk, bytes: forged }).unwrap();
+
+    let rec = Arc::new(Rec::default());
+    let viewer = MeshNode::new_viewer(viewid, cfg(Role::Viewer), seg_len as u64, rec.clone(), ids, (n - 1) as Seq);
+    let stats = tokio::time::timeout(Duration::from_secs(8), viewer.run(vrx, Duration::from_millis(10), Some(n)))
+        .await
+        .expect("viewer should recover from a forged chunk");
+
+    assert_eq!(stats.delivered, n, "every segment ultimately delivered");
+    assert!(stats.hash_failures >= 1, "the forged chunk must be counted as a hash failure");
+    assert_eq!(rec.get(0), Some(segs[0].clone()), "the player got the REAL seg 0, never the forgery");
+    let _ = honest.send(EngineEvent::Stop);
+}
+
+#[tokio::test]
+async fn inbound_from_unconnected_peer_does_not_crash() {
+    // A stray control message from a peer that was never connected must be handled
+    // gracefully (no panic, the node still stops cleanly).
+    let me = PeerId::from_u64(2);
+    let node = MeshNode::new_viewer(me, MeshConfig::default(), 40_000, Arc::new(NullSink), HashMap::new(), 0);
+    let (tx, rx) = mpsc::unbounded_channel::<EngineEvent>();
+    let stray = MeshMsg::Have { seq: 5 }.encode();
+    tx.send(EngineEvent::Inbound { peer: PeerId::from_u64(77), channel: Channel::Ctrl, bytes: stray }).unwrap();
+    let bm = MeshMsg::BufferMap { base_seq: 0, bitfield: vec![0xFF, 0xFF] }.encode();
+    tx.send(EngineEvent::Inbound { peer: PeerId::from_u64(78), channel: Channel::Ctrl, bytes: bm }).unwrap();
+    tx.send(EngineEvent::Stop).unwrap();
+    let stats = tokio::time::timeout(Duration::from_secs(5), node.run(rx, Duration::from_millis(10), None))
+        .await
+        .expect("node handled stray inbound and stopped");
+    assert_eq!(stats.delivered, 0);
+}
+
+// ---- signaling / discovery layer ----
+
+fn sig(store: &MemStatementStore, stream: StreamId, me: PeerId, clock: Arc<VirtualClock>) -> StatementSignaling {
+    StatementSignaling::new(store.clone(), stream, me, 2, 30, clock)
+}
+
+#[test]
+fn presence_expires_after_ttl() {
+    let store = MemStatementStore::new();
+    let clock = Arc::new(VirtualClock::new());
+    let stream = StreamId([9u8; 32]);
+    let (a, b) = (PeerId::from_u64(1), PeerId::from_u64(2));
+    let sa = sig(&store, stream, a, clock.clone());
+    let sb = sig(&store, stream, b, clock.clone());
+
+    sb.publish_presence_now(5_000_000);
+    assert!(sa.read_candidates(10).iter().any(|p| p.peer_id == b), "fresh presence is discoverable");
+
+    // ttl is 30 s; jump past it and the presence must be gone (no stale ghosts).
+    clock.advance(31_000);
+    assert!(!sa.read_candidates(10).iter().any(|p| p.peer_id == b), "expired presence must not be returned");
+}
+
+#[test]
+fn signal_is_delivered_only_to_recipient() {
+    let store = MemStatementStore::new();
+    let clock = Arc::new(VirtualClock::new());
+    let stream = StreamId([3u8; 32]);
+    let (a, p, b) = (PeerId::from_u64(1), PeerId::from_u64(2), PeerId::from_u64(3));
+    let sa = sig(&store, stream, a, clock.clone());
+    let sp = sig(&store, stream, p, clock.clone());
+    let sb = sig(&store, stream, b, clock.clone());
+
+    sa.send_signal_now(p, &SignalMsg::Offer { sdp: b"v=0 to-P".to_vec() });
+
+    assert_eq!(sp.read_signals().len(), 1, "the addressed peer receives the offer");
+    assert_eq!(sb.read_signals().len(), 0, "an unrelated peer receives nothing");
+}
