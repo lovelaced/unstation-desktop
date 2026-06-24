@@ -202,6 +202,52 @@
   /* On-video diagnostic toast (real media errors only) — shared by both players. */
   .diag { position: absolute; left: 10px; right: 10px; bottom: 10px; z-index: 6; font: 11px var(--mono); color: #fff; background: rgba(0,0,0,.66); padding: 6px 9px; border-radius: 7px; pointer-events: none; line-height: 1.45; }
   .diag[hidden] { display: none; }
+
+  /* ---- Phase 7: immersive viewing + glanceable health ---- */
+  /* Native live view fills the stage (the area below the persistent tabs) instead of
+     a centered card — no "box" around the video. object-fit:cover already fills with
+     no letterbox, so a 16:9 stream fills a 16:9 screen edge to edge. */
+  body.native #player .frame { width: 100%; height: 100%; max-width: none; aspect-ratio: auto; border-radius: 0; border: 0; box-shadow: none; }
+  /* True fullscreen (laptop / TV): hide the tabs so the stage = whole screen. Toggled
+     by the HUD button via Tauri window fullscreen, which also sets .fs on the window. */
+  body.native .win.fs .titlebar { display: none; }
+  .hud .hud-btn { -webkit-app-region: no-drag; pointer-events: auto; display: inline-flex; align-items: center; justify-content: center; gap: 7px; cursor: pointer;
+    font-family: var(--ui); font-size: 13px; font-weight: 510; color: var(--text); background: var(--glass); backdrop-filter: blur(26px) saturate(1.6); -webkit-backdrop-filter: blur(26px) saturate(1.6);
+    border: 1px solid var(--line-strong); border-radius: var(--r-pill); padding: 9px 13px; box-shadow: inset 0 1px 0 rgba(255,255,255,.06), 0 14px 34px -16px rgba(0,0,0,.7); transition: background .2s var(--ease); }
+  .hud .hud-btn:hover { background: rgba(255,255,255,.12); }
+  .hud .hud-btn svg { width: 15px; height: 15px; }
+
+  /* Viewer "your connection" popup — plain-language health, no P2P jargon. */
+  .health-row { display: flex; align-items: flex-start; gap: 13px; margin-bottom: 18px; }
+  .health-badge { width: 13px; height: 13px; border-radius: 50%; margin-top: 4px; flex: 0 0 auto; background: var(--faint); transition: all .4s var(--ease); }
+  .health-badge[data-h="good"], .pill .health-dot[data-h="good"] { background: var(--accent); box-shadow: 0 0 12px var(--accent); }
+  .health-badge[data-h="ok"], .pill .health-dot[data-h="ok"] { background: var(--accent-2); box-shadow: 0 0 12px var(--accent-2); }
+  .health-badge[data-h="wait"], .pill .health-dot[data-h="wait"] { background: var(--faint); animation: pulse 1.4s var(--ease) infinite; }
+  .health-verdict { font-size: 17px; font-weight: 600; letter-spacing: .1px; }
+  .health-note { font-size: 12.5px; color: var(--dim); line-height: 1.5; margin-top: 3px; max-width: 44rem; }
+  .vmetrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 14px 18px; }
+  .vmetric .k { font-size: 10.5px; letter-spacing: .5px; text-transform: uppercase; color: var(--faint); }
+  .vmetric .v { font-size: 15px; margin-top: 4px; color: var(--text); font-weight: 540; }
+
+  /* Go Live: streamer-facing stream-health card (digestible — status, viewers, uptime). */
+  .pub-health { display: flex; flex-direction: column; gap: 14px; width: 100%; padding: 16px 18px; border-radius: var(--r-card);
+    background: var(--glass-2); border: 1px solid var(--line-strong); box-shadow: inset 0 1px 0 rgba(255,255,255,.06); text-align: left; }
+  .ph-row { display: flex; align-items: flex-start; gap: 11px; }
+  .ph-dot { width: 11px; height: 11px; border-radius: 50%; margin-top: 4px; flex: 0 0 auto; background: var(--faint); transition: all .4s var(--ease); }
+  .ph-dot[data-h="live"] { background: var(--accent); box-shadow: 0 0 12px var(--accent); }
+  .ph-dot[data-h="wait"] { background: var(--accent-2); box-shadow: 0 0 10px var(--accent-2); animation: pulse 1.5s var(--ease) infinite; }
+  .ph-status { font-size: 15px; font-weight: 600; }
+  .ph-note { font-size: 12px; color: var(--dim); line-height: 1.45; margin-top: 2px; }
+  .ph-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .ph-stat .k { font-size: 10px; letter-spacing: .4px; text-transform: uppercase; color: var(--faint); }
+  .ph-stat .v { font-family: var(--mono); font-size: 18px; margin-top: 3px; color: var(--text); }
+  .pub-preview-link { align-self: flex-start; background: none; border: 0; color: var(--dim); font-family: var(--ui); font-size: 12.5px; cursor: pointer; padding: 2px 0; transition: color .2s var(--ease); }
+  .pub-preview-link:hover { color: var(--accent); }
+  /* Settings status rows — live dot + text. */
+  .set-status { display: inline-flex; align-items: center; gap: 8px; }
+  .set-status .sdot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); flex: 0 0 auto; }
+  .set-status .sdot[data-h="good"] { background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+  .set-status .sdot[data-h="wait"] { background: var(--accent-2); box-shadow: 0 0 8px var(--accent-2); }
   /* Go Live console: video hero (fills the stage) + a side rail for ingest, share,
      and the explicit End control — mirrors the watch player's "video is the hero". */
   .pub-live { display: flex; flex-direction: row; align-items: stretch; gap: 18px; width: 100%; height: 100%; }
@@ -365,8 +411,8 @@
       <div class="eyebrow">Settings</div>
       <div class="settings-card">
         <div class="set-row"><div><div class="set-k">Account</div><div class="set-v" id="setAccount">—</div></div><button class="btn ghost" id="rePairBtn" type="button">Re-pair Polkadot app</button></div>
-        <div class="set-row"><div><div class="set-k">Network</div><div class="set-v">Paseo People · statement store</div></div></div>
-        <div class="set-row"><div><div class="set-k">Connection health</div><div class="set-v">A glanceable badge shows P2P health while you watch — open it for peers, offload, latency, and connection type.</div></div></div>
+        <div class="set-row"><div><div class="set-k">Network</div><div class="set-v"><span class="set-status"><span class="sdot" id="setNetDot" data-h="wait"></span><span id="setNetwork">Checking…</span></span></div></div></div>
+        <div class="set-row"><div><div class="set-k">Connection health</div><div class="set-v"><span class="set-status"><span class="sdot" id="setHealthDot"></span><span id="setHealth">Not watching or streaming right now.</span></span></div></div></div>
         <div class="set-row"><div><div class="set-k">About</div><div class="set-v">Unstation · v0.0.0 · AGPL-3.0-or-later</div></div></div>
       </div>
     </div>
@@ -416,6 +462,18 @@
             <button class="copy" id="copyShare" data-copy="shareLink" type="button">Copy</button>
             <span class="viewers"><span id="pubViewers">0</span> watching</span>
           </div>
+          <div class="pub-health" id="pubHealth">
+            <div class="ph-row">
+              <span class="ph-dot" id="phDot" data-h="wait"></span>
+              <div><div class="ph-status" id="phStatus">Waiting for your encoder</div><div class="ph-note" id="phNote">Point OBS at the server above and start streaming — it goes live on its own.</div></div>
+            </div>
+            <div class="ph-stats">
+              <div class="ph-stat"><div class="k">Watching</div><div class="v" id="phViewers">0</div></div>
+              <div class="ph-stat"><div class="k">Live for</div><div class="v" id="phUptime">—</div></div>
+              <div class="ph-stat"><div class="k">Network</div><div class="v" id="phNet" style="font-size:13px">…</div></div>
+            </div>
+            <button class="pub-preview-link" id="previewSelf" type="button">Preview as a viewer →</button>
+          </div>
           <div class="rail-spacer"></div>
           <button class="btn ghost" id="endStream" type="button">End stream</button>
         </aside>
@@ -440,23 +498,19 @@
         <span class="state"><span class="health-dot"></span><span><span class="mode" id="modeText">LIVE · P2P</span> <span class="sep">·</span> <span class="peers"><span id="peerCount">0</span> peers</span></span></span>
         <span class="chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 15 6-6 6 6"/></svg></span>
       </div>
+      <button class="hud-btn" id="fsBtn" type="button" title="Fullscreen"><svg id="fsIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M3 16v3a2 2 0 0 0 2 2h3"/></svg><span id="fsLabel">Fullscreen</span></button>
     </div>
 
     <div class="net" id="net">
-      <div class="net-head"><span class="t">Network</span><span class="note" id="netNote">verified · in-mesh gossip after first link</span></div>
-      <div class="net-grid">
-        <div class="gauge">
-          <svg viewBox="0 0 120 120"><circle class="track" cx="60" cy="60" r="52"></circle><circle class="val" id="gaugeVal" cx="60" cy="60" r="52"></circle></svg>
-          <div class="label"><div class="pct"><span id="rhoPct">0</span><small>%</small></div><div class="cap">from peers</div></div>
-        </div>
-        <div class="metrics">
-          <div class="metric"><div class="k">Peers</div><div class="v cy" id="mPeers">0</div></div>
-          <div class="metric"><div class="k">From seeds</div><div class="v" id="mSeed">0%</div></div>
-          <div class="metric"><div class="k">From chain</div><div class="v" id="mChain">0%</div></div>
-          <div class="metric"><div class="k">Latency</div><div class="v" id="mLat">—</div></div>
-          <div class="metric"><div class="k">Connection</div><div class="v cy" id="mIce">—</div></div>
-          <div class="metric"><div class="k">Publisher</div><div class="v" id="mPub">—</div></div>
-        </div>
+      <div class="net-head"><span class="t">Your connection</span><span class="note">peer-to-peer · no servers</span></div>
+      <div class="health-row">
+        <span class="health-badge" id="vHealthDot" data-h="wait"></span>
+        <div><div class="health-verdict" id="vHealthLabel">Connecting…</div><div class="health-note" id="vHealthNote">Finding people streaming this near you.</div></div>
+      </div>
+      <div class="vmetrics">
+        <div class="vmetric"><div class="k">Sharing with you</div><div class="v" id="vPeers">0 people</div></div>
+        <div class="vmetric"><div class="k">Where it comes from</div><div class="v" id="vSource">directly from peers</div></div>
+        <div class="vmetric"><div class="k">Broadcaster</div><div class="v" id="mPub">—</div></div>
       </div>
     </div>
   </div>
@@ -477,6 +531,7 @@ import * as sso from './sso.js';
   const invoke = TAURI && TAURI.core ? TAURI.core.invoke : null;
   const listen = TAURI && TAURI.event ? TAURI.event.listen : null;
   const NATIVE = !!TAURI;
+  const appWindow = (TAURI && TAURI.window && TAURI.window.getCurrentWindow) ? TAURI.window.getCurrentWindow() : null;
   const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
   const win = document.getElementById('win');
 
@@ -523,7 +578,7 @@ import * as sso from './sso.js';
     setActiveTab(state);
     player.classList.toggle('show', isLive); hud.classList.toggle('show', isLive);
     document.getElementById('catchup').style.display = state==='catchup'?'grid':'none';
-    if(isLive){ intensity=1; mode=state==='seed'?'seed':'p2p'; win.dataset.health=mode; document.getElementById('modeText').textContent=state==='seed'?'LIVE · via seed':'LIVE · P2P'; showScene(''); if(!NATIVE){ setTitle('hardfork.dot',true); animateGauge(state==='seed'?41:78); setMetrics(state==='seed'); } return; }
+    if(isLive){ intensity=1; mode=state==='seed'?'seed':'p2p'; win.dataset.health=mode; document.getElementById('modeText').textContent=state==='seed'?'LIVE · via seed':'LIVE · P2P'; showScene(''); if(!NATIVE){ setTitle('hardfork.dot',true); renderViewerHealth({peers: state==='seed'?6:23, playing:true, mode, publisher:'hardfork.dot'}); } return; }
     intensity=(state==='finding')?0.85:0.16; win.dataset.net='closed'; if(state!=='finding') setTitle('Unstation',false);
     if(state==='finding'){ showScene('finding'); runFinding(); return; } showScene(state); }
 
@@ -537,17 +592,34 @@ import * as sso from './sso.js';
     seqTimers.push(setTimeout(()=>steps[3].classList.replace('active','done'),2900));
     if(!NATIVE) seqTimers.push(setTimeout(()=>go('live'),3200)); }
 
-  const gv=document.getElementById('gaugeVal'), C=2*Math.PI*52; gv.style.strokeDasharray=C; gv.style.strokeDashoffset=C;
-  function animateGauge(pct){ document.getElementById('rhoPct').textContent=Math.round(pct); requestAnimationFrame(()=>{gv.style.strokeDashoffset=C*(1-pct/100);}); }
-  function setMetrics(seed){ document.getElementById('mSeed').textContent=seed?'54%':'19%'; document.getElementById('mChain').textContent=seed?'5%':'3%'; document.getElementById('mLat').innerHTML=(seed?'6.1':'4.2')+'<small> s</small>'; const ice=document.getElementById('mIce'); ice.textContent=seed?'relayed':'direct'; ice.className='v '+(seed?'am':'cy'); document.getElementById('mPub').textContent='hardfork.dot'; document.getElementById('netNote').textContent=seed?'peers thin — a volunteer seed is filling in':'verified · in-mesh gossip after first link'; }
+  function isVideoPlaying(id){ const v=document.getElementById(id); return !!(v && v.readyState>=3 && !v.paused && !v.ended); }
+  // Plain-language verdict for a viewer. We only have REAL signals (peer count + whether
+  // video is actually playing) — so we never show fake precision (no invented latency/%/
+  // ICE type). The popup and the always-on pill dot share this verdict.
+  function viewerVerdict(peers, playing){
+    if(peers<=0) return { label:'Connecting…', note:'Finding people streaming this near you — make sure the broadcaster is live.', dot:'wait' };
+    if(!playing) return { label:'Almost there', note:'Connected to '+peers+' '+(peers===1?'person':'people')+' — pulling in the video now.', dot:'wait' };
+    if(peers>=2) return { label:'Excellent', note:'Smooth and steady — streaming from '+peers+' people, with no server in the middle.', dot:'good' };
+    return { label:'Good', note:'Streaming directly from 1 person. More viewers nearby will make it sturdier.', dot:'ok' };
+  }
+  function renderViewerHealth(o){
+    o = o || {}; const peers = o.peers||0; const v = viewerVerdict(peers, !!o.playing);
+    const set=(id,t)=>{ const el=document.getElementById(id); if(el) el.textContent=t; };
+    set('vHealthLabel', v.label); set('vHealthNote', v.note);
+    set('vPeers', peers + ' ' + (peers===1?'person':'people'));
+    set('vSource', o.mode==='seed' ? 'a volunteer relay' : 'directly from peers');
+    if(o.publisher) set('mPub', o.publisher);
+    set('peerCount', String(peers));
+    const vd=document.getElementById('vHealthDot'); if(vd) vd.dataset.h=v.dot;
+    const pd=document.querySelector('#pill .health-dot'); if(pd) pd.dataset.h=v.dot;
+  }
 
   /* real stats from the engine */
   let lastPeers = 0, watchWatchdog = null;
   function applyStats(s){ if(!s)return; lastPeers = s.peers||0; const seed=s.mode==='seed'; win.dataset.health=seed?'seed':'p2p';
-    document.getElementById('modeText').textContent=seed?'LIVE · via seed':'LIVE · P2P';
-    document.getElementById('peerCount').textContent=s.peers; document.getElementById('mPeers').textContent=s.peers;
-    animateGauge(s.rho); document.getElementById('mSeed').textContent=(s.from_seed||0)+'%'; document.getElementById('mChain').textContent=(s.from_chain||0)+'%';
-    document.getElementById('mLat').innerHTML=(s.latency_s?s.latency_s.toFixed(1):'—')+'<small> s</small>'; const ice=document.getElementById('mIce'); ice.textContent=s.ice||'—'; ice.className='v '+(seed?'am':'cy'); }
+    const mt=document.getElementById('modeText'); if(mt) mt.textContent=seed?'LIVE · via relay':'LIVE · P2P';
+    renderViewerHealth({peers:lastPeers, playing:isVideoPlaying('vid'), mode:s.mode});
+    if(curStateName==='settings') updateSettingsStatus(); }
 
   // Viewer-facing connection feedback. The catchup overlay carries the message; the
   // watchdog turns a silent "no video" into a peer-aware, actionable explanation.
@@ -601,7 +673,7 @@ import * as sso from './sso.js';
   wireVideoDiag('pubVid','pubVidDiag', true);
   wireVideoDiag('vid','vidDiag', false);
 
-  document.getElementById('watchForm').addEventListener('submit', async (e)=>{ e.preventDefault(); const target=(document.getElementById('streamInput').value||'').trim(); if(!target){ document.getElementById('streamInput').focus(); return; } if(!ensureSignedIn()) return; go('finding');
+  document.getElementById('watchForm').addEventListener('submit', async (e)=>{ e.preventDefault(); const target=(document.getElementById('streamInput').value||'').trim(); if(!target){ document.getElementById('streamInput').focus(); return; } if(!ensureSignedIn()) return; if(NATIVE && publishing && pubName && shareName(target)===pubName){ selfWatch(pubName); return; } go('finding');
     if(NATIVE && invoke){ try{ const info=await invoke('start_watch',{ target }); document.getElementById('mPub').textContent=info.publisher; lastPeers=0; go('live'); setTitle(target,true); applyStats({peers:0,rho:0,mode:'p2p',from_seed:0,from_chain:0,latency_s:0,ice:'connecting'}); startWatchWatchdog(); setVideo(info.hls_url); }catch(err){ console.error('start_watch failed',err); document.getElementById('progEyebrow').textContent='Problem'; document.getElementById('progTitle').textContent='Couldn’t start watching'; document.getElementById('progSub').textContent=((err&&err.message)||(''+err)); clearSeq(); } }
     else { setTimeout(()=>go('live'),1200); } });
 
@@ -609,6 +681,58 @@ import * as sso from './sso.js';
 
   /* Go Live (publisher) — name your stream, share a friendly link, watch it back */
   let publishing = false, pubHlsUrl = null, pubViewersTimer = null, pubName = '';
+  let pubLive = false, pubLiveSince = 0, lastViewers = 0, chainState = '', chainDetail = '', fsOn = false;
+  function fmtDur(ms){ const s=Math.max(0,(ms/1000)|0), h=(s/3600)|0, m=((s%3600)/60)|0, ss=s%60; return (h>0?h+':'+String(m).padStart(2,'0'):String(m))+':'+String(ss).padStart(2,'0'); }
+  // Plain network status shared by the Go Live card + Settings (driven by mesh-status).
+  function netLabel(){
+    if(chainState==='ready') return { t:'Connected', h:'good' };
+    if(chainState==='connecting') return { t:'Connecting…', h:'wait' };
+    if(chainState==='error') return { t:(chainDetail||'Not connected'), h:'' };
+    return { t: NATIVE?'Connecting…':'Preview', h:'wait' };
+  }
+  // Streamer-facing Go Live health: live/waiting + viewers + uptime + network. No jargon.
+  function updatePubHealth(){
+    const set=(id,t)=>{ const el=document.getElementById(id); if(el) el.textContent=t; };
+    const dot=document.getElementById('phDot');
+    if(pubLive){ if(dot) dot.dataset.h='live'; set('phStatus','You’re live'); set('phNote','Your encoder is connected — viewers can tune in with your stream name.'); }
+    else { if(dot) dot.dataset.h='wait'; set('phStatus','Waiting for your encoder'); set('phNote','Point OBS at the server above and start streaming — it goes live on its own.'); }
+    set('phViewers', String(lastViewers));
+    set('phUptime', pubLiveSince ? fmtDur(Date.now()-pubLiveSince) : '—');
+    set('phNet', netLabel().t);
+  }
+  // Settings → Network + Connection health, reflecting real state.
+  function updateSettingsStatus(){
+    const set=(id,t)=>{ const el=document.getElementById(id); if(el) el.textContent=t; };
+    const nl=netLabel(); set('setNetwork', nl.t + ' · Paseo People'); const nd=document.getElementById('setNetDot'); if(nd) nd.dataset.h=nl.h;
+    let ht='Not watching or streaming right now.', hh='';
+    if(publishing){ ht = pubLive ? ('Streaming live · '+lastViewers+' watching') : 'Stream open · waiting for your encoder'; hh = pubLive?'good':'wait'; }
+    else if(['live','seed','catchup'].includes(curStateName)){ const v=viewerVerdict(lastPeers, isVideoPlaying('vid')); ht = v.label + ' · ' + lastPeers + ' ' + (lastPeers===1?'peer':'peers'); hh = v.dot; }
+    set('setHealth', ht); const hd=document.getElementById('setHealthDot'); if(hd) hd.dataset.h=hh;
+  }
+  // Live uptime ticker (cheap; only repaints while a stream is actually live).
+  setInterval(()=>{ if(publishing && pubLive) updatePubHealth(); }, 1000);
+  // Fullscreen for TV/laptop: hide the tabs + let the video fill the screen. Uses the
+  // Tauri window's native fullscreen on desktop; falls back to the HTML API in preview.
+  async function toggleFullscreen(){
+    fsOn=!fsOn; win.classList.toggle('fs', fsOn);
+    const lbl=document.getElementById('fsLabel'); if(lbl) lbl.textContent=fsOn?'Exit':'Fullscreen';
+    if(appWindow){ try{ await appWindow.setFullscreen(fsOn); }catch(e){ console.error('[fs]',e); } }
+    else { try{ if(fsOn){ win.requestFullscreen && win.requestFullscreen(); } else if(document.fullscreenElement){ document.exitFullscreen(); } }catch(e){} }
+  }
+  // Self-check: watch your OWN stream on this machine. A same-identity viewer can't
+  // discover itself over the mesh, so this plays your local publish feed directly —
+  // verifying encoder → ingest → segmenter → HLS → player end to end on one device.
+  function selfWatch(name){
+    if(!(NATIVE && pubHlsUrl)) return;
+    go('live'); setTitle(name+' · preview', true); lastPeers=0;
+    const set=(id,t)=>{ const el=document.getElementById(id); if(el) el.textContent=t; };
+    set('mPub', name+' (you)'); set('vPeers','you'); set('vSource','your local feed');
+    set('vHealthLabel','Your own stream'); set('vHealthNote','Local preview of what you’re broadcasting — confirms your encoder and video pipeline are working.');
+    const vd=document.getElementById('vHealthDot'); if(vd) vd.dataset.h='good';
+    set('peerCount','0'); const pd=document.querySelector('#pill .health-dot'); if(pd) pd.dataset.h='good';
+    const mt=document.getElementById('modeText'); if(mt) mt.textContent='PREVIEW · you';
+    setVideo(pubHlsUrl);
+  }
   const slugify = t => ((t||'').trim().toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'') || 'my-stream');
   // The stream's shareable name — just the text a viewer types. No ".dot": chain-
   // backed `.dot` resolution lands later, and the Rust side hashes the same
@@ -662,7 +786,11 @@ import * as sso from './sso.js';
   // Reflect the REAL stream state — `publish-state` fires from the feeder based on
   // whether fresh fragments are actually arriving, so LIVE always matches the video.
   function applyPublishState(live){
-    // Only drive the console when it's actually on screen — a background publish
+    pubLive = live;
+    if(live){ if(!pubLiveSince) pubLiveSince = Date.now(); } else { pubLiveSince = 0; }
+    updatePubHealth();
+    if(curStateName==='settings') updateSettingsStatus();
+    // Only drive the on-screen console video when it's visible — a background publish
     // still emits publish-state while the user is on another tab.
     if(!publishing || document.getElementById('pubLive').hidden) return;
     const tag = document.getElementById('pubLiveTag');
@@ -702,7 +830,8 @@ import * as sso from './sso.js';
       document.getElementById('ingestServer').textContent = status.info.ingest_server;
       document.getElementById('ingestKey').textContent = status.info.stream_key;
       document.getElementById('shareLink').textContent = status.name;
-      document.getElementById('pubViewers').textContent = status.viewers;
+      lastViewers = status.viewers||0;
+      document.getElementById('pubViewers').textContent = lastViewers;
       document.getElementById('pubSetup').hidden = true;
       document.getElementById('pubLive').hidden = false;
       refreshGoLiveBadge();
@@ -722,7 +851,7 @@ import * as sso from './sso.js';
     else { go('entry'); }
   }
   async function endPublish(){
-    publishing = false; pubActive = false; pubName = ''; clearInterval(pubViewersTimer);
+    publishing = false; pubActive = false; pubName = ''; pubLive = false; pubLiveSince = 0; lastViewers = 0; clearInterval(pubViewersTimer);
     refreshGoLiveBadge();
     if(NATIVE && invoke){ try{ await invoke('stop_publish'); }catch(e){} }
     titleEl.readOnly = false;
@@ -731,11 +860,12 @@ import * as sso from './sso.js';
     const v=document.getElementById('pubVid'); try{ v.pause(); }catch(e){} v.removeAttribute('src'); v.style.display='none';
     go('entry');
   }
-  async function leaveWatch(){ if(NATIVE && invoke){ try{ await invoke('stop_watch'); }catch(e){} } const v=document.getElementById('vid'); clearInterval(v._retry); clearWatchUi(); try{ v.pause(); }catch(e){} v.removeAttribute('src'); v.style.display='none'; go('entry'); }
+  async function leaveWatch(){ if(fsOn) toggleFullscreen(); if(NATIVE && invoke){ try{ await invoke('stop_watch'); }catch(e){} } const v=document.getElementById('vid'); clearInterval(v._retry); clearWatchUi(); try{ v.pause(); }catch(e){} v.removeAttribute('src'); v.style.display='none'; go('entry'); }
   // Use the async session check (the sync one races storage hydration and wrongly
   // shows "Not signed in" right after pairing). Show a transient "Checking…" first.
   async function openSettings(){
     go('settings');
+    updateSettingsStatus();
     const el = document.getElementById('setAccount'); el.textContent = 'Checking…';
     let signedIn = false; try { signedIn = await sso.awaitSession(); } catch(e){}
     el.textContent = signedIn ? 'Signed in' : 'Not signed in';
@@ -746,6 +876,8 @@ import * as sso from './sso.js';
   document.getElementById('tabSettings').addEventListener('click', openSettings);
   document.getElementById('goLiveLink').addEventListener('click', enterGoLive);
   document.getElementById('leaveWatchBtn').addEventListener('click', leaveWatch);
+  document.getElementById('fsBtn').addEventListener('click', toggleFullscreen);
+  { const pv=document.getElementById('previewSelf'); if(pv) pv.addEventListener('click', ()=>{ if(pubName) selfWatch(pubName); }); }
   document.getElementById('rePairBtn').addEventListener('click', ()=>{ try{ sso.resetPairing(); }catch(e){} const pb=document.getElementById('pairedBtn'); if(pb) pb.style.display=''; go('onboarding'); beginPairing(); });
   document.getElementById('cancelPublish').addEventListener('click', endPublish);
   document.getElementById('endStream').addEventListener('click', endPublish);
@@ -760,7 +892,7 @@ import * as sso from './sso.js';
 
   /* preview-only: dock + mock peer jitter */
   if(!NATIVE){ const dock=document.getElementById('dock'); dock.style.display='flex'; document.querySelectorAll('.dock button').forEach(b=>b.addEventListener('click',()=>go(b.dataset.state)));
-    setInterval(()=>{ if(!['live','seed','catchup'].includes(curStateName))return; const base=win.dataset.health==='seed'?6:23; const n=base+((Math.random()*5)|0)-2; document.getElementById('peerCount').textContent=n; document.getElementById('mPeers').textContent=n; },2200);
+    setInterval(()=>{ if(!['live','seed','catchup'].includes(curStateName))return; const base=win.dataset.health==='seed'?6:23; const n=base+((Math.random()*5)|0)-2; renderViewerHealth({peers:n, playing:true, mode:win.dataset.health}); },2200);
   } else { const d=document.getElementById('dock'); if(d) d.remove(); }
 
   /* QR — real, scannable (the `qrcode` lib). Encodes the SSO pairing payload;
@@ -841,9 +973,14 @@ import * as sso from './sso.js';
       let plat='macos'; try{ plat = await invoke('platform'); }catch(e){}
       document.body.classList.add('plat-'+plat);
       // Windows/Linux use a custom titlebar; wire its min/max/close to the native window.
-      const appWindow = (TAURI.window && TAURI.window.getCurrentWindow) ? TAURI.window.getCurrentWindow() : null;
       if(appWindow){ const wire=(id,fn)=>{ const b=document.getElementById(id); if(b) b.onclick=()=>{ try{ fn(); }catch(e){} }; }; wire('wcMin',()=>appWindow.minimize()); wire('wcMax',()=>appWindow.toggleMaximize()); wire('wcClose',()=>appWindow.close()); }
-      if(listen){ try{ await listen('mesh-stats', e=>applyStats(e.payload)); await listen('publish-state', e=>applyPublishState(!!(e.payload && e.payload.live))); await listen('publish-stats', e=>{ const el=document.getElementById('pubViewers'); if(el && e.payload) el.textContent=e.payload.viewers; }); await listen('publish-hint', e=>{ const w=document.getElementById('pubWaiting'); const b=w&&w.querySelector('b'); if(b && e.payload && e.payload.message){ b.textContent=e.payload.message; } }); await listen('mesh-status', e=>{ const p=e&&e.payload; if(!p) return; console.log('[mesh-status]', p.state, p.detail); if(p.state==='error'){ const b=document.querySelector('#pubWaiting b'); if(b && !document.getElementById('pubLive').hidden) b.textContent=p.detail; } }); }catch(e){} }
+      if(listen){ try{
+        await listen('mesh-stats', e=>applyStats(e.payload));
+        await listen('publish-state', e=>applyPublishState(!!(e.payload && e.payload.live)));
+        await listen('publish-stats', e=>{ if(e.payload){ lastViewers = e.payload.viewers||0; const el=document.getElementById('pubViewers'); if(el) el.textContent=lastViewers; updatePubHealth(); if(curStateName==='settings') updateSettingsStatus(); } });
+        await listen('publish-hint', e=>{ const w=document.getElementById('pubWaiting'); const b=w&&w.querySelector('b'); if(b && e.payload && e.payload.message){ b.textContent=e.payload.message; } });
+        await listen('mesh-status', e=>{ const p=e&&e.payload; if(!p) return; console.log('[mesh-status]', p.state, p.detail); chainState=p.state; chainDetail=p.detail||''; updatePubHealth(); if(curStateName==='settings') updateSettingsStatus(); if(p.state==='error'){ const b=document.querySelector('#pubWaiting b'); if(b && !document.getElementById('pubLive').hidden) b.textContent=p.detail; } });
+      }catch(e){} }
       // Re-attach: if a publish session is still running in the backend (a webview
       // reload, or relaunch while the process lived), light the Go-Live tab badge so
       // the user can tab straight back into it.
