@@ -258,6 +258,50 @@ async fn inbound_from_unconnected_peer_does_not_crash() {
     assert_eq!(stats.delivered, 0);
 }
 
+#[tokio::test]
+async fn viewer_relays_stream_to_a_peer_that_cant_reach_the_origin() {
+    // Mesh-as-relay (M4): viewer B connects ONLY to viewer A — never to the publisher —
+    // and still receives the whole stream, because A reshares what it pulls. This is the
+    // decentralized substitute for a TURN relay: a NAT-restricted peer only needs to reach
+    // *some* peer, and the swarm relays through volunteers.
+    let (n, seg_len) = (10usize, 16_000usize);
+    let (segs, ids) = make_vod(n, seg_len);
+    let (p, a, b) = (PeerId::from_u64(1), PeerId::from_u64(2), PeerId::from_u64(3));
+
+    let (atx, arx) = mpsc::unbounded_channel::<EngineEvent>();
+    let (btx, brx) = mpsc::unbounded_channel::<EngineEvent>();
+
+    // Publisher P ↔ viewer A (A is the only peer that can reach the origin).
+    let ptx = spawn_publisher(p, a, &atx, segs.clone(), seg_len);
+
+    // Viewer A ↔ viewer B. B has NO link to the publisher.
+    let (la_for_a, la_for_b) = wire(a, atx.clone(), b, btx.clone());
+    atx.send(EngineEvent::PeerConnected { peer: b, link: la_for_a }).unwrap();
+    btx.send(EngineEvent::PeerConnected { peer: a, link: la_for_b }).unwrap();
+
+    // A keeps running (and reshares) until we stop it — so it can serve B to completion.
+    let a_rec = Arc::new(Rec::default());
+    let viewer_a =
+        MeshNode::new_viewer(a, cfg(Role::Viewer), seg_len as u64, a_rec.clone(), ids.clone(), (n - 1) as Seq);
+    let a_handle = tokio::spawn(viewer_a.run(arx, Duration::from_millis(10), None));
+
+    let b_rec = Arc::new(Rec::default());
+    let viewer_b =
+        MeshNode::new_viewer(b, cfg(Role::Viewer), seg_len as u64, b_rec.clone(), ids, (n - 1) as Seq);
+    let b_stats = tokio::time::timeout(Duration::from_secs(12), viewer_b.run(brx, Duration::from_millis(10), Some(n)))
+        .await
+        .expect("B should receive the full stream relayed through A");
+
+    assert_eq!(b_stats.delivered, n, "B got every segment via A's reshare");
+    assert_eq!(b_stats.hash_failures, 0);
+    assert!(b_stats.peer_bytes > 0, "B's bytes came from a peer (A), never the origin");
+    assert_eq!(b_rec.count(), n, "all relayed segments reached B's player");
+
+    let _ = atx.send(EngineEvent::Stop);
+    let _ = ptx.send(EngineEvent::Stop);
+    let _ = tokio::time::timeout(Duration::from_secs(2), a_handle).await;
+}
+
 // ---- signaling / discovery layer ----
 
 fn sig(store: &MemStatementStore, stream: StreamId, me: PeerId, clock: Arc<VirtualClock>) -> StatementSignaling {

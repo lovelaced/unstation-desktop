@@ -299,6 +299,11 @@ async fn start_watch(
     // Learn the live edge (segment ids) from the publisher.
     session.spawn_edge_poller(view_tx.clone());
 
+    // Announce ourselves so other viewers can discover + reshare from us — the mesh
+    // relays through volunteer peers, so a NAT-restricted node only needs to reach
+    // *someone*. (At scale this presence write moves off-chain; see docs/SCALING_RESEARCH.)
+    session.spawn_presence(20_000_000);
+
     // Discover the publisher and dial it, then keep the connection alive: if the dial
     // stalls (no connect within the timeout) or the peer later drops, re-discover and
     // re-dial. (watch returns now so the UI can attach the player while this runs.)
@@ -307,51 +312,68 @@ async fn start_watch(
         let appc = app.clone();
         tasks.push(tokio::spawn(async move {
             loop {
-                let presence = s.discover().await; // loops until presence is found
-                let publisher = presence.peer_id;
-                // M2 trust gate: if the publisher announced a signed manifest, fetch it
-                // from Bulletin and verify it against the publisher's PeerId (its sr25519
-                // pubkey) before connecting. A signature MISMATCH is an impostor/tamper
-                // signal → refuse and re-discover. A transient fetch failure (chain lag)
-                // is tolerated — per-segment hashes still protect content integrity.
-                if let Some(cid) = presence.manifest_cid.clone() {
-                    match BulletinOrigin.fetch_manifest(cid).await {
-                        Ok(m) if m.verify(&publisher.0).is_ok() => {
-                            log::info!("[watch] publisher signed manifest verified");
+                // Mesh-as-relay (M4): hold a few peer connections, dialing whichever
+                // discovered candidates we can reach. A NAT-restricted viewer only needs
+                // ONE reachable peer — the swarm relays the rest. No central relay required.
+                const TARGET_DEGREE: usize = 3;
+                let mut dialed = Vec::new();
+                if s.peer_count() < TARGET_DEGREE {
+                    for cand in s.discover_peers(8).await {
+                        if s.peer_count() >= TARGET_DEGREE {
+                            break;
                         }
-                        Ok(_) => {
-                            let _ = appc.emit(
-                                "mesh-status",
-                                MeshStatusMsg { state: "error".into(), detail: "Couldn’t verify the broadcaster — signature mismatch.".into() },
-                            );
-                            tokio::time::sleep(Duration::from_secs(3)).await;
-                            continue;
+                        // M2 trust gate: only the publisher announces a signed-manifest CID;
+                        // verify it against its PeerId and skip impostors. Resharing viewers
+                        // carry no manifest — their segments are still hash-verified against
+                        // the publisher-authenticated live edge.
+                        if let Some(cid) = cand.manifest_cid.clone() {
+                            match BulletinOrigin.fetch_manifest(cid).await {
+                                Ok(m) if m.verify(&cand.peer_id.0).is_ok() => {}
+                                Ok(_) => {
+                                    let _ = appc.emit(
+                                        "mesh-status",
+                                        MeshStatusMsg { state: "error".into(), detail: "Couldn’t verify a broadcaster — skipping.".into() },
+                                    );
+                                    continue;
+                                }
+                                Err(e) => log::warn!("[watch] manifest fetch failed ({e:?}); proceeding (segments still hash-verified)"),
+                            }
                         }
-                        Err(e) => log::warn!("[watch] manifest fetch failed ({e:?}); proceeding (segments still hash-verified)"),
+                        s.dial(cand.peer_id);
+                        dialed.push(cand.peer_id);
                     }
                 }
-                s.dial(publisher);
-                // Wait up to ~12s for both data channels to open.
+                if s.peer_count() == 0 && dialed.is_empty() {
+                    // No candidates discovered yet — keep looking.
+                    let _ = appc.emit(
+                        "mesh-status",
+                        MeshStatusMsg { state: "connecting".into(), detail: "Reaching the swarm…".into() },
+                    );
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+                // Give fresh dials up to ~12s to open a channel.
                 let mut waited = 0u64;
                 while s.peer_count() == 0 && waited < 12_000 {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     waited += 500;
                 }
                 if s.peer_count() == 0 {
-                    // Stalled handshake (lost signal / ICE failure): abandon this
-                    // attempt so the transport accepts a fresh dial, then retry.
+                    // All dials stalled (lost signal / ICE failure): abandon them so the
+                    // transport accepts fresh dials, then retry other candidates.
                     let _ = appc.emit(
                         "mesh-status",
-                        MeshStatusMsg { state: "connecting".into(), detail: "Still reaching the broadcaster…".into() },
+                        MeshStatusMsg { state: "connecting".into(), detail: "Still reaching the swarm…".into() },
                     );
-                    s.close(publisher);
+                    for pid in dialed {
+                        s.close(pid);
+                    }
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     continue;
                 }
-                // Connected — hold until the peer drops, then loop to re-establish.
-                while s.peer_count() > 0 {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
+                // Connected to at least one peer — the mesh delivers. Re-evaluate
+                // periodically to top up toward TARGET_DEGREE and replace dropped peers.
+                tokio::time::sleep(Duration::from_secs(3)).await;
             }
         }));
     }

@@ -165,6 +165,29 @@ impl Session {
         self.discover().await.peer_id
     }
 
+    /// Viewer: a one-shot snapshot of up to `max` candidate peers (anyone that isn't us)
+    /// across the discovery shards, deduped. The dial loop tries several, so a
+    /// NAT-restricted node only needs to reach *one* — the swarm relays the rest, with
+    /// no central relay required. Returns whatever is present right now (possibly empty).
+    pub async fn discover_peers(&self, max: usize) -> Vec<Presence> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for shard in 0..self.n_shards {
+            let topic = discovery_topic(&self.stream, shard);
+            if let Ok(list) = self.signaling.read_presence(topic, 32).await {
+                for p in list {
+                    if p.peer_id != self.my_peer && seen.insert(p.peer_id) {
+                        out.push(p);
+                        if out.len() >= max {
+                            return out;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Viewer: open a WebRTC connection to a discovered publisher. The link
     /// arrives at the node inbox as `PeerConnected` once both channels open.
     pub fn dial(&self, publisher: PeerId) {
