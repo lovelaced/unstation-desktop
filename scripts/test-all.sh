@@ -61,17 +61,20 @@ if [ "$WITH_CHAIN" = 1 ]; then
     echo "  using the node already running at $RPC_URL"
   else
     echo "  booting a local dev node (one-time build if needed; see dev-chain.sh) …"
-    scripts/dev-chain.sh build || { FAILED+=("dev-chain build"); }
+    scripts/dev-chain.sh build || FAILED+=("dev-chain build")
     scripts/dev-chain.sh run > "$ROOT/dev-node.log" 2>&1 &
     NODE_PID=$!
     if ! RPC_URL="$RPC_URL" TIMEOUT=120 .github/scripts/wait-for-rpc.sh; then
       echo "  ✗ dev node never became ready (see dev-node.log)"; FAILED+=("dev node boot")
     fi
   fi
-  if [ -z "${FAILED[*]:-}" ] || RPC_URL="$RPC_URL" TIMEOUT=2 .github/scripts/wait-for-rpc.sh >/dev/null 2>&1; then
+  if RPC_URL="$RPC_URL" TIMEOUT=2 .github/scripts/wait-for-rpc.sh >/dev/null 2>&1; then
+    # Grant the e2e key's statement allowance (runtime-correct, via polkadot-js).
+    NODE_WS="${NODE_WS:-ws://127.0.0.1:9944}" scripts/provision-allowance.sh \
+      || FAILED+=("provision allowance")
     ( cd crates/unstation-chain \
       && NODE_WS="${NODE_WS:-ws://127.0.0.1:9944}" \
-         cargo test --features testnet-provisioning --test chain_e2e -- --ignored --nocapture ) \
+         cargo test --test chain_e2e -- --ignored --nocapture ) \
       && echo "  ✓ chain e2e" || { echo "  ✗ chain e2e"; FAILED+=("chain e2e"); }
   fi
 fi

@@ -78,11 +78,15 @@ jobs:
           unstation-desktop/scripts/dev-chain.sh run > node.log 2>&1 &
           echo "NODE_PID=$!" >> "$GITHUB_ENV"
           RPC_URL=http://127.0.0.1:9944 TIMEOUT=120 unstation-desktop/.github/scripts/wait-for-rpc.sh
-      - name: Run chain e2e (real statement store + Alice-provisioned allowance)
+      - name: Provision the test key's statement allowance (sudo, runtime-correct)
+        env:
+          NODE_WS: ws://127.0.0.1:9944
+        run: unstation-desktop/scripts/provision-allowance.sh
+      - name: Run chain e2e (real statement store)
         working-directory: unstation-desktop/crates/unstation-chain
         env:
           NODE_WS: ws://127.0.0.1:9944
-        run: cargo test --features testnet-provisioning --test chain_e2e -- --ignored --nocapture
+        run: cargo test --test chain_e2e -- --ignored --nocapture
       - name: Stop the node
         if: always()
         run: kill "${NODE_PID}" 2>/dev/null || true

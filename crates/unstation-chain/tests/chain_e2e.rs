@@ -4,13 +4,16 @@
 //! Production "Paseo People Next" can't be reproduced locally (its personhood pallets are
 //! non-public), but our code only depends on the `:statement_allowance:` key + the
 //! `statement_submit`/`statement_subscribeStatement` RPC — which a local kitchensink
-//! `substrate-node` reproduces faithfully. With the `testnet-provisioning` feature,
-//! `init_statement_store` auto-grants this key an allowance via Alice's sudo (Alice IS
-//! sudo on a --dev node; she is NOT on public Paseo — that's the production blocker).
+//! `substrate-node` reproduces faithfully. This test's identity is a FIXED key (seed
+//! [11u8;32]); its allowance is granted out-of-band by `scripts/provision-allowance.sh`
+//! (a sudo `system.setStorage` as Alice — the SDK's own auto-provision targets the
+//! production runtime, not a local node, so we don't use it here).
 //!
-//! Boot a node first (see `scripts/dev-chain.sh`), then:
+//! Driven end-to-end by `scripts/test-all.sh --chain`. Manually:
+//!   scripts/dev-chain.sh run &                       # boot the node
+//!   scripts/provision-allowance.sh                   # grant this key's allowance
 //!   NODE_WS=ws://127.0.0.1:9944 cargo test -p unstation-chain \
-//!     --features testnet-provisioning --test chain_e2e -- --ignored --nocapture
+//!     --test chain_e2e -- --ignored --nocapture
 //!
 //! Single test on purpose: the statement-store client is process-global (one init).
 
@@ -29,8 +32,8 @@ fn node_ws() -> String {
 async fn local_chain_round_trips_presence_signaling_and_edge() {
     use unstation_chain::ChainSignaling;
 
-    // Point the SDK at the local node, then init a fresh identity. With
-    // `testnet-provisioning`, init kicks off Alice's sudo grant of our allowance.
+    // Point the SDK at the local node, then init the FIXED identity whose allowance
+    // provision-allowance.sh granted.
     unstation_chain::set_statement_store_endpoint(vec![node_ws()]);
     let kp = crypto::keypair_from_seed(&[11u8; 32]);
     unstation_chain::init_statement_store(kp);
@@ -44,18 +47,18 @@ async fn local_chain_round_trips_presence_signaling_and_edge() {
     let stream = StreamId([7u8; 32]);
     let sig = ChainSignaling::new(stream, 1);
 
-    // ---- presence (retry to absorb async allowance provisioning) ----
+    // ---- presence (short retry to absorb the allowance landing in a block) ----
     let pres = Presence { peer_id: me, caps_upload_bps: 20_000_000, ttl_s: 30, manifest_cid: None, relay: true };
     let mut waited = 0u64;
     loop {
         match sig.publish_presence(pres.clone()).await {
             Ok(()) => break,
-            Err(e) if waited < 90 => {
-                eprintln!("[e2e] publish_presence not yet allowed ({e}); allowance still provisioning…");
+            Err(e) if waited < 30 => {
+                eprintln!("[e2e] publish not yet allowed ({e}); did scripts/provision-allowance.sh run?");
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 waited += 3;
             }
-            Err(e) => panic!("publish_presence never succeeded (allowance not provisioned?): {e}"),
+            Err(e) => panic!("publish_presence never succeeded — allowance not granted? run scripts/provision-allowance.sh: {e}"),
         }
     }
     tokio::time::sleep(Duration::from_secs(3)).await; // let the store settle/gossip
