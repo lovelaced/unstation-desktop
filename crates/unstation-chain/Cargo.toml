@@ -11,8 +11,19 @@ unstation-core = { path = "../unstation-core" }
 # The chain SDK's native facade (statement store, wallet, VRF, bulletin).
 # Mirrors truhost/desktop/src-tauri's dependency on the same crate.
 useragent-native = { package = "useragent-native", path = "../../../useragent-kit/crates/host-native" }
+# Direct (feature-only) handle to the SAME chain crate the facade uses, so we can forward
+# its `testnet-provisioning` feature WITHOUT modifying the shared SDK. Pulled only when the
+# feature below is enabled (debug/e2e builds); never linked in normal/release builds.
+useragent-chain = { package = "useragent-chain", path = "../../../useragent-kit/crates/host-chain", optional = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros"] }
 parity-scale-codec = { version = "3", features = ["derive"] }
 schnorrkel = "0.11"
 bytes = "1"
 log = "0.4"
+
+[features]
+# Enable the SDK's Alice-sudo statement-store provisioning for LOCAL-chain e2e tests
+# (tests/chain_e2e.rs). Cargo unifies the host-chain build, so `init_statement_store`'s
+# auto_provision actually grants the test key a `:statement_allowance:` entry. Debug-only —
+# the SDK hard-errors this feature in release builds, which is fine (tests run unoptimized).
+testnet-provisioning = ["dep:useragent-chain", "useragent-chain/testnet-provisioning"]

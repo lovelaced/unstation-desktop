@@ -71,6 +71,13 @@ pub fn identity_public() -> Option<[u8; 32]> {
     local_peer_id().map(|p| p.0)
 }
 
+/// Point the statement-store client at specific WS endpoint(s) — e.g. a local `--dev`
+/// node for e2e tests — overriding the default Paseo endpoint and the
+/// `HOST_STATEMENT_STORE_WS_ENDPOINTS` env var. Call BEFORE [`init_statement_store`].
+pub fn set_statement_store_endpoint(ws_endpoints: Vec<String>) {
+    ss::set_endpoint_override(ws_endpoints);
+}
+
 /// Initialize the process-global statement store with the host's signing keypair
 /// (from `WalletManager::statement_store_keypair`). Call once at startup. The
 /// background subscription/poll thread starts immediately; `auto_provision`

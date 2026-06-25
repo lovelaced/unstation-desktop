@@ -4613,6 +4613,7 @@ dependencies = [
  "schnorrkel",
  "tokio",
  "unstation-core",
+ "useragent-chain",
  "useragent-native",
 ]
 
