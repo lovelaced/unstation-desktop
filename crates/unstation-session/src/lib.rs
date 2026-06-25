@@ -17,6 +17,7 @@
 //! [`Link`]: unstation_core::transport::Link
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -44,6 +45,10 @@ pub struct Session {
     pub n_shards: u32,
     signaling: ChainSignaling,
     transport: LibDcTransport,
+    /// Publisher's signed-manifest Bulletin CID, announced in presence once the
+    /// manifest is published (after the encoder's init segment exists). Shared so the
+    /// presence-refresh loop picks it up when [`Session::set_manifest_cid`] is called.
+    manifest_cid: Arc<Mutex<Option<String>>>,
 }
 
 impl Session {
@@ -74,23 +79,39 @@ impl Session {
         tokio::spawn(relay_outbound(sig_rx, signaling.clone(), my_peer));
         tokio::spawn(relay_inbound(signaling.clone(), my_peer, transport.clone()));
 
-        Ok(Self { stream, my_peer, n_shards: n_shards.max(1), signaling, transport })
+        Ok(Self {
+            stream,
+            my_peer,
+            n_shards: n_shards.max(1),
+            signaling,
+            transport,
+            manifest_cid: Arc::new(Mutex::new(None)),
+        })
     }
 
     /// Publisher: announce presence on our discovery shard, refreshed before TTL.
     pub fn spawn_presence(&self, caps_upload_bps: u64) {
         let signaling = self.signaling.clone();
         let me = self.my_peer;
+        let manifest_cid = self.manifest_cid.clone();
         tokio::spawn(async move {
             let mut tick = interval(PRESENCE_REFRESH);
             loop {
                 tick.tick().await;
-                let p = Presence { peer_id: me, caps_upload_bps, ttl_s: PRESENCE_TTL_S };
+                let mc = manifest_cid.lock().unwrap().clone();
+                let p = Presence { peer_id: me, caps_upload_bps, ttl_s: PRESENCE_TTL_S, manifest_cid: mc };
                 if let Err(e) = signaling.publish_presence(p).await {
                     log::warn!("[session] publish_presence: {e}");
                 }
             }
         });
+    }
+
+    /// Publisher: set the signed-manifest Bulletin CID announced in presence. Call once
+    /// the manifest has been published to Bulletin (after the encoder's init segment
+    /// exists); the presence-refresh loop picks it up on its next tick.
+    pub fn set_manifest_cid(&self, cid: String) {
+        *self.manifest_cid.lock().unwrap() = Some(cid);
     }
 
     /// Publisher: republish the live-edge manifest as new `(seq, content-id)` pairs
@@ -121,20 +142,27 @@ impl Session {
         });
     }
 
-    /// Viewer: poll presence across all discovery shards until a publisher (any
-    /// peer that isn't us) appears, and return it.
-    pub async fn discover_publisher(&self) -> PeerId {
+    /// Viewer: poll presence across all discovery shards until a publisher (any peer
+    /// that isn't us) appears, and return its full presence record — including the
+    /// signed-manifest CID the viewer fetches + verifies before trusting the stream.
+    pub async fn discover(&self) -> Presence {
         loop {
             for shard in 0..self.n_shards {
                 let topic = discovery_topic(&self.stream, shard);
                 if let Ok(list) = self.signaling.read_presence(topic, 32).await {
                     if let Some(p) = list.into_iter().find(|p| p.peer_id != self.my_peer) {
-                        return p.peer_id;
+                        return p;
                     }
                 }
             }
             sleep(DISCOVERY_POLL).await;
         }
+    }
+
+    /// Viewer: like [`Session::discover`] but returns only the publisher's `PeerId`
+    /// (for callers that don't need the manifest CID).
+    pub async fn discover_publisher(&self) -> PeerId {
+        self.discover().await.peer_id
     }
 
     /// Viewer: open a WebRTC connection to a discovered publisher. The link

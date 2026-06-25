@@ -15,6 +15,11 @@ pub struct Presence {
     pub peer_id: PeerId,
     pub caps_upload_bps: u64,
     pub ttl_s: u32,
+    /// Bulletin CID of the publisher's signed manifest (M2). A viewer fetches +
+    /// verifies it against `peer_id` (which is the publisher's sr25519 pubkey)
+    /// before trusting the stream. `None` until the publisher has published it
+    /// (e.g. before the encoder's init segment exists), or for plain viewers.
+    pub manifest_cid: Option<String>,
 }
 
 /// SCALE wire form of a presence record (the statement `data` payload).
@@ -23,16 +28,27 @@ pub struct PresenceRecord {
     pub peer_id: [u8; 32],
     pub caps_upload_bps: u64,
     pub ttl_s: u32,
+    pub manifest_cid: Option<String>,
 }
 
 impl From<&Presence> for PresenceRecord {
     fn from(p: &Presence) -> Self {
-        Self { peer_id: p.peer_id.0, caps_upload_bps: p.caps_upload_bps, ttl_s: p.ttl_s }
+        Self {
+            peer_id: p.peer_id.0,
+            caps_upload_bps: p.caps_upload_bps,
+            ttl_s: p.ttl_s,
+            manifest_cid: p.manifest_cid.clone(),
+        }
     }
 }
 impl From<PresenceRecord> for Presence {
     fn from(r: PresenceRecord) -> Self {
-        Self { peer_id: PeerId(r.peer_id), caps_upload_bps: r.caps_upload_bps, ttl_s: r.ttl_s }
+        Self {
+            peer_id: PeerId(r.peer_id),
+            caps_upload_bps: r.caps_upload_bps,
+            ttl_s: r.ttl_s,
+            manifest_cid: r.manifest_cid,
+        }
     }
 }
 

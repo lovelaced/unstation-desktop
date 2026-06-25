@@ -7064,6 +7064,7 @@ name = "transport-libdc"
 version = "0.0.0"
 dependencies = [
  "datachannel",
+ "datachannel-sys",
  "log",
  "serde_json",
  "tokio",
@@ -7242,6 +7243,7 @@ dependencies = [
 name = "unstation-chain"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "log",
  "parity-scale-codec",
  "schnorrkel",

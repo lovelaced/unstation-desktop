@@ -24,10 +24,12 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::task::JoinHandle;
 use unstation_core::config::{MeshConfig, Mode, Role};
 use unstation_core::crypto;
+use unstation_core::manifest::{Kind, Manifest, OriginOfRecord, SignedManifest, Track};
 use unstation_core::media::MediaSink;
 use unstation_core::node::MeshNode;
 use unstation_core::transport::EngineEvent;
 use unstation_core::types::{SegmentId, Seq, StreamId};
+use unstation_chain::BulletinOrigin;
 use unstation_session::Session;
 
 /// Nominal segment size for the picker's expected-delivery-time estimates.
@@ -305,7 +307,29 @@ async fn start_watch(
         let appc = app.clone();
         tasks.push(tokio::spawn(async move {
             loop {
-                let publisher = s.discover_publisher().await; // loops until presence is found
+                let presence = s.discover().await; // loops until presence is found
+                let publisher = presence.peer_id;
+                // M2 trust gate: if the publisher announced a signed manifest, fetch it
+                // from Bulletin and verify it against the publisher's PeerId (its sr25519
+                // pubkey) before connecting. A signature MISMATCH is an impostor/tamper
+                // signal → refuse and re-discover. A transient fetch failure (chain lag)
+                // is tolerated — per-segment hashes still protect content integrity.
+                if let Some(cid) = presence.manifest_cid.clone() {
+                    match BulletinOrigin.fetch_manifest(cid).await {
+                        Ok(m) if m.verify(&publisher.0).is_ok() => {
+                            log::info!("[watch] publisher signed manifest verified");
+                        }
+                        Ok(_) => {
+                            let _ = appc.emit(
+                                "mesh-status",
+                                MeshStatusMsg { state: "error".into(), detail: "Couldn’t verify the broadcaster — signature mismatch.".into() },
+                            );
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            continue;
+                        }
+                        Err(e) => log::warn!("[watch] manifest fetch failed ({e:?}); proceeding (segments still hash-verified)"),
+                    }
+                }
                 s.dial(publisher);
                 // Wait up to ~12s for both data channels to open.
                 let mut waited = 0u64;
@@ -517,6 +541,48 @@ async fn start_publish(
 
     // Announce presence + republish the live-edge manifest as segments are made.
     session.spawn_presence(80_000_000);
+
+    // M2 — publish the SIGNED MANIFEST to the Bulletin chain (the durable trust
+    // anchor) and announce its CID in presence. Signed with this host's identity
+    // (the same key as presence), so a viewer verifies it against our PeerId before
+    // trusting the stream. Spawned, not awaited, so a slow/unavailable chain never
+    // blocks going live; the presence loop picks up the CID once it's set.
+    {
+        let session_mc = session.clone();
+        tokio::spawn(async move {
+            let Some(publisher) = unstation_chain::identity_public() else {
+                log::warn!("[publish] no chain identity — skipping signed-manifest publish");
+                return;
+            };
+            let created_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let manifest = Manifest {
+                stream_id: stream,
+                kind: Kind::Live,
+                // TODO(M2.1): derive codec / init-segment CID / track dims from the CMAF init.
+                codec: "avc1.640028,mp4a.40.2".into(),
+                init_segment_cid: String::new(),
+                target_segment_ms: 2000,
+                ll_mode: false,
+                tracks: vec![Track { id: "v".into(), bitrate: 0, w: 0, h: 0 }],
+                publisher,
+                created_at,
+            };
+            let Some(sig) = unstation_chain::sign_with_identity(&manifest.signing_payload()) else {
+                log::warn!("[publish] could not sign manifest");
+                return;
+            };
+            match BulletinOrigin.put_manifest(SignedManifest { manifest, sig }).await {
+                Ok(cid) => {
+                    log::info!("[publish] signed manifest on Bulletin: {cid}");
+                    session_mc.set_manifest_cid(cid);
+                }
+                Err(e) => log::warn!("[publish] manifest put to Bulletin failed: {e:?}"),
+            }
+        });
+    }
     let (edge_tx, edge_rx) = unbounded_channel::<(Seq, SegmentId)>();
     session.spawn_edge_publisher(edge_rx);
 
