@@ -176,3 +176,41 @@ impl Signaling for StatementSignaling {
         Subscription::default()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::VirtualClock;
+    use crate::signaling::Signaling;
+
+    fn sig(store: &MemStatementStore, me: PeerId, clock: Arc<VirtualClock>) -> StatementSignaling {
+        StatementSignaling::new(store.clone(), StreamId([1u8; 32]), me, 2, 30, clock)
+    }
+
+    /// Exercise the `Signaling` trait surface (publish/read presence, send signal,
+    /// subscribe) through a `&dyn Signaling`, the way the orchestrator uses it.
+    #[test]
+    fn statement_signaling_trait_surface_round_trips() {
+        let store = MemStatementStore::new();
+        let clock = Arc::new(VirtualClock::new());
+        let (me, other) = (PeerId::from_u64(7), PeerId::from_u64(8));
+
+        let s7 = sig(&store, me, clock.clone());
+        let s8 = sig(&store, other, clock.clone());
+        let a: &dyn Signaling = &s7;
+        let b: &dyn Signaling = &s8;
+
+        // Peer 8 announces; peer 7 reads peer 8's discovery shard and finds it (read_presence
+        // filters out the reader's own record, so peer 7 must look at peer 8's shard).
+        let pres8 = Presence { peer_id: other, caps_upload_bps: 9, ttl_s: 30, manifest_cid: None, relay: true };
+        pollster::block_on(b.publish_presence(pres8)).expect("publish via trait");
+        let topic8 = crate::topic::discovery_topic(&StreamId([1u8; 32]), shard_for(&other, 2));
+        let found = pollster::block_on(a.read_presence(topic8, 8)).expect("read via trait");
+        assert!(found.iter().any(|p| p.peer_id == other), "trait read_presence finds the other peer");
+        assert!(found.iter().all(|p| p.peer_id != me), "read_presence excludes the reader's own record");
+
+        // send_signal + subscribe_edge smoke (the trait wrappers over the inherent methods).
+        pollster::block_on(a.send_signal(other, SignalMsg::Offer { sdp: vec![1, 2, 3] })).expect("send_signal");
+        let _sub = a.subscribe_edge(StreamId([1u8; 32]));
+    }
+}

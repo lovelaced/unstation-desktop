@@ -48,6 +48,24 @@ jobs:
         continue-on-error: true
         run: cargo clippy --workspace --all-targets
 
+  coverage:
+    name: coverage gate (engine)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake pkg-config libssl-dev clang
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      # Fails the build if engine line coverage drops below the threshold (excludes the
+      # real-WebRTC reactor + CLI main, which the deterministic suite can't reach).
+      - name: Coverage gate
+        run: scripts/coverage.sh --check
+
   chain-crates:
     name: chain + session crates (SDK)
     runs-on: ubuntu-latest

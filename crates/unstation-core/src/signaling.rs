@@ -180,4 +180,50 @@ mod tests {
         let plain = PresenceRecord { manifest_cid: None, relay: false, ..rec };
         assert_eq!(PresenceRecord::decode(&mut &plain.encode()[..]).unwrap(), plain);
     }
+
+    #[test]
+    fn presence_record_converts_to_and_from_presence() {
+        let p = Presence {
+            peer_id: PeerId([9u8; 32]),
+            caps_upload_bps: 5,
+            ttl_s: 30,
+            manifest_cid: Some("cid".into()),
+            relay: true,
+        };
+        let rec = PresenceRecord::from(&p);
+        let back: Presence = rec.into();
+        assert_eq!(back, p);
+    }
+
+    fn rec(id: u8, relay: bool) -> PresenceRecord {
+        PresenceRecord { peer_id: [id; 32], caps_upload_bps: 1, ttl_s: 30, manifest_cid: None, relay }
+    }
+
+    #[test]
+    fn presence_book_insert_merge_sample_len() {
+        let book = PresenceBook::new();
+        assert!(book.is_empty());
+        book.insert(rec(1, false));
+        book.insert(rec(2, true));
+        assert_eq!(book.len(), 2);
+        assert!(!book.is_empty());
+
+        // merge skips our own entry, adds new peers, and latest-write-wins on a dup.
+        let me = PeerId([0u8; 32]);
+        book.merge(vec![rec(0, true), rec(3, false), rec(1, true)], &me);
+        assert_eq!(book.len(), 3, "peer 0 (== me) skipped; 3 added; 1 updated");
+        assert_eq!(book.snapshot().len(), 3);
+
+        // sample(2) returns relay-capable peers first (1 was just updated to relay, 2 is relay).
+        let s = book.sample(2);
+        assert_eq!(s.len(), 2);
+        assert!(s.iter().all(|r| r.relay), "relay-capable peers are sampled first");
+    }
+
+    #[test]
+    fn subscription_and_live_edge_construct() {
+        let _sub: Subscription<LiveEdge> = Subscription::default();
+        let e = LiveEdge { head_seq: 5, segment_seqs: vec![1, 2, 3] };
+        assert_eq!((e.head_seq, e.segment_seqs.len()), (5, 3));
+    }
 }

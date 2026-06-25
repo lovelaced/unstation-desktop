@@ -570,6 +570,114 @@ async fn presence_gossip_populates_the_book_and_is_rebroadcast() {
     assert!(rebroadcast, "node rebroadcasts its presence book to peers");
 }
 
+#[tokio::test]
+async fn node_replies_pong_to_ping() {
+    let (me, peer) = (PeerId::from_u64(1), PeerId::from_u64(2));
+    let (tx, rx) = mpsc::unbounded_channel::<EngineEvent>();
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    tx.send(EngineEvent::PeerConnected { peer, link: Arc::new(RecordingLink { remote: peer, sent: sent.clone() }) }).unwrap();
+    tx.send(EngineEvent::Inbound { peer, channel: Channel::Ctrl, bytes: MeshMsg::Ping { nonce: 42, t_send_ms: 7 }.encode() }).unwrap();
+    tx.send(EngineEvent::Stop).unwrap();
+    let node = MeshNode::new_live_publisher(me, cfg(Role::Publisher), 16_000, Arc::new(NullSink));
+    tokio::time::timeout(Duration::from_secs(5), node.run(rx, Duration::from_millis(10), None)).await.unwrap();
+    let pong = sent.lock().unwrap().iter().any(|(ch, b)| {
+        *ch == Channel::Ctrl && matches!(MeshMsg::decode(&mut &b[..]), Ok(MeshMsg::Pong { nonce: 42, t_send_ms: 7 }))
+    });
+    assert!(pong, "a Ping must be answered with a matching Pong");
+}
+
+#[tokio::test]
+async fn unsubscribe_stops_pushes() {
+    let seg_len = 16_000usize;
+    let (me, sub) = (PeerId::from_u64(1), PeerId::from_u64(2));
+    let (tx, rx) = mpsc::unbounded_channel::<EngineEvent>();
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    tx.send(EngineEvent::PeerConnected { peer: sub, link: Arc::new(RecordingLink { remote: sub, sent: sent.clone() }) }).unwrap();
+    tx.send(EngineEvent::Inbound { peer: sub, channel: Channel::Ctrl, bytes: MeshMsg::Subscribe.encode() }).unwrap();
+    let s0 = Bytes::from(vec![1u8; seg_len]);
+    tx.send(EngineEvent::Produced { seq: 0, id: crypto::segment_id(&s0), bytes: s0 }).unwrap();
+    tx.send(EngineEvent::Inbound { peer: sub, channel: Channel::Ctrl, bytes: MeshMsg::Unsubscribe.encode() }).unwrap();
+    let s1 = Bytes::from(vec![2u8; seg_len]);
+    tx.send(EngineEvent::Produced { seq: 1, id: crypto::segment_id(&s1), bytes: s1 }).unwrap();
+    tx.send(EngineEvent::Stop).unwrap();
+    let node = MeshNode::new_live_publisher(me, cfg(Role::Publisher), seg_len as u64, Arc::new(NullSink));
+    tokio::time::timeout(Duration::from_secs(5), node.run(rx, Duration::from_millis(10), None)).await.unwrap();
+    let pushed = |seq: u64| {
+        sent.lock().unwrap().iter().any(|(ch, b)| {
+            *ch == Channel::Bulk && matches!(MeshMsg::decode(&mut &b[..]), Ok(MeshMsg::SegmentData { seq: s, .. }) if s == seq)
+        })
+    };
+    assert!(pushed(0), "seg 0 pushed while subscribed");
+    assert!(!pushed(1), "seg 1 NOT pushed after unsubscribe");
+}
+
+#[tokio::test]
+async fn peer_gossip_grows_known_peers() {
+    let me = PeerId::from_u64(1);
+    let (tx, rx) = mpsc::unbounded_channel::<EngineEvent>();
+    let gossip = MeshMsg::PeerGossip { peers: vec![PeerId::from_u64(5).0, PeerId::from_u64(6).0, me.0] }.encode();
+    tx.send(EngineEvent::Inbound { peer: PeerId::from_u64(9), channel: Channel::Ctrl, bytes: gossip }).unwrap();
+    tx.send(EngineEvent::Stop).unwrap();
+    let node = MeshNode::new_viewer(me, cfg(Role::Viewer), 16_000, Arc::new(NullSink), HashMap::new(), 0);
+    let stats = tokio::time::timeout(Duration::from_secs(5), node.run(rx, Duration::from_millis(10), None)).await.unwrap();
+    assert_eq!(stats.known_peers, 2, "learned peers 5 + 6 via gossip; self filtered out");
+}
+
+#[tokio::test]
+async fn early_push_of_wrong_bytes_fails_verification_when_id_arrives() {
+    // A segment is pushed to us before we know its id → buffered. When the (real) id
+    // arrives via the live edge, the buffered bytes are verified and — being wrong —
+    // rejected as a hash failure, never delivered. Exercises the buffer + verify-on-id path.
+    let seg_len = 16_000usize;
+    let me = PeerId::from_u64(100);
+    let attacker = PeerId::from_u64(7);
+    let real_id = crypto::segment_id(&Bytes::from(vec![0x11u8; seg_len]));
+    let wrong = vec![0x22u8; seg_len];
+
+    let (tx, rx) = mpsc::unbounded_channel::<EngineEvent>();
+    let rec = Arc::new(Rec::default());
+    let node = MeshNode::new_viewer(me, cfg(Role::Viewer), seg_len as u64, rec.clone(), HashMap::new(), 0);
+    let pushed = MeshMsg::SegmentData { seq: 0, track_id: 0, total_len: seg_len as u32, offset: 0, bytes: wrong }.encode();
+    tx.send(EngineEvent::Inbound { peer: attacker, channel: Channel::Bulk, bytes: pushed }).unwrap();
+    tx.send(EngineEvent::LiveEdge { seq: 0, id: real_id }).unwrap();
+    tx.send(EngineEvent::Stop).unwrap();
+    let stats = tokio::time::timeout(Duration::from_secs(5), node.run(rx, Duration::from_millis(10), None)).await.unwrap();
+    assert_eq!(stats.delivered, 0, "wrong bytes are never delivered");
+    assert!(stats.hash_failures >= 1, "buffered wrong bytes fail verification once the id lands");
+    assert_eq!(rec.count(), 0);
+}
+
+#[tokio::test]
+async fn lost_segment_is_re_requested_after_pending_timeout() {
+    // A peer advertises seg 0 (buffer map) but never serves it (we drop every Want). On
+    // the unreliable bulk channel a lost chunk would otherwise pin the seq forever; after
+    // PENDING_TIMEOUT the viewer must re-request it. We record the viewer's outbound Wants.
+    let seg_len = 16_000usize;
+    let (me, peer) = (PeerId::from_u64(100), PeerId::from_u64(1));
+    let id0 = crypto::segment_id(&Bytes::from(vec![1u8; seg_len]));
+
+    let (tx, rx) = mpsc::unbounded_channel::<EngineEvent>();
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    tx.send(EngineEvent::PeerConnected { peer, link: Arc::new(RecordingLink { remote: peer, sent: sent.clone() }) }).unwrap();
+    tx.send(EngineEvent::LiveEdge { seq: 0, id: id0 }).unwrap(); // we know seg 0 exists
+    let bm = MeshMsg::BufferMap { base_seq: 0, bitfield: vec![0x01] }.encode(); // peer has seq 0
+    tx.send(EngineEvent::Inbound { peer, channel: Channel::Ctrl, bytes: bm }).unwrap();
+
+    let tx_stop = tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(2300)).await; // past PENDING_TIMEOUT (2s)
+        let _ = tx_stop.send(EngineEvent::Stop);
+    });
+    let node = MeshNode::new_viewer(me, cfg(Role::Viewer), seg_len as u64, Arc::new(NullSink), HashMap::new(), 0);
+    tokio::time::timeout(Duration::from_secs(6), node.run(rx, Duration::from_millis(10), None)).await.unwrap();
+
+    let wants = sent.lock().unwrap().iter().filter(|(ch, b)| {
+        *ch == Channel::Ctrl
+            && matches!(MeshMsg::decode(&mut &b[..]), Ok(MeshMsg::Want { segment_seqs, .. }) if segment_seqs.contains(&0))
+    }).count();
+    assert!(wants >= 2, "a lost segment must be re-requested after the pending timeout (got {wants})");
+}
+
 // ---- signaling / discovery layer ----
 
 fn sig(store: &MemStatementStore, stream: StreamId, me: PeerId, clock: Arc<VirtualClock>) -> StatementSignaling {

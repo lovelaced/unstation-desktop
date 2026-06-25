@@ -128,4 +128,52 @@ mod tests {
         let bytes = msg.encode();
         assert_eq!(MeshMsg::decode(&mut &bytes[..]).unwrap(), msg);
     }
+
+    /// Every wire variant must survive a SCALE round-trip AND keep a stable variant tag —
+    /// the hand-rolled `SegmentData` framing (tag 4) and cross-version compatibility both
+    /// depend on the discriminants never silently shifting. Adding a variant is fine (new
+    /// tag at the end); reordering or inserting is a wire-breaking change this test catches.
+    #[test]
+    fn all_variants_roundtrip_with_stable_tags() {
+        let rec = PresenceRecord {
+            peer_id: [7u8; 32],
+            caps_upload_bps: 19,
+            ttl_s: 30,
+            manifest_cid: Some("cid".into()),
+            relay: false,
+        };
+        let variants: Vec<(u8, MeshMsg)> = vec![
+            (0, MeshMsg::Hello { peer_id: [1; 32], stream_id: [2; 32], version: 3, caps: Caps { upload_bps: 4, relay: true }, base_seq: 5, bitfield: vec![0xAB] }),
+            (1, MeshMsg::BufferMap { base_seq: 6, bitfield: vec![0xCD, 0xEF] }),
+            (2, MeshMsg::Want { segment_seqs: vec![7, 8], deadline_hint_ms: 9 }),
+            (3, MeshMsg::Have { seq: 10 }),
+            (4, MeshMsg::SegmentData { seq: 11, track_id: 1, total_len: 12, offset: 0, bytes: vec![0xFF; 12] }),
+            (5, MeshMsg::Cancel { seq: 13 }),
+            (6, MeshMsg::Choke),
+            (7, MeshMsg::Unchoke),
+            (8, MeshMsg::Ping { nonce: 14, t_send_ms: 15 }),
+            (9, MeshMsg::Pong { nonce: 16, t_send_ms: 17 }),
+            (10, MeshMsg::PeerGossip { peers: vec![[3; 32], [4; 32]] }),
+            (11, MeshMsg::Subscribe),
+            (12, MeshMsg::Unsubscribe),
+            (13, MeshMsg::EdgeAnnounce { seq: 18, id: [5; 32], sig: [6; 64] }),
+            (14, MeshMsg::PresenceGossip { records: vec![rec] }),
+        ];
+        for (tag, msg) in &variants {
+            let enc = msg.encode();
+            assert_eq!(enc[0], *tag, "variant {msg:?} must encode with stable tag {tag}");
+            let dec = MeshMsg::decode(&mut &enc[..]).expect("variant must decode");
+            assert_eq!(&dec, msg, "variant {msg:?} must survive a SCALE round-trip");
+        }
+    }
+
+    /// Malformed bytes from a hostile/buggy peer must be rejected, never panic — the node's
+    /// `on_inbound` relies on a clean `Err` to drop bad frames.
+    #[test]
+    fn decode_rejects_garbage_and_truncation() {
+        assert!(MeshMsg::decode(&mut &[][..]).is_err(), "empty input");
+        assert!(MeshMsg::decode(&mut &[200u8][..]).is_err(), "unknown variant tag");
+        assert!(MeshMsg::decode(&mut &[4u8][..]).is_err(), "truncated SegmentData (tag only)");
+        assert!(MeshMsg::decode(&mut &[2u8, 0xFF][..]).is_err(), "truncated Want length prefix");
+    }
 }

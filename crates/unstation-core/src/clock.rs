@@ -48,3 +48,27 @@ impl Clock for SystemClock {
         self.start.elapsed().as_millis() as u64
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn virtual_clock_advances_and_sets() {
+        let c = VirtualClock::new();
+        assert_eq!(c.now_ms(), 0);
+        c.advance(100);
+        c.advance(50);
+        assert_eq!(c.now_ms(), 150);
+        c.set(42);
+        assert_eq!(c.now_ms(), 42);
+    }
+
+    #[test]
+    fn system_clock_is_monotonic_nonnegative() {
+        let c = SystemClock::default();
+        let a = c.now_ms();
+        let b = c.now_ms();
+        assert!(b >= a, "wall clock must not go backwards");
+    }
+}

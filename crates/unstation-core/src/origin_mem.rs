@@ -79,3 +79,20 @@ impl OriginOfRecord for MemoryOrigin {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn put_then_fetch_segment_round_trips_and_missing_is_not_found() {
+        let origin = MemoryOrigin::new();
+        let bytes = Bytes::from(vec![9u8; 1234]);
+        let id = crypto::segment_id(&bytes);
+        let cid = pollster::block_on(origin.put_segment(id, bytes.clone())).expect("put_segment");
+        assert!(cid.starts_with("mem://"));
+        assert_eq!(pollster::block_on(origin.fetch_segment(id)).expect("fetch_segment"), bytes);
+        let missing = crypto::segment_id(b"nope");
+        assert!(matches!(pollster::block_on(origin.fetch_segment(missing)), Err(Error::NotFound)));
+    }
+}
