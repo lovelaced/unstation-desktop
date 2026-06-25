@@ -89,6 +89,17 @@ pub struct NodeStats {
     pub known_peers: usize,
 }
 
+/// A media sink that drops everything — for seed/relay nodes that cache + reshare
+/// segments but never play them.
+struct DiscardSink;
+impl MediaSink for DiscardSink {
+    fn push_init(&self, _: Bytes) {}
+    fn push_segment(&self, _: u64, _: Bytes) {}
+    fn on_play_head(&self) -> u64 {
+        0
+    }
+}
+
 pub struct MeshNode {
     me: PeerId,
     eng: MeshEngine,
@@ -106,6 +117,11 @@ pub struct MeshNode {
     last_bm_count: usize,
     last_choke_ms: u64,
     optimistic_rr: u64,
+    /// Upload rate cap (TECH_SPEC §8.5): a token bucket in bytes, refilled at
+    /// `upload_budget_bps`. We serve a segment only if we hold enough tokens, so a
+    /// node never uploads faster than its declared budget. 0 budget = unmetered.
+    upload_tokens: f64,
+    last_token_ms: u64,
     stats: NodeStats,
 }
 
@@ -161,12 +177,37 @@ impl MeshNode {
         Self::with_engine(me, MeshEngine::new(cfg, seg_bytes), sink, HashMap::new())
     }
 
+    /// A seed / relay node (TECH_SPEC §8.5): it fetches a stream like a viewer — so it
+    /// caches segments and can reshare them — but exists to OFFLOAD the origin, not to
+    /// play. Pass a `Role::Seed` config with a generous `upload_budget_bps`; the node
+    /// then never chokes (spreading by proximity) and discards media (no playback).
+    pub fn new_seed(
+        me: PeerId,
+        cfg: MeshConfig,
+        seg_bytes: u64,
+        segment_ids: HashMap<Seq, SegmentId>,
+        head_seq: Seq,
+    ) -> Self {
+        let mut eng = MeshEngine::new(cfg, seg_bytes);
+        eng.head_seq = head_seq;
+        eng.seed_available = false;
+        eng.bulletin_available = false;
+        Self::with_engine(me, eng, Arc::new(DiscardSink), segment_ids)
+    }
+
     fn with_engine(
         me: PeerId,
         eng: MeshEngine,
         sink: Arc<dyn MediaSink>,
         segment_ids: HashMap<Seq, SegmentId>,
     ) -> Self {
+        // Start the upload bucket full so a fresh node can serve immediately, then
+        // refill at the budget rate. Burst = 0.5 s of budget (min two segments).
+        let upload_tokens = if eng.cfg.upload_budget_bps > 0 {
+            (eng.cfg.upload_budget_bps as f64 / 8.0 * 0.5).max(2.0 * eng.seg_bytes as f64)
+        } else {
+            0.0
+        };
         Self {
             me,
             eng,
@@ -183,6 +224,8 @@ impl MeshNode {
             last_bm_count: usize::MAX, // force the first buffer-map advertise
             last_choke_ms: 0,
             optimistic_rr: 0,
+            upload_tokens,
+            last_token_ms: 0,
             stats: NodeStats::default(),
         }
     }
@@ -324,6 +367,16 @@ impl MeshNode {
             self.eng.play_seq = head;
         }
 
+        // Refill the upload token bucket at the budget rate (capped at the burst).
+        if self.eng.cfg.upload_budget_bps > 0 {
+            let dt = self.now_ms.saturating_sub(self.last_token_ms);
+            self.last_token_ms = self.now_ms;
+            let refill = (self.eng.cfg.upload_budget_bps as f64 / 8.0) * (dt as f64 / 1000.0);
+            let burst = (self.eng.cfg.upload_budget_bps as f64 / 8.0 * 0.5)
+                .max(2.0 * self.eng.seg_bytes as f64);
+            self.upload_tokens = (self.upload_tokens + refill).min(burst);
+        }
+
         // Expire stale in-flight requests (a lost chunk on the unreliable bulk channel
         // never completes and never hash-fails) so the picker re-requests them.
         let now = self.now_ms;
@@ -425,6 +478,15 @@ impl MeshNode {
                 }
                 for seq in segment_seqs {
                     if let Some(b) = self.eng.store.get(seq) {
+                        // Stay within the upload budget: skip if we can't afford this
+                        // segment now (the requester re-asks; tokens refill each tick).
+                        let cost = b.len() as f64;
+                        if self.eng.cfg.upload_budget_bps > 0 {
+                            if self.upload_tokens < cost {
+                                continue;
+                            }
+                            self.upload_tokens -= cost;
+                        }
                         if let Some(link) = self.links.get(&peer).cloned() {
                             self.send_segment(&link, seq, &b);
                         }
