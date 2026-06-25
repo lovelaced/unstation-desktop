@@ -44,6 +44,14 @@ pub enum MeshMsg {
     Pong { nonce: u64, t_send_ms: u64 },
     /// In-mesh peer discovery after bootstrap (TECH_SPEC §7.3).
     PeerGossip { peers: Vec<[u8; 32]> },
+    /// Register standing interest in a holder's live edge (push-pull, TECH_SPEC §6.4).
+    /// Once subscribed, the holder PUSHES each new segment as it lands instead of
+    /// waiting for a per-segment `Want` — cutting steady-state live-edge latency from
+    /// a discovery + request round-trip down to ~one hop. New variants are appended so
+    /// the `SegmentData` tag (4) the hand-rolled framing depends on never shifts.
+    Subscribe,
+    /// Withdraw a `Subscribe` (e.g. the viewer paused / left the live edge to seek VOD).
+    Unsubscribe,
 }
 
 #[cfg(test)]
@@ -73,5 +81,17 @@ mod tests {
         };
         let bytes = msg.encode();
         assert_eq!(MeshMsg::decode(&mut &bytes[..]).unwrap(), msg);
+    }
+
+    #[test]
+    fn roundtrip_subscribe() {
+        for msg in [MeshMsg::Subscribe, MeshMsg::Unsubscribe] {
+            let bytes = msg.encode();
+            assert_eq!(MeshMsg::decode(&mut &bytes[..]).unwrap(), msg);
+        }
+        // Appending the push-pull variants must not have moved the SegmentData tag (4),
+        // which the one-copy framing in `node::frame_segment_data` hardcodes.
+        let sd = MeshMsg::SegmentData { seq: 0, track_id: 0, total_len: 1, offset: 0, bytes: vec![0] };
+        assert_eq!(sd.encode()[0], 4, "SegmentData must stay variant 4");
     }
 }

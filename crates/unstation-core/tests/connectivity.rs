@@ -7,7 +7,7 @@
 //! feeding corrupt bytes, presence that must expire, and per-recipient signaling.
 
 use bytes::Bytes;
-use parity_scale_codec::Encode;
+use parity_scale_codec::{Decode, Encode};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,7 +20,7 @@ use unstation_core::node::MeshNode;
 use unstation_core::protocol::MeshMsg;
 use unstation_core::signaling::SignalMsg;
 use unstation_core::statement_store_mem::{MemStatementStore, StatementSignaling};
-use unstation_core::transport::{Channel, EngineEvent};
+use unstation_core::transport::{Channel, EngineEvent, Link};
 use unstation_core::transport_mem::wire;
 use unstation_core::types::{PeerId, SegmentId, Seq, StreamId};
 
@@ -54,6 +54,21 @@ impl MediaSink for NullSink {
     fn push_segment(&self, _: u64, _: Bytes) {}
     fn on_play_head(&self) -> u64 {
         0
+    }
+}
+
+/// A `Link` that records every `send` instead of delivering it — lets a test observe
+/// exactly what a node chose to transmit (used to prove a push happened with no `Want`).
+struct RecordingLink {
+    remote: PeerId,
+    sent: Arc<Mutex<Vec<(Channel, Vec<u8>)>>>,
+}
+impl Link for RecordingLink {
+    fn remote(&self) -> PeerId {
+        self.remote
+    }
+    fn send(&self, channel: Channel, bytes: Vec<u8>) {
+        self.sent.lock().unwrap().push((channel, bytes));
     }
 }
 
@@ -300,6 +315,87 @@ async fn viewer_relays_stream_to_a_peer_that_cant_reach_the_origin() {
     let _ = atx.send(EngineEvent::Stop);
     let _ = ptx.send(EngineEvent::Stop);
     let _ = tokio::time::timeout(Duration::from_secs(2), a_handle).await;
+}
+
+#[tokio::test]
+async fn publisher_pushes_a_produced_segment_to_a_subscriber_without_a_want() {
+    // Push-pull (TECH_SPEC §6.4): a subscriber registers interest ONCE; thereafter the
+    // publisher PUSHES each produced segment proactively. We record everything the
+    // publisher transmits and assert it emitted SegmentData for the new segment although
+    // the subscriber never sent a single `Want`.
+    let seg_len = 20_000usize;
+    let pubid = PeerId::from_u64(1);
+    let subid = PeerId::from_u64(2);
+    let (ptx, prx) = mpsc::unbounded_channel::<EngineEvent>();
+
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let link = Arc::new(RecordingLink { remote: subid, sent: sent.clone() });
+    ptx.send(EngineEvent::PeerConnected { peer: subid, link }).unwrap();
+    // Subscribe, then produce — and crucially, no Want is ever sent.
+    ptx.send(EngineEvent::Inbound {
+        peer: subid,
+        channel: Channel::Ctrl,
+        bytes: MeshMsg::Subscribe.encode(),
+    })
+    .unwrap();
+    let seg = Bytes::from(vec![0x5Au8; seg_len]);
+    let id = crypto::segment_id(&seg);
+    ptx.send(EngineEvent::Produced { seq: 0, id, bytes: seg }).unwrap();
+    ptx.send(EngineEvent::Stop).unwrap();
+
+    let publisher =
+        MeshNode::new_live_publisher(pubid, cfg(Role::Publisher), seg_len as u64, Arc::new(NullSink));
+    tokio::time::timeout(Duration::from_secs(5), publisher.run(prx, Duration::from_millis(10), None))
+        .await
+        .expect("publisher loop should stop");
+
+    let msgs = sent.lock().unwrap();
+    let pushed = msgs
+        .iter()
+        .filter(|(ch, b)| {
+            *ch == Channel::Bulk
+                && matches!(MeshMsg::decode(&mut &b[..]), Ok(MeshMsg::SegmentData { seq: 0, .. }))
+        })
+        .count();
+    assert!(pushed >= 1, "the publisher must PUSH the produced segment to its subscriber");
+}
+
+#[tokio::test]
+async fn pushed_segment_buffers_until_live_edge_then_delivers() {
+    // Push-pull receive path: a segment is pushed to a viewer BEFORE it has learned the
+    // segment's authenticated id (the chain edge-poll races the direct bytes). The viewer
+    // holds the bytes and delivers them the instant the id lands — no re-fetch, no Want.
+    let seg_len = 20_000usize;
+    let me = PeerId::from_u64(100);
+    let src = PeerId::from_u64(1);
+    let seg = Bytes::from(vec![0x33u8; seg_len]);
+    let id = crypto::segment_id(&seg);
+
+    let (tx, rx) = mpsc::unbounded_channel::<EngineEvent>();
+    let rec = Arc::new(Rec::default());
+    // A viewer that does NOT yet know any segment ids (empty map, head 0).
+    let viewer = MeshNode::new_viewer(me, cfg(Role::Viewer), seg_len as u64, rec.clone(), HashMap::new(), 0);
+
+    // Bytes first (the push), id second (the live edge catches up).
+    let pushed = MeshMsg::SegmentData {
+        seq: 0,
+        track_id: 0,
+        total_len: seg_len as u32,
+        offset: 0,
+        bytes: seg.to_vec(),
+    }
+    .encode();
+    tx.send(EngineEvent::Inbound { peer: src, channel: Channel::Bulk, bytes: pushed }).unwrap();
+    tx.send(EngineEvent::LiveEdge { seq: 0, id }).unwrap();
+    tx.send(EngineEvent::Stop).unwrap();
+
+    let stats = tokio::time::timeout(Duration::from_secs(5), viewer.run(rx, Duration::from_millis(10), None))
+        .await
+        .expect("viewer loop should stop");
+
+    assert_eq!(stats.delivered, 1, "the buffered early push is delivered once its id arrives");
+    assert_eq!(stats.hash_failures, 0, "an early push is not a hash failure");
+    assert_eq!(rec.get(0), Some(seg), "the player received exactly the pushed segment");
 }
 
 // ---- signaling / discovery layer ----

@@ -48,6 +48,12 @@ const MAX_SEGMENT_BYTES: u32 = 4 * 1024 * 1024;
 /// so the swarm can bootstrap. Re-evaluated every `CHOKE_INTERVAL_MS`.
 const UPLOAD_SLOTS: usize = 4;
 const CHOKE_INTERVAL_MS: u64 = 5_000;
+/// Push-pull (TECH_SPEC §6.4): a peer may PUSH a segment to us before our live edge has
+/// told us its authenticated id (the chain edge-poll races the direct WebRTC bytes). We
+/// hold such bytes until the id lands, then verify + deliver — but only up to this many
+/// bytes total, so an early (or hostile) push can't grow memory without bound. Beyond it,
+/// the push is dropped and the segment is pulled normally instead.
+const MAX_PENDING_VERIFY_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Choose which peers to unchoke (serve) this round — the pure core of the upload-slot
 /// manager, separated for testability. Viewers reward reciprocation (rank by the
@@ -128,6 +134,15 @@ pub struct MeshNode {
     reasm: HashMap<Seq, Reassembler>,
     segment_ids: HashMap<Seq, SegmentId>,
     known_peers: HashSet<PeerId>,
+    /// Push-pull (TECH_SPEC §6.4): peers that subscribed to our live edge. We PUSH each
+    /// newly-available segment to them (subject to choke + budget) instead of waiting for
+    /// their per-segment `Want`.
+    subscribers: HashSet<PeerId>,
+    /// Segments pushed to us ahead of our learning their authenticated id: held here
+    /// (seq → who sent it + the raw bytes) until `LiveEdge` provides the id, then verified
+    /// and delivered. Bounded by `pending_verify_bytes` ≤ [`MAX_PENDING_VERIFY_BYTES`].
+    pending_verify: HashMap<Seq, (PeerId, Bytes)>,
+    pending_verify_bytes: u64,
     /// In-flight segment requests: seq → (peer we asked, when we asked, in `now_ms`).
     pending: HashMap<Seq, (PeerId, u64)>,
     rng: ChaCha8Rng,
@@ -236,6 +251,9 @@ impl MeshNode {
             reasm: HashMap::new(),
             segment_ids,
             known_peers: HashSet::new(),
+            subscribers: HashSet::new(),
+            pending_verify: HashMap::new(),
+            pending_verify_bytes: 0,
             pending: HashMap::new(),
             rng: ChaCha8Rng::seed_from_u64(me.0[0] as u64 + 1),
             now_ms: 0,
@@ -331,10 +349,18 @@ impl MeshNode {
                 self.eng.peers.entry(peer).or_insert_with(|| PeerState::new(peer));
                 self.links.insert(peer, link.clone());
                 self.send_hello(&link);
+                // Push-pull (TECH_SPEC §6.4): register standing interest so this peer
+                // pushes us its live edge. The publisher is the source — it subscribes to
+                // no one (a relaying viewer, however, both subscribes upstream and serves
+                // its own downstream subscribers).
+                if !matches!(self.eng.cfg.role, Role::Publisher) {
+                    link.send(Channel::Ctrl, MeshMsg::Subscribe.encode());
+                }
             }
             EngineEvent::PeerDisconnected { peer } => {
                 self.links.remove(&peer);
                 self.eng.peers.remove(&peer);
+                self.subscribers.remove(&peer);
                 // Release in-flight requests to this peer (and any partial reassembly)
                 // so the picker re-requests them from someone else next tick.
                 let dropped: Vec<Seq> = self
@@ -355,11 +381,16 @@ impl MeshNode {
                 self.eng.local.set(seq);
                 self.segment_ids.insert(seq, id);
                 self.eng.head_seq = self.eng.head_seq.max(seq);
+                // Push-pull: push it straight to subscribers (don't wait for their Want).
+                self.push_to_subscribers(seq);
             }
             EngineEvent::LiveEdge { seq, id } => {
                 // Learn that a segment exists + its content id (so we can fetch + verify).
                 self.segment_ids.insert(seq, id);
                 self.eng.head_seq = self.eng.head_seq.max(seq);
+                // A segment may have been pushed to us before this id arrived — now that
+                // we can verify it, deliver it without a re-fetch (push-pull receive).
+                self.try_verify_pending(seq);
             }
             EngineEvent::Tick => self.on_tick(),
             EngineEvent::Stop => {}
@@ -412,6 +443,20 @@ impl MeshNode {
                 self.reasm.remove(&seq); // re-request starts fresh
                 if let Some(p) = self.eng.peers.get_mut(&pid) {
                     p.pending_bytes = p.pending_bytes.saturating_sub(seg_bytes);
+                }
+            }
+        }
+
+        // Evict push-ahead buffers whose seq slid below the play head: their id never
+        // arrived in time, playback has moved past them, so they'll never be delivered.
+        if !self.pending_verify.is_empty() {
+            let play = self.eng.play_seq;
+            let drop: Vec<Seq> =
+                self.pending_verify.keys().copied().filter(|s| *s < play).collect();
+            for seq in drop {
+                if let Some((_, raw)) = self.pending_verify.remove(&seq) {
+                    self.pending_verify_bytes =
+                        self.pending_verify_bytes.saturating_sub(raw.len() as u64);
                 }
             }
         }
@@ -555,6 +600,14 @@ impl MeshNode {
                     p.choked_by = false;
                 }
             }
+            // Push-pull (TECH_SPEC §6.4): a peer registers/withdraws standing interest in
+            // our live edge. While subscribed, we push it each new segment proactively.
+            MeshMsg::Subscribe => {
+                self.subscribers.insert(peer);
+            }
+            MeshMsg::Unsubscribe => {
+                self.subscribers.remove(&peer);
+            }
             // Cancel: no-op (we never hedge — `pending` dedups per seq — so there's no
             // losing request to cancel).
             _ => {}
@@ -589,34 +642,126 @@ impl MeshNode {
             }
         }
         let r = self.reasm.remove(&seq).expect("present and complete");
-        let expected = self.segment_ids.get(&seq).copied();
-        let now = self.now_ms;
-        let seg_bytes = self.eng.seg_bytes;
-        match expected.and_then(|id| r.finish_verified(&id).map(|b| (id, b))) {
-            Some((id, data)) => {
-                let n = data.len();
-                self.stats.peer_bytes += n as u64;
-                let b = Bytes::from(data);
-                self.eng.store.insert(seq, id, b.clone());
-                self.eng.local.set(seq);
-                self.sink.push_segment(seq, b);
-                // Real throughput: bytes delivered / time since we asked.
-                let sent = self.pending.remove(&seq).map(|(_, t)| t);
-                if let Some(p) = self.eng.peers.get_mut(&peer) {
-                    if let Some(sent_ms) = sent {
-                        let elapsed = now.saturating_sub(sent_ms).max(1);
-                        p.throughput_bps.update((n as f64) * 8_000.0 / (elapsed as f64));
+        match self.segment_ids.get(&seq).copied() {
+            // We already know the authenticated id → verify against it now.
+            Some(id) => match r.finish_verified(&id) {
+                Some(data) => self.accept_segment(peer, seq, id, Bytes::from(data)),
+                None => {
+                    // Hash mismatch against a KNOWN id — a genuinely bad/forged chunk:
+                    // discard, decay reputation, re-request elsewhere.
+                    self.stats.hash_failures += 1;
+                    self.pending.remove(&seq);
+                    if let Some(p) = self.eng.peers.get_mut(&peer) {
+                        p.reputation *= 0.5;
                     }
-                    p.pending_bytes = p.pending_bytes.saturating_sub(seg_bytes);
+                }
+            },
+            // Pushed to us before our live edge learned this segment's id (push-pull):
+            // buffer the bytes until `LiveEdge` provides the id, then verify. This is NOT
+            // proof of a bad peer, so we don't penalize — and it's bounded, so an early
+            // (or hostile) push can't grow memory without limit.
+            None => {
+                self.pending.remove(&seq);
+                if let Some(raw) = r.assemble() {
+                    self.buffer_pending_verify(peer, seq, raw);
                 }
             }
-            None => {
-                // Hash mismatch (or unknown id): discard, decay reputation, re-request later.
-                self.stats.hash_failures += 1;
-                self.pending.remove(&seq);
-                if let Some(p) = self.eng.peers.get_mut(&peer) {
-                    p.reputation *= 0.5;
+        }
+    }
+
+    /// Store a verified segment, feed the player, update the sender's throughput, and
+    /// (push-pull) reshare it to our own subscribers so the live edge propagates
+    /// hop-by-hop without each downstream viewer paying a discovery + `Want` round-trip.
+    fn accept_segment(&mut self, peer: PeerId, seq: Seq, id: SegmentId, b: Bytes) {
+        let n = b.len();
+        self.stats.peer_bytes += n as u64;
+        self.eng.store.insert(seq, id, b.clone());
+        self.eng.local.set(seq);
+        self.sink.push_segment(seq, b);
+        // Real throughput: bytes delivered / time since we asked (push deliveries have no
+        // matching `pending` entry, so they just don't update the estimate — correct).
+        let sent = self.pending.remove(&seq).map(|(_, t)| t);
+        let now = self.now_ms;
+        let seg_bytes = self.eng.seg_bytes;
+        if let Some(p) = self.eng.peers.get_mut(&peer) {
+            if let Some(sent_ms) = sent {
+                let elapsed = now.saturating_sub(sent_ms).max(1);
+                p.throughput_bps.update((n as f64) * 8_000.0 / (elapsed as f64));
+            }
+            p.pending_bytes = p.pending_bytes.saturating_sub(seg_bytes);
+        }
+        self.push_to_subscribers(seq);
+    }
+
+    /// Hold a segment pushed to us before its id is known, within the global byte budget.
+    fn buffer_pending_verify(&mut self, peer: PeerId, seq: Seq, raw: Vec<u8>) {
+        let len = raw.len() as u64;
+        if self.pending_verify.contains_key(&seq)
+            || self.pending_verify_bytes + len > MAX_PENDING_VERIFY_BYTES
+        {
+            return; // already buffered, or over budget — let the picker pull it instead.
+        }
+        self.pending_verify_bytes += len;
+        self.pending_verify.insert(seq, (peer, Bytes::from(raw)));
+    }
+
+    /// A pushed-ahead segment's id just arrived via the live edge — verify the buffered
+    /// bytes against it and deliver (the receive half of push-pull).
+    fn try_verify_pending(&mut self, seq: Seq) {
+        let (peer, raw) = match self.pending_verify.remove(&seq) {
+            Some(v) => v,
+            None => return,
+        };
+        self.pending_verify_bytes = self.pending_verify_bytes.saturating_sub(raw.len() as u64);
+        if self.eng.local.has(seq) {
+            return; // already pulled it in the meantime.
+        }
+        let id = match self.segment_ids.get(&seq).copied() {
+            Some(id) => id,
+            None => return,
+        };
+        if crypto::verify_segment(&raw[..], &id) {
+            self.accept_segment(peer, seq, id, raw);
+        } else {
+            self.stats.hash_failures += 1;
+            if let Some(p) = self.eng.peers.get_mut(&peer) {
+                p.reputation *= 0.5;
+            }
+        }
+    }
+
+    /// Push a freshly-available segment to every subscriber that (per its buffer map)
+    /// still needs it, honoring choke + the upload budget — the proactive half of
+    /// push-pull. A redundant push is harmless: the receiver dedups by `seq`.
+    fn push_to_subscribers(&mut self, seq: Seq) {
+        if self.subscribers.is_empty() {
+            return;
+        }
+        let bytes = match self.eng.store.get(seq) {
+            Some(b) => b,
+            None => return,
+        };
+        let cost = bytes.len() as f64;
+        let metered = self.eng.cfg.upload_budget_bps > 0;
+        let targets: Vec<PeerId> = self
+            .subscribers
+            .iter()
+            .copied()
+            .filter(|s| match self.eng.peers.get(s) {
+                // Skip a peer we're choking, or one the buffer map shows already has it.
+                Some(p) => !p.choked && !p.buffer.has(seq),
+                None => true, // subscribed before its Hello — no state yet, push anyway.
+            })
+            .collect();
+        for s in targets {
+            if metered {
+                if self.upload_tokens < cost {
+                    break; // out of budget this round — subscribers fall back to pulling.
                 }
+                self.upload_tokens -= cost;
+            }
+            if let Some(link) = self.links.get(&s).cloned() {
+                self.send_segment(&link, seq, &bytes);
             }
         }
     }
