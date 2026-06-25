@@ -11,7 +11,7 @@
 //! (live-edge propagation is D3). Verification is always against it.
 
 use crate::buffermap::BufferMap;
-use crate::config::MeshConfig;
+use crate::config::{MeshConfig, Role};
 use crate::media::MediaSink;
 use crate::peer::PeerState;
 use crate::picker::Source;
@@ -24,6 +24,7 @@ use bytes::Bytes;
 use parity_scale_codec::{Decode, Encode};
 use rand_chacha::ChaCha8Rng;
 use rand::SeedableRng;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,6 +42,41 @@ const PING_INTERVAL_MS: u64 = 1_000;
 const BUFFERMAP_INTERVAL_MS: u64 = 500;
 /// Reject absurd segment sizes from a hostile peer before allocating a reassembler.
 const MAX_SEGMENT_BYTES: u32 = 4 * 1024 * 1024;
+/// Upload fairness (TECH_SPEC §8.5). A viewer serves at most this many peers at once
+/// (its "regular" unchoke slots), rewarding the best reciprocators, plus one rotating
+/// optimistic slot for newcomers. Publishers/seeds don't choke — the origin is generous
+/// so the swarm can bootstrap. Re-evaluated every `CHOKE_INTERVAL_MS`.
+const UPLOAD_SLOTS: usize = 4;
+const CHOKE_INTERVAL_MS: u64 = 5_000;
+
+/// Choose which peers to unchoke (serve) this round — the pure core of the upload-slot
+/// manager, separated for testability. Viewers reward reciprocation (rank by the
+/// throughput a peer has given US); seeds/publishers spread by proximity (lowest RTT).
+/// One extra "optimistic" slot rotates among the remaining peers so newcomers get a
+/// chance to prove themselves. `peers` is `(id, throughput_bps_from_them, rtt_ms)`.
+fn select_unchokes(
+    peers: &[(PeerId, f64, f64)],
+    role: Role,
+    slots: usize,
+    optimistic_rr: u64,
+) -> HashSet<PeerId> {
+    let mut ranked: Vec<&(PeerId, f64, f64)> = peers.iter().collect();
+    match role {
+        // Tit-for-tat: best reciprocators first (highest throughput they've given us).
+        Role::Viewer => ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)),
+        // No reciprocation to measure — spread to the closest peers (fastest to reshare).
+        Role::Publisher | Role::Seed => {
+            ranked.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal))
+        }
+    }
+    let mut set: HashSet<PeerId> = ranked.iter().take(slots).map(|p| p.0).collect();
+    // Optimistic unchoke: rotate one slot among the peers not already chosen.
+    let rest: Vec<PeerId> = ranked.iter().skip(slots).map(|p| p.0).collect();
+    if !rest.is_empty() {
+        set.insert(rest[(optimistic_rr as usize) % rest.len()]);
+    }
+    set
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct NodeStats {
@@ -68,6 +104,8 @@ pub struct MeshNode {
     last_ping_ms: u64,
     last_bm_ms: u64,
     last_bm_count: usize,
+    last_choke_ms: u64,
+    optimistic_rr: u64,
     stats: NodeStats,
 }
 
@@ -143,7 +181,48 @@ impl MeshNode {
             last_ping_ms: 0,
             last_bm_ms: 0,
             last_bm_count: usize::MAX, // force the first buffer-map advertise
+            last_choke_ms: 0,
+            optimistic_rr: 0,
             stats: NodeStats::default(),
+        }
+    }
+
+    /// Re-evaluate upload slots (TECH_SPEC §8.5) and send Choke/Unchoke on transitions.
+    /// Publishers/seeds never choke (the origin stays generous so the swarm can
+    /// bootstrap); only viewers ration their upload across slots.
+    fn recompute_unchokes(&mut self) {
+        self.last_choke_ms = self.now_ms;
+        if !matches!(self.eng.cfg.role, Role::Viewer) {
+            return; // origin stays open; peers keep their default `choked = false`.
+        }
+        self.optimistic_rr = self.optimistic_rr.wrapping_add(1);
+        let stats: Vec<(PeerId, f64, f64)> = self
+            .eng
+            .peers
+            .iter()
+            .map(|(id, p)| (*id, p.throughput_bps.or(0.0), p.rtt_ms.or(f64::MAX)))
+            .collect();
+        let unchoked = select_unchokes(&stats, Role::Viewer, UPLOAD_SLOTS, self.optimistic_rr);
+        let (mut to_choke, mut to_unchoke) = (Vec::new(), Vec::new());
+        for (id, p) in self.eng.peers.iter_mut() {
+            let want = unchoked.contains(id);
+            if want && p.choked {
+                p.choked = false;
+                to_unchoke.push(*id);
+            } else if !want && !p.choked {
+                p.choked = true;
+                to_choke.push(*id);
+            }
+        }
+        for id in to_unchoke {
+            if let Some(l) = self.links.get(&id) {
+                l.send(Channel::Ctrl, MeshMsg::Unchoke.encode());
+            }
+        }
+        for id in to_choke {
+            if let Some(l) = self.links.get(&id) {
+                l.send(Channel::Ctrl, MeshMsg::Choke.encode());
+            }
         }
     }
 
@@ -293,11 +372,24 @@ impl MeshNode {
             }
         }
 
+        // Upload-slot fairness: re-evaluate which peers we serve (viewers ration; the
+        // first eval fires as soon as we have peers, then every CHOKE_INTERVAL_MS).
+        if !self.eng.peers.is_empty()
+            && (self.last_choke_ms == 0
+                || self.now_ms.saturating_sub(self.last_choke_ms) >= CHOKE_INTERVAL_MS)
+        {
+            self.recompute_unchokes();
+        }
+
         // Run the picker and issue Wants to peers.
         let reqs = self.eng.plan(self.now_ms, &mut self.rng);
         for r in reqs {
             if let Source::Peer(pid) = r.source {
                 if self.pending.contains_key(&r.seq) {
+                    continue;
+                }
+                // Don't waste a Want on a peer that's choking us.
+                if self.eng.peers.get(&pid).map(|p| p.choked_by).unwrap_or(false) {
                     continue;
                 }
                 if let Some(link) = self.links.get(&pid).cloned() {
@@ -326,6 +418,11 @@ impl MeshNode {
                 entry.buffer = BufferMap::from_bytes(base_seq, &bitfield);
             }
             MeshMsg::Want { segment_seqs, .. } => {
+                // Upload fairness: serve only peers we've unchoked (publishers/seeds
+                // never choke, so they always serve).
+                if self.eng.peers.get(&peer).map(|p| p.choked).unwrap_or(false) {
+                    return;
+                }
                 for seq in segment_seqs {
                     if let Some(b) = self.eng.store.get(seq) {
                         if let Some(link) = self.links.get(&peer).cloned() {
@@ -364,8 +461,20 @@ impl MeshNode {
                     p.rtt_ms.update(rtt.max(1.0));
                 }
             }
-            // Cancel / Choke / Unchoke: no-ops (we never hedge — `pending` dedups per
-            // seq — so there's no losing request to cancel).
+            // Upload fairness: a peer telling us it won't serve us — stop wasting Wants
+            // on it (the picker skips `choked_by` peers; the pending timeout re-routes).
+            MeshMsg::Choke => {
+                if let Some(p) = self.eng.peers.get_mut(&peer) {
+                    p.choked_by = true;
+                }
+            }
+            MeshMsg::Unchoke => {
+                if let Some(p) = self.eng.peers.get_mut(&peer) {
+                    p.choked_by = false;
+                }
+            }
+            // Cancel: no-op (we never hedge — `pending` dedups per seq — so there's no
+            // losing request to cancel).
             _ => {}
         }
     }
@@ -432,5 +541,51 @@ impl MeshNode {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pid(n: u64) -> PeerId {
+        PeerId::from_u64(n)
+    }
+
+    #[test]
+    fn viewer_unchokes_top_reciprocators_plus_one_rotating_optimistic() {
+        // 6 peers; peer i has throughput (7-i) Mbit/s, so 1 is the best reciprocator.
+        let peers: Vec<(PeerId, f64, f64)> =
+            (1..=6u64).map(|i| (pid(i), (7 - i) as f64 * 1_000_000.0, 50.0)).collect();
+
+        let set = select_unchokes(&peers, Role::Viewer, 4, 0);
+        // The four best reciprocators are always unchoked.
+        for i in 1..=4 {
+            assert!(set.contains(&pid(i)), "top reciprocator {i} must be unchoked");
+        }
+        // Plus exactly one optimistic slot from the remaining peers (5, 6).
+        assert_eq!(set.len(), 5);
+        assert!(set.contains(&pid(5)) ^ set.contains(&pid(6)), "exactly one optimistic slot");
+        // The optimistic slot rotates with the round-robin counter.
+        let set2 = select_unchokes(&peers, Role::Viewer, 4, 1);
+        assert_ne!(set.contains(&pid(5)), set2.contains(&pid(5)), "optimistic slot rotates");
+    }
+
+    #[test]
+    fn seed_spreads_by_proximity_not_throughput() {
+        // A fast-but-far peer loses its regular slot to a slow-but-close one.
+        let peers = vec![
+            (pid(1), 9_000_000.0, 200.0), // far, fast
+            (pid(2), 1_000_000.0, 20.0),  // close, slow
+            (pid(3), 5_000_000.0, 300.0), // farthest
+        ];
+        let set = select_unchokes(&peers, Role::Seed, 1, 0);
+        assert!(set.contains(&pid(2)), "a seed's regular slot goes to the closest peer");
+    }
+
+    #[test]
+    fn fewer_peers_than_slots_unchokes_all() {
+        let peers = vec![(pid(1), 1.0, 10.0), (pid(2), 2.0, 10.0)];
+        assert_eq!(select_unchokes(&peers, Role::Viewer, 4, 0).len(), 2);
     }
 }

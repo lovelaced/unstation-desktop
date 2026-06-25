@@ -42,6 +42,11 @@ pub struct PeerState {
     pub pending_bytes: u64,
     /// Reputation in `[0, 1]`; decays on hash mismatch / repeated choke (TECH_SPEC §8.5).
     pub reputation: f64,
+    /// Upload fairness (TECH_SPEC §8.5). `choked` = WE are withholding upload from this
+    /// peer (not in one of our upload slots); `choked_by` = THEY told us they won't serve
+    /// us (so the picker shouldn't waste `Want`s on them). Both default to "open".
+    pub choked: bool,
+    pub choked_by: bool,
 }
 
 impl PeerState {
@@ -53,6 +58,8 @@ impl PeerState {
             rtt_ms: Ewma::new(0.3),
             pending_bytes: 0,
             reputation: 1.0,
+            choked: false,
+            choked_by: false,
         }
     }
 }
