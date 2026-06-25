@@ -52,6 +52,12 @@ pub enum MeshMsg {
     Subscribe,
     /// Withdraw a `Subscribe` (e.g. the viewer paused / left the live edge to seek VOD).
     Unsubscribe,
+    /// Signed live-edge announcement, gossiped in-mesh (TECH_SPEC §6.4, off-chain
+    /// signaling). Carries a segment's authenticated content id signed by the publisher
+    /// (sr25519); any node verifies it against the publisher's pubkey and re-gossips it,
+    /// so the edge propagates at mesh speed instead of via the ~2.8 s chain poll. The
+    /// chain edge remains a coarse fallback for cold/partitioned viewers.
+    EdgeAnnounce { seq: Seq, id: [u8; 32], sig: [u8; 64] },
 }
 
 #[cfg(test)]
@@ -93,5 +99,12 @@ mod tests {
         // which the one-copy framing in `node::frame_segment_data` hardcodes.
         let sd = MeshMsg::SegmentData { seq: 0, track_id: 0, total_len: 1, offset: 0, bytes: vec![0] };
         assert_eq!(sd.encode()[0], 4, "SegmentData must stay variant 4");
+    }
+
+    #[test]
+    fn roundtrip_edge_announce() {
+        let msg = MeshMsg::EdgeAnnounce { seq: 42, id: [3u8; 32], sig: [9u8; 64] };
+        let bytes = msg.encode();
+        assert_eq!(MeshMsg::decode(&mut &bytes[..]).unwrap(), msg);
     }
 }

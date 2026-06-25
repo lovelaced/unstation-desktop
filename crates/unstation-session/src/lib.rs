@@ -25,6 +25,7 @@ use tokio::time::{interval, sleep};
 
 use transport_libdc::{LibDcTransport, SignalOut};
 use unstation_chain::ChainSignaling;
+use unstation_core::node::EdgeSigner;
 use unstation_core::signaling::{Presence, Signaling, SignalMsg};
 use unstation_core::topic::discovery_topic;
 use unstation_core::transport::EngineEvent;
@@ -36,6 +37,20 @@ const PRESENCE_REFRESH: Duration = Duration::from_secs(10);
 const EDGE_REFRESH: Duration = Duration::from_secs(2);
 const PRESENCE_TTL_S: u32 = 30;
 const EDGE_WINDOW: usize = 64;
+
+/// Signs live-edge gossip with the host's on-chain identity — the SAME sr25519 key as
+/// the signed manifest + presence. Injected into the publisher's `MeshNode` (via
+/// [`MeshNode::with_edge_signer`]) so the secret never leaves the chain layer; viewers
+/// verify each gossiped edge against the publisher's pubkey. Off-chain signaling
+/// (TECH_SPEC §6.4).
+pub struct IdentityEdgeSigner;
+impl EdgeSigner for IdentityEdgeSigner {
+    fn sign(&self, payload: &[u8]) -> [u8; 64] {
+        // Publishing always implies a signed-in identity; the all-zero fallback (which
+        // viewers reject) only guards the impossible "publisher without identity" case.
+        unstation_chain::sign_with_identity(payload).unwrap_or([0u8; 64])
+    }
+}
 
 /// A running session: the chain-signaling + WebRTC plumbing for one stream.
 #[derive(Clone)]

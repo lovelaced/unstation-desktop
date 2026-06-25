@@ -30,7 +30,7 @@ use unstation_core::node::MeshNode;
 use unstation_core::transport::EngineEvent;
 use unstation_core::types::{SegmentId, Seq, StreamId};
 use unstation_chain::BulletinOrigin;
-use unstation_session::Session;
+use unstation_session::{IdentityEdgeSigner, Session};
 
 /// Nominal segment size for the picker's expected-delivery-time estimates.
 const SEG_BYTES: u64 = 200_000;
@@ -290,7 +290,10 @@ async fn start_watch(
         sink,
         HashMap::new(),
         0,
-    );
+    )
+    // Off-chain signaling (#17): bind to this stream so gossiped live-edge signatures
+    // verify; the publisher key arrives via SetPublisherKey once discovery confirms it.
+    .with_stream_id(stream.0);
     let mut tasks = Vec::new();
     tasks.push(tokio::spawn(async move {
         let _ = viewer.run(view_rx, TICK, None).await;
@@ -312,6 +315,7 @@ async fn start_watch(
     {
         let s = session.clone();
         let appc = app.clone();
+        let vtx = view_tx.clone();
         tasks.push(tokio::spawn(async move {
             loop {
                 // Mesh-as-relay (M4): hold a few peer connections, dialing whichever
@@ -330,7 +334,13 @@ async fn start_watch(
                         // the publisher-authenticated live edge.
                         if let Some(cid) = cand.manifest_cid.clone() {
                             match BulletinOrigin.fetch_manifest(cid).await {
-                                Ok(m) if m.verify(&cand.peer_id.0).is_ok() => {}
+                                Ok(m) if m.verify(&cand.peer_id.0).is_ok() => {
+                                    // Verified publisher → its PeerId is the trust anchor
+                                    // for gossiped live-edge announcements (#17).
+                                    let _ = vtx.send(EngineEvent::SetPublisherKey {
+                                        key: cand.peer_id.0,
+                                    });
+                                }
                                 Ok(_) => {
                                     let _ = appc.emit(
                                         "mesh-status",
@@ -558,7 +568,11 @@ async fn start_publish(
         cfg(Mode::Live, Role::Publisher),
         SEG_BYTES,
         Arc::new(NullSink),
-    );
+    )
+    // Off-chain signaling (#17): sign each produced segment's live edge with our identity
+    // and gossip it in-mesh, so viewers learn ids at mesh speed (chain edge = fallback).
+    .with_stream_id(stream.0)
+    .with_edge_signer(Arc::new(IdentityEdgeSigner));
     tokio::spawn(async move {
         let _ = publisher.run(pub_rx, TICK, None).await;
     });

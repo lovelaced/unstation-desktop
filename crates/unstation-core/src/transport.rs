@@ -39,6 +39,10 @@ pub enum EngineEvent {
     /// Viewer-side, locally injected: the signed live-edge announced a segment's
     /// content id, so the node knows it exists and how to verify it (TECH_SPEC §6.4).
     LiveEdge { seq: Seq, id: SegmentId },
+    /// Viewer-side, locally injected once the publisher is discovered and its signed
+    /// manifest verifies: the publisher pubkey to authenticate gossiped live-edge
+    /// announcements against (off-chain signaling, TECH_SPEC §6.4).
+    SetPublisherKey { key: [u8; 32] },
     /// Scheduler tick (also emitted by a timer in production).
     Tick,
     Stop,

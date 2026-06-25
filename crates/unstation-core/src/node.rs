@@ -54,6 +54,33 @@ const CHOKE_INTERVAL_MS: u64 = 5_000;
 /// bytes total, so an early (or hostile) push can't grow memory without bound. Beyond it,
 /// the push is dropped and the segment is pulled normally instead.
 const MAX_PENDING_VERIFY_BYTES: u64 = 8 * 1024 * 1024;
+/// Off-chain signaling (TECH_SPEC §6.4): remember this many recent edge seqs so a
+/// gossiped `EdgeAnnounce` is applied + re-broadcast exactly once (loop/storm suppression)
+/// while still tracking the live window. Pruned below `head - this` each tick.
+const EDGE_SEEN_KEEP: Seq = 1024;
+/// Domain tag prefixed to the bytes a publisher signs for a live-edge gossip. Both
+/// `MANIFEST_CONTEXT` (the sr25519 signing context) and this tag separate an edge
+/// signature from a manifest signature, so neither can be replayed as the other.
+const EDGE_SIGN_TAG: &[u8] = b"unstation-edge-v1";
+
+/// Builds the exact bytes a publisher signs (and a viewer verifies) for one live-edge
+/// entry: tag ‖ stream ‖ seq ‖ content-id. A free fn so the sign + verify paths can't
+/// drift apart.
+fn edge_payload(stream_id: &[u8; 32], seq: Seq, id: &SegmentId) -> Vec<u8> {
+    let mut p = Vec::with_capacity(EDGE_SIGN_TAG.len() + 32 + 8 + 32);
+    p.extend_from_slice(EDGE_SIGN_TAG);
+    p.extend_from_slice(stream_id);
+    seq.encode_to(&mut p);
+    p.extend_from_slice(&id.0);
+    p
+}
+
+/// Signs live-edge announcements with the publisher's identity key (sr25519). Injected
+/// by the session so the secret stays in the chain layer; the node only holds this handle
+/// and the public key the verification side checks against.
+pub trait EdgeSigner: Send + Sync {
+    fn sign(&self, payload: &[u8]) -> [u8; 64];
+}
 
 /// Choose which peers to unchoke (serve) this round — the pure core of the upload-slot
 /// manager, separated for testability. Viewers reward reciprocation (rank by the
@@ -133,6 +160,14 @@ pub struct MeshNode {
     links: HashMap<PeerId, Arc<dyn Link>>,
     reasm: HashMap<Seq, Reassembler>,
     segment_ids: HashMap<Seq, SegmentId>,
+    /// Off-chain signaling (TECH_SPEC §6.4). `stream_id` binds edge signatures to this
+    /// stream; `edge_signer` (publisher only) signs each new edge; `publisher_key` (viewer
+    /// only) is the trust anchor each gossiped edge is verified against — the SAME pubkey
+    /// the signed manifest was checked against; `edge_seen` dedups gossip per seq.
+    stream_id: [u8; 32],
+    edge_signer: Option<Arc<dyn EdgeSigner>>,
+    publisher_key: Option<[u8; 32]>,
+    edge_seen: HashSet<Seq>,
     known_peers: HashSet<PeerId>,
     /// Push-pull (TECH_SPEC §6.4): peers that subscribed to our live edge. We PUSH each
     /// newly-available segment to them (subject to choke + budget) instead of waiting for
@@ -250,6 +285,10 @@ impl MeshNode {
             links: HashMap::new(),
             reasm: HashMap::new(),
             segment_ids,
+            stream_id: [0u8; 32],
+            edge_signer: None,
+            publisher_key: None,
+            edge_seen: HashSet::new(),
             known_peers: HashSet::new(),
             subscribers: HashSet::new(),
             pending_verify: HashMap::new(),
@@ -266,6 +305,27 @@ impl MeshNode {
             last_token_ms: 0,
             stats: NodeStats::default(),
         }
+    }
+
+    /// Bind this node to a stream id (used as the signing/verifying domain for live-edge
+    /// gossip). Builder-style so existing constructors stay unchanged.
+    pub fn with_stream_id(mut self, stream_id: [u8; 32]) -> Self {
+        self.stream_id = stream_id;
+        self
+    }
+
+    /// Publisher: attach the identity signer so each produced segment's edge is signed
+    /// and gossiped in-mesh (off-chain signaling, TECH_SPEC §6.4).
+    pub fn with_edge_signer(mut self, signer: Arc<dyn EdgeSigner>) -> Self {
+        self.edge_signer = Some(signer);
+        self
+    }
+
+    /// Viewer: the publisher pubkey every gossiped edge is verified against (the same
+    /// trust anchor used for the signed manifest). Without it, gossiped edges are ignored.
+    pub fn with_publisher_key(mut self, key: [u8; 32]) -> Self {
+        self.publisher_key = Some(key);
+        self
     }
 
     /// Re-evaluate upload slots (TECH_SPEC §8.5) and send Choke/Unchoke on transitions.
@@ -381,16 +441,24 @@ impl MeshNode {
                 self.eng.local.set(seq);
                 self.segment_ids.insert(seq, id);
                 self.eng.head_seq = self.eng.head_seq.max(seq);
+                // Off-chain signaling (TECH_SPEC §6.4): sign this edge + gossip it in-mesh
+                // so viewers learn the id at mesh speed (the chain edge is the fallback).
+                if let Some(signer) = self.edge_signer.clone() {
+                    if self.edge_seen.insert(seq) {
+                        let sig = signer.sign(&edge_payload(&self.stream_id, seq, &id));
+                        self.gossip_edge(seq, id, sig, None);
+                    }
+                }
                 // Push-pull: push it straight to subscribers (don't wait for their Want).
                 self.push_to_subscribers(seq);
             }
             EngineEvent::LiveEdge { seq, id } => {
-                // Learn that a segment exists + its content id (so we can fetch + verify).
-                self.segment_ids.insert(seq, id);
-                self.eng.head_seq = self.eng.head_seq.max(seq);
-                // A segment may have been pushed to us before this id arrived — now that
-                // we can verify it, deliver it without a re-fetch (push-pull receive).
-                self.try_verify_pending(seq);
+                // Learn a segment's content id from the chain edge poll (the fallback path).
+                self.apply_edge(seq, id);
+            }
+            EngineEvent::SetPublisherKey { key } => {
+                // Trust anchor learned at runtime — gossiped edges now get verified.
+                self.publisher_key = Some(key);
             }
             EngineEvent::Tick => self.on_tick(),
             EngineEvent::Stop => {}
@@ -407,6 +475,27 @@ impl MeshNode {
             bitfield: self.eng.local.to_bytes(),
         };
         link.send(Channel::Ctrl, msg.encode());
+    }
+
+    /// Record a segment's authenticated content id (from the chain edge OR a verified
+    /// gossip), advance the head, and deliver any bytes that were pushed to us before
+    /// the id was known (push-pull receive).
+    fn apply_edge(&mut self, seq: Seq, id: SegmentId) {
+        self.segment_ids.insert(seq, id);
+        self.eng.head_seq = self.eng.head_seq.max(seq);
+        self.try_verify_pending(seq);
+    }
+
+    /// Broadcast a signed live-edge to every connected peer except `exclude` (the peer it
+    /// arrived from). Re-broadcasting verbatim is safe: the signature travels with it, so
+    /// every hop re-verifies against the same publisher key.
+    fn gossip_edge(&self, seq: Seq, id: SegmentId, sig: [u8; 64], exclude: Option<PeerId>) {
+        let encoded = MeshMsg::EdgeAnnounce { seq, id: id.0, sig }.encode();
+        for (pid, link) in self.links.iter() {
+            if Some(*pid) != exclude {
+                link.send(Channel::Ctrl, encoded.clone());
+            }
+        }
     }
 
     fn on_tick(&mut self) {
@@ -459,6 +548,13 @@ impl MeshNode {
                         self.pending_verify_bytes.saturating_sub(raw.len() as u64);
                 }
             }
+        }
+
+        // Bound the gossip-dedup set to the recent live window (edges are monotonic, so
+        // far-behind seqs won't legitimately re-appear near the head).
+        if self.edge_seen.len() as Seq > EDGE_SEEN_KEEP {
+            let cutoff = self.eng.head_seq.saturating_sub(EDGE_SEEN_KEEP);
+            self.edge_seen.retain(|&s| s >= cutoff);
         }
 
         // Advertise the buffer map only on change, or at most every BUFFERMAP_INTERVAL_MS
@@ -607,6 +703,24 @@ impl MeshNode {
             }
             MeshMsg::Unsubscribe => {
                 self.subscribers.remove(&peer);
+            }
+            // Off-chain signaling (TECH_SPEC §6.4): a gossiped signed live-edge. Verify it
+            // against the publisher trust anchor BEFORE acting on or relaying it, dedup by
+            // seq (loop/storm suppression), apply it, then re-gossip to our other peers.
+            MeshMsg::EdgeAnnounce { seq, id, sig } => {
+                let pubkey = match self.publisher_key {
+                    Some(k) => k,
+                    None => return, // no trust anchor → can't trust a gossiped edge.
+                };
+                let sid = SegmentId(id);
+                if !crypto::verify_sr25519(&pubkey, &edge_payload(&self.stream_id, seq, &sid), &sig) {
+                    return; // forged / wrong stream → never propagate it.
+                }
+                if !self.edge_seen.insert(seq) {
+                    return; // already seen this edge — don't re-apply or re-storm.
+                }
+                self.apply_edge(seq, sid);
+                self.gossip_edge(seq, sid, sig, Some(peer)); // fan out, minus the sender.
             }
             // Cancel: no-op (we never hedge — `pending` dedups per seq — so there's no
             // losing request to cancel).

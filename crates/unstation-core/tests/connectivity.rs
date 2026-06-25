@@ -16,7 +16,7 @@ use unstation_core::clock::VirtualClock;
 use unstation_core::config::{MeshConfig, Mode, PickerWeights, Role};
 use unstation_core::crypto;
 use unstation_core::media::MediaSink;
-use unstation_core::node::MeshNode;
+use unstation_core::node::{EdgeSigner, MeshNode};
 use unstation_core::protocol::MeshMsg;
 use unstation_core::signaling::SignalMsg;
 use unstation_core::statement_store_mem::{MemStatementStore, StatementSignaling};
@@ -69,6 +69,17 @@ impl Link for RecordingLink {
     }
     fn send(&self, channel: Channel, bytes: Vec<u8>) {
         self.sent.lock().unwrap().push((channel, bytes));
+    }
+}
+
+/// Signs live-edge gossip with an sr25519 keypair derived from a 32-byte seed. Holds the
+/// seed (not the keypair) so the test never has to name `schnorrkel::Keypair`.
+struct SeedSigner {
+    seed: [u8; 32],
+}
+impl EdgeSigner for SeedSigner {
+    fn sign(&self, payload: &[u8]) -> [u8; 64] {
+        crypto::sign_sr25519(&crypto::keypair_from_seed(&self.seed), payload)
     }
 }
 
@@ -396,6 +407,118 @@ async fn pushed_segment_buffers_until_live_edge_then_delivers() {
     assert_eq!(stats.delivered, 1, "the buffered early push is delivered once its id arrives");
     assert_eq!(stats.hash_failures, 0, "an early push is not a hash failure");
     assert_eq!(rec.get(0), Some(seg), "the player received exactly the pushed segment");
+}
+
+#[tokio::test]
+async fn signed_edge_gossips_multihop_and_relays_to_a_viewer_with_no_link_to_the_origin() {
+    // Off-chain signaling (#17 piece 1), the flagship case: a publisher SIGNS each
+    // segment's live edge and gossips it in-mesh. Viewer A (connected to P) verifies it
+    // against the publisher key and RE-GOSSIPS to viewer B — which has NO link to the
+    // origin and NO chain edge poller. B can therefore only learn each segment's id from
+    // A's relayed gossip, and only get the bytes from A's reshare. Full delivery proves
+    // multi-hop signed-edge propagation + the push relay, with zero chain involvement.
+    let seg_len = 16_000usize;
+    let seed = [4u8; 32];
+    let pubkey = crypto::public_bytes(&crypto::keypair_from_seed(&seed));
+    let sid = [5u8; 32];
+    let n = 4usize;
+
+    let (p, a, b) = (PeerId::from_u64(1), PeerId::from_u64(2), PeerId::from_u64(3));
+    let (ptx, prx) = mpsc::unbounded_channel::<EngineEvent>();
+    let (atx, arx) = mpsc::unbounded_channel::<EngineEvent>();
+    let (btx, brx) = mpsc::unbounded_channel::<EngineEvent>();
+
+    // P ↔ A
+    let (lp_for_p, lp_for_a) = wire(p, ptx.clone(), a, atx.clone());
+    ptx.send(EngineEvent::PeerConnected { peer: a, link: lp_for_p }).unwrap();
+    atx.send(EngineEvent::PeerConnected { peer: p, link: lp_for_a }).unwrap();
+    // A ↔ B (B has no link to P)
+    let (la_for_a, la_for_b) = wire(a, atx.clone(), b, btx.clone());
+    atx.send(EngineEvent::PeerConnected { peer: b, link: la_for_a }).unwrap();
+    btx.send(EngineEvent::PeerConnected { peer: a, link: la_for_b }).unwrap();
+
+    let publisher = MeshNode::new_live_publisher(p, cfg(Role::Publisher), seg_len as u64, Arc::new(NullSink))
+        .with_stream_id(sid)
+        .with_edge_signer(Arc::new(SeedSigner { seed }));
+    tokio::spawn(publisher.run(prx, Duration::from_millis(10), None));
+
+    let a_rec = Arc::new(Rec::default());
+    let viewer_a = MeshNode::new_viewer(a, cfg(Role::Viewer), seg_len as u64, a_rec.clone(), HashMap::new(), 0)
+        .with_stream_id(sid)
+        .with_publisher_key(pubkey);
+    let a_handle = tokio::spawn(viewer_a.run(arx, Duration::from_millis(10), None));
+
+    // Produce only after both viewers have connected + subscribed (so the push cascade
+    // fires); each Produced triggers a signed edge gossip + a push.
+    let ptx_prod = ptx.clone();
+    let segs: Vec<Bytes> = (0..n as u64)
+        .map(|i| Bytes::from(vec![(i as u8).wrapping_mul(11).wrapping_add(3); seg_len]))
+        .collect();
+    let segs_task = segs.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        for (i, seg) in segs_task.into_iter().enumerate() {
+            let id = crypto::segment_id(&seg);
+            let _ = ptx_prod.send(EngineEvent::Produced { seq: i as u64, id, bytes: seg });
+        }
+    });
+
+    let b_rec = Arc::new(Rec::default());
+    let viewer_b = MeshNode::new_viewer(b, cfg(Role::Viewer), seg_len as u64, b_rec.clone(), HashMap::new(), 0)
+        .with_stream_id(sid)
+        .with_publisher_key(pubkey);
+    let b_stats = tokio::time::timeout(Duration::from_secs(12), viewer_b.run(brx, Duration::from_millis(10), Some(n)))
+        .await
+        .expect("B should learn edges via A's re-gossip and receive the relayed stream");
+
+    assert_eq!(b_stats.delivered, n, "B got every segment: edge via gossip relay, bytes via reshare");
+    assert_eq!(b_stats.hash_failures, 0);
+    for (i, seg) in segs.iter().enumerate() {
+        assert_eq!(b_rec.get(i as u64).as_ref(), Some(seg), "B played the real segment {i}");
+    }
+    let _ = atx.send(EngineEvent::Stop);
+    let _ = ptx.send(EngineEvent::Stop);
+    let _ = tokio::time::timeout(Duration::from_secs(2), a_handle).await;
+}
+
+#[tokio::test]
+async fn forged_edge_gossip_is_rejected() {
+    // A peer forges an EdgeAnnounce (garbage signature). The viewer must NOT accept the
+    // id from it, so even though the *correct* bytes for that seq are pushed, they can
+    // never be matched to a publisher-authenticated id and are never delivered.
+    let seg_len = 16_000usize;
+    let pubkey = crypto::public_bytes(&crypto::keypair_from_seed(&[4u8; 32]));
+    let sid = [5u8; 32];
+    let me = PeerId::from_u64(100);
+    let attacker = PeerId::from_u64(7);
+
+    let seg = Bytes::from(vec![0x42u8; seg_len]);
+    let id = crypto::segment_id(&seg);
+
+    let (tx, rx) = mpsc::unbounded_channel::<EngineEvent>();
+    let rec = Arc::new(Rec::default());
+    let viewer = MeshNode::new_viewer(me, cfg(Role::Viewer), seg_len as u64, rec.clone(), HashMap::new(), 0)
+        .with_stream_id(sid)
+        .with_publisher_key(pubkey);
+
+    let forged = MeshMsg::EdgeAnnounce { seq: 0, id: id.0, sig: [0u8; 64] }.encode();
+    tx.send(EngineEvent::Inbound { peer: attacker, channel: Channel::Ctrl, bytes: forged }).unwrap();
+    let pushed = MeshMsg::SegmentData {
+        seq: 0,
+        track_id: 0,
+        total_len: seg_len as u32,
+        offset: 0,
+        bytes: seg.to_vec(),
+    }
+    .encode();
+    tx.send(EngineEvent::Inbound { peer: attacker, channel: Channel::Bulk, bytes: pushed }).unwrap();
+    tx.send(EngineEvent::Stop).unwrap();
+
+    let stats = tokio::time::timeout(Duration::from_secs(5), viewer.run(rx, Duration::from_millis(10), None))
+        .await
+        .expect("viewer loop should stop");
+    assert_eq!(stats.delivered, 0, "a forged edge must not let any segment be accepted");
+    assert_eq!(rec.count(), 0, "nothing reached the player");
 }
 
 // ---- signaling / discovery layer ----
