@@ -93,6 +93,7 @@ impl StatementSignaling {
             caps_upload_bps,
             ttl_s: self.ttl_s,
             manifest_cid: None,
+            relay: false,
         };
         let topic = discovery_topic(&self.stream, shard_for(&self.me, self.n_shards));
         self.store.publish(topic, self.me, rec.encode(), self.expiry());

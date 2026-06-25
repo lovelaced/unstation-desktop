@@ -301,8 +301,10 @@ async fn start_watch(
 
     // Announce ourselves so other viewers can discover + reshare from us — the mesh
     // relays through volunteer peers, so a NAT-restricted node only needs to reach
-    // *someone*. (At scale this presence write moves off-chain; see docs/SCALING_RESEARCH.)
-    session.spawn_presence(20_000_000);
+    // *someone*. relay = false: a plain viewer reshares but isn't a designated relay
+    // bridge (we don't yet detect its reachability). (Presence write moves off-chain at
+    // scale; see docs/SCALING_RESEARCH.)
+    session.spawn_presence(20_000_000, false);
 
     // Discover the publisher and dial it, then keep the connection alive: if the dial
     // stalls (no connect within the timeout) or the peer later drops, re-discover and
@@ -561,8 +563,10 @@ async fn start_publish(
         let _ = publisher.run(pub_rx, TICK, None).await;
     });
 
-    // Announce presence + republish the live-edge manifest as segments are made.
-    session.spawn_presence(80_000_000);
+    // Announce presence + republish the live-edge manifest as segments are made. The
+    // publisher advertises relay-capability (relay = true): it's the origin/bridge, so
+    // NAT-restricted viewers should prefer dialing it.
+    session.spawn_presence(80_000_000, true);
 
     // M2 — publish the SIGNED MANIFEST to the Bulletin chain (the durable trust
     // anchor) and announce its CID in presence. Signed with this host's identity

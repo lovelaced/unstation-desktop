@@ -346,7 +346,7 @@ mod tests {
         let stream = StreamId([7u8; 32]);
         let sig = ChainSignaling::new(stream, 1);
         let me = PeerId::from_u64(42);
-        let pres = Presence { peer_id: me, caps_upload_bps: 5_000_000, ttl_s: 30, manifest_cid: None };
+        let pres = Presence { peer_id: me, caps_upload_bps: 5_000_000, ttl_s: 30, manifest_cid: None, relay: false };
 
         // Best-effort: a fresh ephemeral key has no allowance until provisioned,
         // so a `noAllowance` here is an environment skip, not a code failure.

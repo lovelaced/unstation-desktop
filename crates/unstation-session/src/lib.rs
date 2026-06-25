@@ -90,7 +90,7 @@ impl Session {
     }
 
     /// Publisher: announce presence on our discovery shard, refreshed before TTL.
-    pub fn spawn_presence(&self, caps_upload_bps: u64) {
+    pub fn spawn_presence(&self, caps_upload_bps: u64, relay: bool) {
         let signaling = self.signaling.clone();
         let me = self.my_peer;
         let manifest_cid = self.manifest_cid.clone();
@@ -99,7 +99,7 @@ impl Session {
             loop {
                 tick.tick().await;
                 let mc = manifest_cid.lock().unwrap().clone();
-                let p = Presence { peer_id: me, caps_upload_bps, ttl_s: PRESENCE_TTL_S, manifest_cid: mc };
+                let p = Presence { peer_id: me, caps_upload_bps, ttl_s: PRESENCE_TTL_S, manifest_cid: mc, relay };
                 if let Err(e) = signaling.publish_presence(p).await {
                     log::warn!("[session] publish_presence: {e}");
                 }
@@ -178,13 +178,14 @@ impl Session {
                 for p in list {
                     if p.peer_id != self.my_peer && seen.insert(p.peer_id) {
                         out.push(p);
-                        if out.len() >= max {
-                            return out;
-                        }
                     }
                 }
             }
         }
+        // Relay-capable volunteers first: a NAT-restricted node should try the reliable
+        // bridges before random peers (the decentralized stand-in for a TURN server).
+        out.sort_by_key(|p| !p.relay);
+        out.truncate(max);
         out
     }
 

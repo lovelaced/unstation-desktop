@@ -20,6 +20,10 @@ pub struct Presence {
     /// before trusting the stream. `None` until the publisher has published it
     /// (e.g. before the encoder's init segment exists), or for plain viewers.
     pub manifest_cid: Option<String>,
+    /// Relay-capability hint (M4): a well-connected volunteer advertises `true` so
+    /// NAT-restricted peers preferentially dial it — the decentralized stand-in for
+    /// a TURN server (publishers + seed/relay nodes set it; plain viewers don't).
+    pub relay: bool,
 }
 
 /// SCALE wire form of a presence record (the statement `data` payload).
@@ -29,6 +33,7 @@ pub struct PresenceRecord {
     pub caps_upload_bps: u64,
     pub ttl_s: u32,
     pub manifest_cid: Option<String>,
+    pub relay: bool,
 }
 
 impl From<&Presence> for PresenceRecord {
@@ -38,6 +43,7 @@ impl From<&Presence> for PresenceRecord {
             caps_upload_bps: p.caps_upload_bps,
             ttl_s: p.ttl_s,
             manifest_cid: p.manifest_cid.clone(),
+            relay: p.relay,
         }
     }
 }
@@ -48,6 +54,7 @@ impl From<PresenceRecord> for Presence {
             caps_upload_bps: r.caps_upload_bps,
             ttl_s: r.ttl_s,
             manifest_cid: r.manifest_cid,
+            relay: r.relay,
         }
     }
 }
@@ -89,4 +96,28 @@ pub trait Signaling: Send + Sync {
     fn read_presence(&self, topic: TopicId, max: usize) -> BoxFuture<'static, crate::Result<Vec<Presence>>>;
     fn send_signal(&self, to: PeerId, msg: SignalMsg) -> BoxFuture<'static, crate::Result<()>>;
     fn subscribe_edge(&self, stream: StreamId) -> Subscription<LiveEdge>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presence_record_roundtrips_manifest_cid_and_relay() {
+        // The discovery wire format must preserve the M2 manifest CID + the M4 relay
+        // flag through a SCALE round-trip (the chain publishes/reads via PresenceRecord).
+        let rec = PresenceRecord {
+            peer_id: [7u8; 32],
+            caps_upload_bps: 20_000_000,
+            ttl_s: 30,
+            manifest_cid: Some("bafy-manifest-cid".into()),
+            relay: true,
+        };
+        let bytes = rec.encode();
+        assert_eq!(PresenceRecord::decode(&mut &bytes[..]).unwrap(), rec);
+
+        // And the None / non-relay shape round-trips too.
+        let plain = PresenceRecord { manifest_cid: None, relay: false, ..rec };
+        assert_eq!(PresenceRecord::decode(&mut &plain.encode()[..]).unwrap(), plain);
+    }
 }
