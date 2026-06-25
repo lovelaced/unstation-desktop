@@ -1664,6 +1664,7 @@ dependencies = [
 name = "transport-libdc"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "datachannel",
  "datachannel-sys",
  "log",

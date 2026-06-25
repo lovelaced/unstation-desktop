@@ -260,7 +260,16 @@ impl LibDcTransport {
 }
 
 fn rtc_config(stun: &[String]) -> RtcConfig {
-    RtcConfig::new(stun)
+    let cfg = RtcConfig::new(stun);
+    // Headless CI / loopback meshes: libjuice deliberately excludes 127.0.0.1 host
+    // candidates (RFC 8445), so a same-host mesh gathers none and never connects. An
+    // explicit bind address makes libjuice short-circuit and return exactly that address
+    // as the single host candidate. Set `UNSTATION_BIND_ADDR=127.0.0.1` only for
+    // tests/CI; production leaves it unset and gathers all interfaces as usual.
+    match std::env::var("UNSTATION_BIND_ADDR") {
+        Ok(addr) if !addr.is_empty() => cfg.bind_address(&addr),
+        _ => cfg,
+    }
 }
 
 /// Tune libdatachannel's global SCTP settings once, before any `PeerConnection` is
