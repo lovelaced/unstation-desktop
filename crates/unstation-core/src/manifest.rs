@@ -58,11 +58,32 @@ impl Manifest {
     }
 }
 
-/// Backed by Bulletin Cloud Storage: the durable, censorship-resistant floor.
-/// Reads fetch content-addressed bytes by CID; the publisher writes sparingly
-/// within its metered allowance.
+/// A manifest plus the publisher's signature over its canonical bytes — the unit
+/// stored on the origin and verified before any of the stream's data is trusted.
+/// The publisher key is the trust anchor; a viewer learns it from the publisher's
+/// allowance-backed presence record (its `PeerId` *is* its sr25519 pubkey).
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct SignedManifest {
+    pub manifest: Manifest,
+    pub sig: [u8; 64],
+}
+
+impl SignedManifest {
+    /// Verify the signature and that the embedded publisher matches the expected
+    /// trust anchor. Call before trusting any buffer map, live edge, or segment.
+    pub fn verify(&self, expected_publisher: &[u8; 32]) -> crate::Result<()> {
+        self.manifest.verify(expected_publisher, &self.sig)
+    }
+}
+
+/// Backed by the Bulletin chain: the durable, censorship-resistant trust + boot
+/// anchor (signed manifest + init segment). Bulk segment bytes are deliberately NOT
+/// stored here — the metered chain allowance (~tens of MB) holds the manifest, never
+/// a multi-GB stream; bulk durability is the CDN/origin floor's job. Reads fetch
+/// content-addressed bytes by CID; the publisher writes once per stream.
 pub trait OriginOfRecord: Send + Sync {
-    fn fetch_manifest(&self, cid: Cid) -> BoxFuture<'static, crate::Result<Manifest>>;
+    fn fetch_manifest(&self, cid: Cid) -> BoxFuture<'static, crate::Result<SignedManifest>>;
+    fn put_manifest(&self, manifest: SignedManifest) -> BoxFuture<'static, crate::Result<Cid>>;
     fn fetch_segment(&self, id: SegmentId) -> BoxFuture<'static, crate::Result<Bytes>>;
     fn put_segment(&self, id: SegmentId, bytes: Bytes) -> BoxFuture<'static, crate::Result<Cid>>;
 }
@@ -109,5 +130,23 @@ mod tests {
         let other = crypto::keypair_from_seed(&[10u8; 32]);
         let other_pk = crypto::public_bytes(&other);
         assert!(m.verify(&other_pk, &sig).is_err());
+    }
+
+    #[test]
+    fn signed_manifest_roundtrip_and_verify() {
+        let kp = crypto::keypair_from_seed(&[9u8; 32]);
+        let pk = crypto::public_bytes(&kp);
+        let m = sample(pk);
+        let sig = crypto::sign_sr25519(&kp, &m.signing_payload());
+        let signed = SignedManifest { manifest: m, sig };
+
+        // SCALE roundtrip survives intact.
+        let bytes = signed.encode();
+        assert_eq!(SignedManifest::decode(&mut &bytes[..]).unwrap(), signed);
+
+        // Verifies against the right anchor; a wrong anchor is rejected.
+        assert!(signed.verify(&pk).is_ok());
+        let other = crypto::public_bytes(&crypto::keypair_from_seed(&[11u8; 32]));
+        assert!(signed.verify(&other).is_err());
     }
 }

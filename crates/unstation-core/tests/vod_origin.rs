@@ -9,7 +9,7 @@
 use bytes::Bytes;
 use pollster::block_on;
 use unstation_core::crypto;
-use unstation_core::manifest::{Kind, Manifest, OriginOfRecord, Track};
+use unstation_core::manifest::{Kind, Manifest, OriginOfRecord, SignedManifest, Track};
 use unstation_core::origin_mem::MemoryOrigin;
 use unstation_core::reassembly::Reassembler;
 use unstation_core::types::StreamId;
@@ -41,11 +41,11 @@ fn vod_plays_from_origin_with_verification() {
         created_at: 1,
     };
     let sig = crypto::sign_sr25519(&kp, &manifest.signing_payload());
-    origin.put_manifest("bafymanifest", manifest);
+    let cid = block_on(origin.put_manifest(SignedManifest { manifest, sig })).unwrap();
 
-    // Viewer resolves the manifest by CID and verifies the publisher signature.
-    let fetched = block_on(origin.fetch_manifest("bafymanifest".into())).unwrap();
-    fetched.verify(&pubkey, &sig).expect("manifest must verify against the publisher key");
+    // Viewer resolves the signed manifest by CID and verifies it against the publisher.
+    let fetched = block_on(origin.fetch_manifest(cid)).unwrap();
+    fetched.verify(&pubkey).expect("manifest must verify against the publisher key");
 
     // Pull each segment from the origin, deliver it in 1 KiB chunks, reassemble, verify, "play".
     let mut played = 0usize;

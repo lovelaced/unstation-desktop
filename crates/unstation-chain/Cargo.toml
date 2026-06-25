@@ -14,4 +14,5 @@ useragent-native = { package = "useragent-native", path = "../../../useragent-ki
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros"] }
 parity-scale-codec = { version = "3", features = ["derive"] }
 schnorrkel = "0.11"
+bytes = "1"
 log = "0.4"

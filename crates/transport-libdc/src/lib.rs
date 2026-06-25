@@ -28,7 +28,7 @@ use datachannel::{
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use unstation_core::transport::EngineEvent;
 use unstation_core::types::PeerId;
@@ -184,6 +184,8 @@ impl LibDcTransport {
         inbox: UnboundedSender<EngineEvent>,
         signals: UnboundedSender<SignalOut>,
     ) -> Self {
+        // Tune SCTP globals before any PeerConnection exists (applies to new conns only).
+        apply_sctp_settings();
         let (cmd_tx, mut cmd_rx) = unbounded_channel::<Cmd>();
         let reactor_cmd = cmd_tx.clone();
         let connected = Arc::new(AtomicUsize::new(0));
@@ -244,6 +246,44 @@ impl LibDcTransport {
 
 fn rtc_config(stun: &[String]) -> RtcConfig {
     RtcConfig::new(stun)
+}
+
+/// Tune libdatachannel's global SCTP settings once, before any `PeerConnection` is
+/// created (the C API applies them to newly-created connections only).
+///
+/// The stock defaults — a 256 KiB SCTP window, 200 ms delayed-SACK, a 3-MTU initial
+/// congestion window — are the single biggest WAN throughput ceiling: goodput is
+/// bounded by `window / RTT`, so at 200 ms RTT a relay tops out near 17 Mbit/s (≈2
+/// viewers of a 1080p stream) regardless of link capacity. Lifting the window to 4 MiB
+/// and dropping delayed-SACK to 20 ms takes the same path to ~167 Mbit/s — a ~10x
+/// fan-out multiplier. Invisible on LAN (RTT≈0); decisive off-LAN. The safe `datachannel`
+/// wrapper doesn't expose this, so we call the C binding directly. See
+/// `docs/SCALING_RESEARCH.md` (Transport §1).
+fn apply_sctp_settings() {
+    static SCTP_INIT: Once = Once::new();
+    SCTP_INIT.call_once(|| {
+        let settings = datachannel_sys::rtcSctpSettings {
+            recvBufferSize: 4 * 1024 * 1024,           // 4 MiB — covers a 200 ms BDP at ~167 Mbit/s
+            sendBufferSize: 4 * 1024 * 1024,
+            maxChunksOnQueue: 0,                       // 0 = libdatachannel optimized default
+            initialCongestionWindow: 10,               // RFC 6928 (vs the 3-MTU default) — faster ramp
+            maxBurst: 0,
+            congestionControlModule: 0,                // RFC2581 (default); H-TCP measurably worsens drops
+            delayedSackTimeMs: 20,                     // vs the 200 ms default that starves cwnd growth
+            minRetransmitTimeoutMs: 100,               // vs ~1000 ms — a lost ctrl/SDP message recovers fast
+            maxRetransmitTimeoutMs: 0,
+            initialRetransmitTimeoutMs: 500,
+            maxRetransmitAttempts: 0,
+            heartbeatIntervalMs: 0,
+        };
+        // Safety: POD struct passed by const pointer; libdatachannel copies it synchronously.
+        let rc = unsafe { datachannel_sys::rtcSetSctpSettings(&settings) };
+        if rc < 0 {
+            log::warn!("[transport] rtcSetSctpSettings failed (rc={rc}); using libdatachannel defaults");
+        } else {
+            log::info!("[transport] SCTP tuned for WAN: 4 MiB windows, delayed-SACK 20ms, ICW 10");
+        }
+    });
 }
 
 fn new_conn(

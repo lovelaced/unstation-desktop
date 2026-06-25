@@ -14,6 +14,7 @@
 //! through the real chain. The live-edge subscription (`subscribe_edge`) and the
 //! `OriginOfRecord`/Bulletin impl land in M1/M2.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use parity_scale_codec::{Decode, Encode};
@@ -27,11 +28,55 @@ use unstation_core::BoxFuture;
 
 use useragent_native::chain::statement_store as ss;
 
+mod bulletin;
+pub use bulletin::BulletinOrigin;
+
+/// The host's signing secret (32-byte seed or 64-byte sr25519 secret), retained when
+/// the identity is initialized so we can sign the stream manifest with the SAME key
+/// the statement store + presence are signed with. Its public bytes are the publisher
+/// trust anchor a viewer learns from presence. Set once per process.
+static IDENTITY_SECRET: OnceLock<Vec<u8>> = OnceLock::new();
+
+/// Build a schnorrkel keypair from a 32-byte seed or a 64-byte sr25519 secret
+/// (key ‖ nonce). Keeps `schnorrkel` version handling in one place.
+fn keypair_from_secret(secret: &[u8]) -> Result<schnorrkel::Keypair, String> {
+    match secret.len() {
+        64 => Ok(schnorrkel::SecretKey::from_bytes(secret)
+            .map_err(|e| format!("invalid 64-byte slot key: {e}"))?
+            .to_keypair()),
+        32 => {
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(secret);
+            Ok(schnorrkel::MiniSecretKey::from_bytes(&seed)
+                .map_err(|e| format!("invalid 32-byte slot seed: {e}"))?
+                .expand_to_keypair(schnorrkel::ExpansionMode::Ed25519))
+        }
+        n => Err(format!("statement-store slot key must be 32 or 64 bytes, got {n}")),
+    }
+}
+
+/// Sign `payload` with the host identity (the same key as presence/statements) — for
+/// the stream manifest. Uses the manifest signing context, so
+/// [`unstation_core::manifest::SignedManifest::verify`] accepts it. `None` if no
+/// identity has been initialized.
+pub fn sign_with_identity(payload: &[u8]) -> Option<[u8; 64]> {
+    let secret = IDENTITY_SECRET.get()?;
+    let kp = keypair_from_secret(secret).ok()?;
+    Some(unstation_core::crypto::sign_sr25519(&kp, payload))
+}
+
+/// The host's public key (== its `PeerId`) — the manifest's `publisher` field and the
+/// trust anchor a viewer checks against. `None` until the identity is initialized.
+pub fn identity_public() -> Option<[u8; 32]> {
+    local_peer_id().map(|p| p.0)
+}
+
 /// Initialize the process-global statement store with the host's signing keypair
 /// (from `WalletManager::statement_store_keypair`). Call once at startup. The
 /// background subscription/poll thread starts immediately; `auto_provision`
 /// requests a metered allowance on testnet builds.
 pub fn init_statement_store(keypair: schnorrkel::Keypair) {
+    let _ = IDENTITY_SECRET.set(keypair.secret.to_bytes().to_vec());
     ss::init_with_keypair(None, keypair, true);
 }
 
@@ -40,21 +85,9 @@ pub fn init_statement_store(keypair: schnorrkel::Keypair) {
 /// the phone granted an on-chain statement-store allowance. Keeps `schnorrkel`
 /// version handling inside this crate so callers just pass bytes.
 pub fn init_statement_store_from_secret(secret: &[u8]) -> Result<(), String> {
-    let keypair = match secret.len() {
-        // Full Substrate sr25519 secret: 32-byte key ‖ 32-byte nonce.
-        64 => schnorrkel::SecretKey::from_bytes(secret)
-            .map_err(|e| format!("invalid 64-byte slot key: {e}"))?
-            .to_keypair(),
-        // Mini-secret (seed) — expand to a full keypair.
-        32 => {
-            let mut seed = [0u8; 32];
-            seed.copy_from_slice(secret);
-            schnorrkel::MiniSecretKey::from_bytes(&seed)
-                .map_err(|e| format!("invalid 32-byte slot seed: {e}"))?
-                .expand_to_keypair(schnorrkel::ExpansionMode::Ed25519)
-        }
-        n => return Err(format!("statement-store slot key must be 32 or 64 bytes, got {n}")),
-    };
+    let keypair = keypair_from_secret(secret)?;
+    // Retain the secret so we can sign the stream manifest with this same identity.
+    let _ = IDENTITY_SECRET.set(secret.to_vec());
     ss::init_with_keypair(None, keypair, false);
     Ok(())
 }

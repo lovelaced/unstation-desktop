@@ -4607,6 +4607,7 @@ dependencies = [
 name = "unstation-chain"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "log",
  "parity-scale-codec",
  "schnorrkel",

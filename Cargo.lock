@@ -1665,6 +1665,7 @@ name = "transport-libdc"
 version = "0.0.0"
 dependencies = [
  "datachannel",
+ "datachannel-sys",
  "log",
  "parity-scale-codec",
  "serde_json",
