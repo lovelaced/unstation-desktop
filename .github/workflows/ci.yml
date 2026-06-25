@@ -1,0 +1,112 @@
+name: CI
+
+# Fast, deterministic checks on every PR and push. The engine job needs no chain SDK
+# and is the one to mark as a required status check in branch protection. The SDK-backed
+# jobs (chain crates, desktop build-check) only run when the private SDK repo is
+# configured (vars.SDK_REPO + secrets.SDK_TOKEN) — they skip cleanly on forks.
+#
+# The heavy real-chain + real-WebRTC e2e suite lives in e2e.yml (nightly / on demand).
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  engine:
+    name: engine (deterministic, no SDK)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # Preinstalled on ubuntu-latest; explicit so the libdatachannel (datachannel-sys,
+      # vendored) C build is reproducible and self-hosted/container runners work too.
+      - name: Install native build deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake pkg-config libssl-dev clang
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The deterministic engine suite (unstation-core + transport-libdc + hls-server +
+      # node + segmenter). Real-WebRTC + real-media tests are #[ignore]d, so they don't
+      # run here — they need loopback UDP / ffmpeg and live in e2e.yml.
+      - name: Test (engine workspace)
+        run: cargo test --workspace
+      # Compile every benchmark target (no measurement) so benches can't bit-rot.
+      - name: Benches compile
+        run: cargo bench --workspace --no-run
+      # Advisory only: the tree has pre-existing lints + an intentional non-rustfmt style,
+      # so clippy surfaces new issues without blocking merges (tighten later if desired).
+      - name: Clippy (advisory)
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets
+
+  chain-crates:
+    name: chain + session crates (SDK)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Excluded from the engine workspace and depend on the private chain SDK by relative
+    # path; only run when the SDK repo is configured.
+    if: ${{ vars.SDK_REPO != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: unstation-desktop
+      - name: Check out the chain SDK as the expected sibling
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SDK_REPO }}
+          ref: ${{ vars.SDK_REF || 'main' }}
+          token: ${{ secrets.SDK_TOKEN || github.token }}
+          path: useragent-kit
+      - name: Install native build deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake pkg-config libssl-dev clang
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            unstation-desktop/crates/unstation-chain
+            unstation-desktop/crates/unstation-session
+      # Compiles the crates (incl. the #[ignore]d e2e tests, so they can't bit-rot) and
+      # runs only their non-ignored unit tests — no network, no chain.
+      - name: Test unstation-chain
+        working-directory: unstation-desktop/crates/unstation-chain
+        run: cargo test
+      - name: Test unstation-session
+        working-directory: unstation-desktop/crates/unstation-session
+        run: cargo test
+
+  desktop:
+    name: desktop backend (macOS build-check)
+    runs-on: macos-14
+    timeout-minutes: 45
+    if: ${{ vars.SDK_REPO != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: unstation-desktop
+      - name: Check out the chain SDK as the expected sibling
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SDK_REPO }}
+          ref: ${{ vars.SDK_REF || 'main' }}
+          token: ${{ secrets.SDK_TOKEN || github.token }}
+          path: useragent-kit
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: unstation-desktop/desktop/src-tauri
+      # Compile-check the Tauri backend (chain + session + desktop wiring) without the
+      # full frontend bundle — the heavy DMG build stays in release-macos.yml.
+      - name: cargo check (Tauri backend)
+        working-directory: unstation-desktop/desktop/src-tauri
+        run: cargo check
