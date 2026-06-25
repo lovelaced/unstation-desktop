@@ -90,15 +90,19 @@ impl Session {
     }
 
     /// Publisher: announce presence on our discovery shard, refreshed before TTL.
-    pub fn spawn_presence(&self, caps_upload_bps: u64, relay: bool) {
+    pub fn spawn_presence(&self, caps_upload_bps: u64, relay_opt_in: bool) {
         let signaling = self.signaling.clone();
         let me = self.my_peer;
         let manifest_cid = self.manifest_cid.clone();
+        let transport = self.transport.clone();
         tokio::spawn(async move {
             let mut tick = interval(PRESENCE_REFRESH);
             loop {
                 tick.tick().await;
                 let mc = manifest_cid.lock().unwrap().clone();
+                // Advertise relay-capability if explicitly opted in OR we've proven
+                // reachable (a peer connected to us inbound) — emergent volunteer relay.
+                let relay = relay_opt_in || transport.reachable();
                 let p = Presence { peer_id: me, caps_upload_bps, ttl_s: PRESENCE_TTL_S, manifest_cid: mc, relay };
                 if let Err(e) = signaling.publish_presence(p).await {
                     log::warn!("[session] publish_presence: {e}");

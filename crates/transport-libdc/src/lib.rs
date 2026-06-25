@@ -27,7 +27,7 @@ use datachannel::{
     SessionDescription,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use unstation_core::transport::EngineEvent;
@@ -161,6 +161,9 @@ struct Peer {
     /// order. Buffer them until `remote_set`, then flush.
     remote_set: bool,
     pending_cands: Vec<Vec<u8>>,
+    /// True if this connection was inbound (we `Accept`ed an offer). A successful
+    /// inbound connection proves we're reachable from the outside → relay-capable.
+    inbound: bool,
 }
 
 /// Handle to the WebRTC reactor. Cheap to clone.
@@ -169,6 +172,9 @@ pub struct LibDcTransport {
     cmd: UnboundedSender<Cmd>,
     /// Number of peers with both channels open (a real, live stat for the UI).
     connected: Arc<AtomicUsize>,
+    /// Set once any peer connects to us inbound — i.e. we're reachable from the
+    /// outside and can volunteer as a relay for NAT-restricted peers (M4).
+    reachable: Arc<AtomicBool>,
 }
 
 impl LibDcTransport {
@@ -190,6 +196,8 @@ impl LibDcTransport {
         let reactor_cmd = cmd_tx.clone();
         let connected = Arc::new(AtomicUsize::new(0));
         let reactor_connected = connected.clone();
+        let reachable = Arc::new(AtomicBool::new(false));
+        let reactor_reachable = reachable.clone();
         std::thread::Builder::new()
             .name("libdc-reactor".into())
             .spawn(move || {
@@ -207,17 +215,24 @@ impl LibDcTransport {
                         &signals,
                         &reactor_cmd,
                         &reactor_connected,
+                        &reactor_reachable,
                     );
                 }
             })
             .expect("spawn libdc reactor");
-        Self { cmd: cmd_tx, connected }
+        Self { cmd: cmd_tx, connected, reachable }
     }
 
     /// Number of peers currently connected (both channels open). A real,
     /// live mesh stat for the UI.
     pub fn peer_count(&self) -> usize {
         self.connected.load(Ordering::Relaxed)
+    }
+
+    /// Whether a peer has ever connected to us inbound — i.e. we're reachable from the
+    /// outside and can volunteer as a relay (M4). Emergent: no NAT-type probing needed.
+    pub fn reachable(&self) -> bool {
+        self.reachable.load(Ordering::Relaxed)
     }
 
     /// Initiator: open a connection to `peer` (creates the two data channels; the
@@ -334,6 +349,7 @@ fn handle_cmd(
     signals: &UnboundedSender<SignalOut>,
     reactor_cmd: &UnboundedSender<Cmd>,
     connected: &AtomicUsize,
+    reachable: &AtomicBool,
 ) {
     match cmd {
         Cmd::Dial(peer) => {
@@ -374,6 +390,7 @@ fn handle_cmd(
                     // Remote answer not applied yet; candidates wait for it.
                     remote_set: false,
                     pending_cands: orphan_cands.remove(&peer).unwrap_or_default(),
+                    inbound: false, // we initiated (Dial) — outbound.
                 },
             );
         }
@@ -410,6 +427,7 @@ fn handle_cmd(
                 announced: false,
                 remote_set,
                 pending_cands: orphan_cands.remove(&peer).unwrap_or_default(),
+                inbound: true, // a peer reached IN to us (Accept) — proves reachability.
             };
             // The offer is the remote description, so any buffered candidates apply now.
             if remote_set {
@@ -480,6 +498,11 @@ fn handle_cmd(
                 if p.ctrl_open && p.bulk_open && !p.announced {
                     p.announced = true;
                     connected.fetch_add(1, Ordering::Relaxed);
+                    // A completed inbound connection proves we're reachable from the
+                    // outside → we can volunteer as a relay (M4).
+                    if p.inbound {
+                        reachable.store(true, Ordering::Relaxed);
+                    }
                     let link: Arc<dyn Link> =
                         Arc::new(LibDcLink { remote: peer, cmd: reactor_cmd.clone() });
                     let _ = inbox.send(EngineEvent::PeerConnected { peer, link });

@@ -301,9 +301,9 @@ async fn start_watch(
 
     // Announce ourselves so other viewers can discover + reshare from us — the mesh
     // relays through volunteer peers, so a NAT-restricted node only needs to reach
-    // *someone*. relay = false: a plain viewer reshares but isn't a designated relay
-    // bridge (we don't yet detect its reachability). (Presence write moves off-chain at
-    // scale; see docs/SCALING_RESEARCH.)
+    // *someone*. relay_opt_in = false, but a viewer that proves reachable (a peer
+    // connects to it inbound) auto-promotes to advertising relay-capability — emergent,
+    // self-organizing volunteer relays. (Presence write moves off-chain at scale.)
     session.spawn_presence(20_000_000, false);
 
     // Discover the publisher and dial it, then keep the connection alive: if the dial
