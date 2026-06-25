@@ -99,6 +99,18 @@ pub fn init_statement_store_from_secret(secret: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Initialize the statement store from a BIP-39 mnemonic — the derived account must
+/// already carry a statement-store allowance on the target chain (e.g. a personhood-
+/// provisioned key). For the public-Paseo nightly smoke test.
+pub fn init_from_mnemonic(mnemonic: &str) -> Result<(), String> {
+    use useragent_native::wallet::WalletManager;
+    let mut wallet = WalletManager::new_ephemeral();
+    wallet.load_from_mnemonic(mnemonic).map_err(|e| format!("load mnemonic: {e:?}"))?;
+    let kp = wallet.statement_store_keypair().map_err(|e| format!("statement-store keypair: {e:?}"))?;
+    init_statement_store(kp);
+    Ok(())
+}
+
 /// Like [`init_statement_store`] but loads-or-generates a *persistent* signing key
 /// under `key_dir`, so the host keeps the same statement-store identity across
 /// launches (it stays signed in). `key_dir` should be a per-app, per-platform

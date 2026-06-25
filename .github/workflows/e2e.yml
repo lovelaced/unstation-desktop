@@ -1,0 +1,148 @@
+name: e2e (chain + real mesh)
+
+# Heavy, slow, network/UDP-dependent checks. NOT a required status check — flakiness
+# here must never block merges. Runs nightly, on demand, or on a PR labeled `e2e`.
+# (paseo-smoke runs only nightly/on-demand: it hits the real public chain.)
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # nightly 03:00 UTC (default branch only)
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  POLKADOT_SDK_REF: master # pin to a stable tag for reproducible caching
+
+jobs:
+  # ---- real WebRTC mesh over loopback (no chain, no SDK) ----
+  mesh-loopback:
+    name: real-WebRTC mesh (loopback)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'e2e') }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake pkg-config libssl-dev clang
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Real N-node mesh over loopback
+        # libjuice skips 127.0.0.1 unless told to bind it (RFC 8445).
+        env:
+          UNSTATION_BIND_ADDR: 127.0.0.1
+        run: cargo test -p transport-libdc --test mesh_loopback -- --ignored --nocapture
+
+  # ---- real statement-store e2e against a local --dev kitchensink node ----
+  chain-e2e:
+    name: local-chain e2e (statement store)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120 # the substrate-node build is ~1h on a cache miss
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'e2e') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: unstation-desktop
+      - name: Check out the chain SDK as the expected sibling
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SDK_REPO }}
+          ref: ${{ vars.SDK_REF || 'main' }}
+          token: ${{ secrets.SDK_TOKEN || github.token }}
+          path: useragent-kit
+      - name: Install native build deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake pkg-config libssl-dev clang
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: unstation-desktop/crates/unstation-chain
+      # The kitchensink substrate-node has no prebuilt binary, so cache the built binary
+      # itself (small) keyed on the SDK ref; the ~1h build runs only on a cache miss.
+      - name: Cache substrate-node binary
+        id: nodecache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/unstation/polkadot-sdk/target/release/substrate-node
+          key: substrate-node-${{ env.POLKADOT_SDK_REF }}-${{ runner.os }}
+      - name: Build substrate-node (cache miss only, ~1h)
+        if: steps.nodecache.outputs.cache-hit != 'true'
+        run: unstation-desktop/scripts/dev-chain.sh build
+      - name: Boot the dev node + wait for RPC
+        run: |
+          set -euo pipefail
+          unstation-desktop/scripts/dev-chain.sh run > node.log 2>&1 &
+          echo "NODE_PID=$!" >> "$GITHUB_ENV"
+          RPC_URL=http://127.0.0.1:9944 TIMEOUT=120 unstation-desktop/.github/scripts/wait-for-rpc.sh
+      - name: Run chain e2e (real statement store + Alice-provisioned allowance)
+        working-directory: unstation-desktop/crates/unstation-chain
+        env:
+          NODE_WS: ws://127.0.0.1:9944
+        run: cargo test --features testnet-provisioning --test chain_e2e -- --ignored --nocapture
+      - name: Stop the node
+        if: always()
+        run: kill "${NODE_PID}" 2>/dev/null || true
+      - name: Upload node log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev-node-log
+          path: node.log
+          if-no-files-found: ignore
+
+  # ---- public Paseo smoke: real production chain. Nightly / on-demand only. ----
+  paseo-smoke:
+    name: public Paseo smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && vars.SDK_REPO != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: unstation-desktop
+      - name: Check out the chain SDK as the expected sibling
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SDK_REPO }}
+          ref: ${{ vars.SDK_REF || 'main' }}
+          token: ${{ secrets.SDK_TOKEN || github.token }}
+          path: useragent-kit
+      - name: Install native build deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake pkg-config libssl-dev clang
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: unstation-desktop/crates/unstation-chain
+      - name: Smoke the real statement store (+ best-effort Bulletin)
+        working-directory: unstation-desktop/crates/unstation-chain
+        # UNSTATION_PASEO_MNEMONIC (a provisioned key) unlocks the WRITE path; without it
+        # the test still validates real read connectivity and skips writes.
+        env:
+          UNSTATION_PASEO_MNEMONIC: ${{ secrets.UNSTATION_PASEO_MNEMONIC }}
+        run: cargo test --test paseo_smoke -- --ignored --nocapture
+
+  # ---- benchmarks (report only; no hard regression gate yet) ----
+  bench:
+    name: benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'e2e') }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake pkg-config libssl-dev clang
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run criterion benches
+        run: cargo bench -p unstation-core | tee bench.txt
+      - name: Upload bench output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-output
+          path: bench.txt
+          if-no-files-found: ignore
