@@ -7,7 +7,9 @@
 use crate::types::{PeerId, StreamId};
 use crate::BoxFuture;
 use parity_scale_codec::{Decode, Encode};
+use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::sync::{Arc, Mutex};
 
 /// A presence announcement published to the (sharded) discovery topic.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +58,64 @@ impl From<PresenceRecord> for Presence {
             manifest_cid: r.manifest_cid,
             relay: r.relay,
         }
+    }
+}
+
+/// Shared, in-mesh presence directory (off-chain signaling, TECH_SPEC §7.3). Plain
+/// viewers no longer write presence to the chain every refresh (O(viewers) writes) —
+/// instead they gossip presence peer-to-peer into this book, so a node that has reached
+/// *one* peer learns the rest of the swarm without reading the chain. Only bootstrap
+/// **anchors** (publishers + reachable relay volunteers) still write to the chain, so a
+/// cold joiner can find an entry point. Cheap to clone; shared between the `MeshNode`
+/// (which gossips + ingests) and the `Session` (which dials from it).
+///
+/// Presence is a dial *hint*, not a trust claim — a forged record only costs a wasted
+/// dial, since the manifest + signed live-edge still gate what a peer is trusted to serve.
+#[derive(Clone, Default)]
+pub struct PresenceBook {
+    inner: Arc<Mutex<HashMap<PeerId, PresenceRecord>>>,
+}
+
+impl PresenceBook {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record/refresh one peer's presence (latest write wins).
+    pub fn insert(&self, rec: PresenceRecord) {
+        self.inner.lock().unwrap().insert(PeerId(rec.peer_id), rec);
+    }
+
+    /// Merge gossiped records, skipping our own entry (`me`).
+    pub fn merge(&self, recs: impl IntoIterator<Item = PresenceRecord>, me: &PeerId) {
+        let mut g = self.inner.lock().unwrap();
+        for rec in recs {
+            if PeerId(rec.peer_id) != *me {
+                g.insert(PeerId(rec.peer_id), rec);
+            }
+        }
+    }
+
+    /// Every known record (for the session's discovery merge).
+    pub fn snapshot(&self) -> Vec<PresenceRecord> {
+        self.inner.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Up to `max` records to gossip onward, relay-capable peers first so reachable
+    /// volunteers propagate fastest (bounds per-message size at scale).
+    pub fn sample(&self, max: usize) -> Vec<PresenceRecord> {
+        let mut v: Vec<PresenceRecord> = self.inner.lock().unwrap().values().cloned().collect();
+        v.sort_by_key(|r| !r.relay);
+        v.truncate(max);
+        v
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

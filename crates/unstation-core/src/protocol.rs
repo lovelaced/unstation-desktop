@@ -2,6 +2,7 @@
 //! the Polkadot stack. One reliable-ordered `ctrl` channel carries control
 //! messages; one unreliable-unordered `bulk` channel carries `SegmentData`.
 
+use crate::signaling::PresenceRecord;
 use crate::types::Seq;
 use parity_scale_codec::{Decode, Encode};
 
@@ -58,6 +59,11 @@ pub enum MeshMsg {
     /// so the edge propagates at mesh speed instead of via the ~2.8 s chain poll. The
     /// chain edge remains a coarse fallback for cold/partitioned viewers.
     EdgeAnnounce { seq: Seq, id: [u8; 32], sig: [u8; 64] },
+    /// In-mesh presence directory gossip (TECH_SPEC §7.3, off-chain signaling). Carries
+    /// known peers' presence so a node that reached one peer discovers the swarm without
+    /// reading the chain — replacing the per-viewer chain presence write. A dial hint
+    /// only (unsigned): trust is still gated by the manifest + signed live-edge.
+    PresenceGossip { records: Vec<PresenceRecord> },
 }
 
 #[cfg(test)]
@@ -104,6 +110,21 @@ mod tests {
     #[test]
     fn roundtrip_edge_announce() {
         let msg = MeshMsg::EdgeAnnounce { seq: 42, id: [3u8; 32], sig: [9u8; 64] };
+        let bytes = msg.encode();
+        assert_eq!(MeshMsg::decode(&mut &bytes[..]).unwrap(), msg);
+    }
+
+    #[test]
+    fn roundtrip_presence_gossip() {
+        let msg = MeshMsg::PresenceGossip {
+            records: vec![PresenceRecord {
+                peer_id: [5u8; 32],
+                caps_upload_bps: 20_000_000,
+                ttl_s: 30,
+                manifest_cid: Some("bafy-cid".into()),
+                relay: true,
+            }],
+        };
         let bytes = msg.encode();
         assert_eq!(MeshMsg::decode(&mut &bytes[..]).unwrap(), msg);
     }

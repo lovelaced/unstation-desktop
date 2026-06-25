@@ -26,7 +26,7 @@ use tokio::time::{interval, sleep};
 use transport_libdc::{LibDcTransport, SignalOut};
 use unstation_chain::ChainSignaling;
 use unstation_core::node::EdgeSigner;
-use unstation_core::signaling::{Presence, Signaling, SignalMsg};
+use unstation_core::signaling::{Presence, PresenceBook, PresenceRecord, Signaling, SignalMsg};
 use unstation_core::topic::discovery_topic;
 use unstation_core::transport::EngineEvent;
 use unstation_core::types::{PeerId, SegmentId, Seq, StreamId};
@@ -64,6 +64,10 @@ pub struct Session {
     /// manifest is published (after the encoder's init segment exists). Shared so the
     /// presence-refresh loop picks it up when [`Session::set_manifest_cid`] is called.
     manifest_cid: Arc<Mutex<Option<String>>>,
+    /// Off-chain presence directory (TECH_SPEC §7.3): shared with the `MeshNode`, which
+    /// gossips it in-mesh. The session refreshes our own entry + dials from it, so plain
+    /// viewers never write presence to the chain (only bootstrap anchors do).
+    book: PresenceBook,
 }
 
 impl Session {
@@ -101,7 +105,16 @@ impl Session {
             signaling,
             transport,
             manifest_cid: Arc::new(Mutex::new(None)),
+            book: PresenceBook::new(),
         })
+    }
+
+    /// The shared off-chain presence directory — hand this to the `MeshNode`
+    /// (via [`MeshNode::with_presence_book`]) so node + session see the same peers.
+    ///
+    /// [`MeshNode::with_presence_book`]: unstation_core::node::MeshNode::with_presence_book
+    pub fn presence_book(&self) -> PresenceBook {
+        self.book.clone()
     }
 
     /// Publisher: announce presence on our discovery shard, refreshed before TTL.
@@ -110,6 +123,7 @@ impl Session {
         let me = self.my_peer;
         let manifest_cid = self.manifest_cid.clone();
         let transport = self.transport.clone();
+        let book = self.book.clone();
         tokio::spawn(async move {
             let mut tick = interval(PRESENCE_REFRESH);
             loop {
@@ -119,8 +133,16 @@ impl Session {
                 // reachable (a peer connected to us inbound) — emergent volunteer relay.
                 let relay = relay_opt_in || transport.reachable();
                 let p = Presence { peer_id: me, caps_upload_bps, ttl_s: PRESENCE_TTL_S, manifest_cid: mc, relay };
-                if let Err(e) = signaling.publish_presence(p).await {
-                    log::warn!("[session] publish_presence: {e}");
+                // Off-chain presence (TECH_SPEC §7.3): always refresh our own entry in the
+                // in-mesh book so neighbors gossip us onward. Only ANCHORS (publishers +
+                // reachable relay volunteers) ALSO write to the chain — the bootstrap set a
+                // cold joiner reads. Plain viewers skip the chain write, taking presence
+                // from O(viewers) writes down to O(anchors).
+                book.insert(PresenceRecord::from(&p));
+                if relay {
+                    if let Err(e) = signaling.publish_presence(p).await {
+                        log::warn!("[session] publish_presence: {e}");
+                    }
                 }
             }
         });
@@ -191,6 +213,8 @@ impl Session {
     pub async fn discover_peers(&self, max: usize) -> Vec<Presence> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
+        // Chain anchors (publishers + relay volunteers) — the bootstrap entry points a
+        // cold joiner needs before it has reached the mesh.
         for shard in 0..self.n_shards {
             let topic = discovery_topic(&self.stream, shard);
             if let Ok(list) = self.signaling.read_presence(topic, 32).await {
@@ -199,6 +223,14 @@ impl Session {
                         out.push(p);
                     }
                 }
+            }
+        }
+        // In-mesh presence (TECH_SPEC §7.3): peers learned via gossip once we've reached
+        // the swarm — these incur NO chain read, and most plain viewers appear ONLY here.
+        for rec in self.book.snapshot() {
+            let p: Presence = rec.into();
+            if p.peer_id != self.my_peer && seen.insert(p.peer_id) {
+                out.push(p);
             }
         }
         // Relay-capable volunteers first: a NAT-restricted node should try the reliable

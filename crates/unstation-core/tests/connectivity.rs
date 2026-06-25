@@ -18,7 +18,7 @@ use unstation_core::crypto;
 use unstation_core::media::MediaSink;
 use unstation_core::node::{EdgeSigner, MeshNode};
 use unstation_core::protocol::MeshMsg;
-use unstation_core::signaling::SignalMsg;
+use unstation_core::signaling::{PresenceBook, PresenceRecord, SignalMsg};
 use unstation_core::statement_store_mem::{MemStatementStore, StatementSignaling};
 use unstation_core::transport::{Channel, EngineEvent, Link};
 use unstation_core::transport_mem::wire;
@@ -519,6 +519,55 @@ async fn forged_edge_gossip_is_rejected() {
         .expect("viewer loop should stop");
     assert_eq!(stats.delivered, 0, "a forged edge must not let any segment be accepted");
     assert_eq!(rec.count(), 0, "nothing reached the player");
+}
+
+#[tokio::test]
+async fn presence_gossip_populates_the_book_and_is_rebroadcast() {
+    // Off-chain presence (#17 piece 2): a node learns a peer purely from a gossiped
+    // PresenceGossip into the shared book — no chain read — and rebroadcasts its book to
+    // its own peers, so discovery scales without a per-viewer statement-store write.
+    let book = PresenceBook::new();
+    let me = PeerId::from_u64(100);
+    let peerx = PeerId::from_u64(5);
+
+    let (tx, rx) = mpsc::unbounded_channel::<EngineEvent>();
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let link = Arc::new(RecordingLink { remote: peerx, sent: sent.clone() });
+    tx.send(EngineEvent::PeerConnected { peer: peerx, link }).unwrap();
+
+    // A connected peer gossips presence for a (relay-capable) peer X to us.
+    let rec = PresenceRecord {
+        peer_id: peerx.0,
+        caps_upload_bps: 9_000_000,
+        ttl_s: 30,
+        manifest_cid: None,
+        relay: true,
+    };
+    let gossip = MeshMsg::PresenceGossip { records: vec![rec] }.encode();
+    tx.send(EngineEvent::Inbound { peer: peerx, channel: Channel::Ctrl, bytes: gossip }).unwrap();
+
+    let node = MeshNode::new_viewer(me, cfg(Role::Viewer), 16_000, Arc::new(NullSink), HashMap::new(), 0)
+        .with_presence_book(book.clone());
+    // A few ticks is enough — the first presence-gossip fires as soon as the book is
+    // non-empty (we don't wait a full interval).
+    let tx_stop = tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let _ = tx_stop.send(EngineEvent::Stop);
+    });
+    let _ = tokio::time::timeout(Duration::from_secs(5), node.run(rx, Duration::from_millis(10), None))
+        .await
+        .expect("node loop should stop");
+
+    assert!(
+        book.snapshot().iter().any(|r| r.peer_id == peerx.0 && r.relay),
+        "peer X was learned via gossip, with no chain read",
+    );
+    let rebroadcast = sent.lock().unwrap().iter().any(|(ch, b)| {
+        *ch == Channel::Ctrl
+            && matches!(MeshMsg::decode(&mut &b[..]), Ok(MeshMsg::PresenceGossip { .. }))
+    });
+    assert!(rebroadcast, "node rebroadcasts its presence book to peers");
 }
 
 // ---- signaling / discovery layer ----

@@ -17,6 +17,7 @@ use crate::peer::PeerState;
 use crate::picker::Source;
 use crate::protocol::{Caps, MeshMsg};
 use crate::reassembly::Reassembler;
+use crate::signaling::PresenceBook;
 use crate::transport::{Channel, EngineEvent, Link};
 use crate::types::{PeerId, SegmentId, Seq};
 use crate::{crypto, engine::MeshEngine};
@@ -58,6 +59,11 @@ const MAX_PENDING_VERIFY_BYTES: u64 = 8 * 1024 * 1024;
 /// gossiped `EdgeAnnounce` is applied + re-broadcast exactly once (loop/storm suppression)
 /// while still tracking the live window. Pruned below `head - this` each tick.
 const EDGE_SEEN_KEEP: Seq = 1024;
+/// Presence-gossip cadence + per-message cap (TECH_SPEC §7.3, off-chain signaling): how
+/// often we share our known-peer directory, and how many records we put in one message
+/// (bounds bandwidth — tiny vs video, but capped anyway).
+const PRESENCE_GOSSIP_INTERVAL_MS: u64 = 3_000;
+const PRESENCE_GOSSIP_MAX: usize = 32;
 /// Domain tag prefixed to the bytes a publisher signs for a live-edge gossip. Both
 /// `MANIFEST_CONTEXT` (the sr25519 signing context) and this tag separate an edge
 /// signature from a manifest signature, so neither can be replayed as the other.
@@ -168,6 +174,11 @@ pub struct MeshNode {
     edge_signer: Option<Arc<dyn EdgeSigner>>,
     publisher_key: Option<[u8; 32]>,
     edge_seen: HashSet<Seq>,
+    /// Off-chain presence directory (TECH_SPEC §7.3), shared with the session: the node
+    /// periodically gossips a sample of it to peers and merges what it receives, so the
+    /// session can dial in-mesh-discovered peers without a per-viewer chain write.
+    presence_book: Option<PresenceBook>,
+    last_presence_gossip_ms: u64,
     known_peers: HashSet<PeerId>,
     /// Push-pull (TECH_SPEC §6.4): peers that subscribed to our live edge. We PUSH each
     /// newly-available segment to them (subject to choke + budget) instead of waiting for
@@ -289,6 +300,8 @@ impl MeshNode {
             edge_signer: None,
             publisher_key: None,
             edge_seen: HashSet::new(),
+            presence_book: None,
+            last_presence_gossip_ms: 0,
             known_peers: HashSet::new(),
             subscribers: HashSet::new(),
             pending_verify: HashMap::new(),
@@ -325,6 +338,14 @@ impl MeshNode {
     /// trust anchor used for the signed manifest). Without it, gossiped edges are ignored.
     pub fn with_publisher_key(mut self, key: [u8; 32]) -> Self {
         self.publisher_key = Some(key);
+        self
+    }
+
+    /// Share the off-chain presence directory (TECH_SPEC §7.3) with the session: the node
+    /// gossips a sample of it to peers + merges what it receives, so the session can dial
+    /// in-mesh-discovered peers instead of every viewer writing presence to the chain.
+    pub fn with_presence_book(mut self, book: PresenceBook) -> Self {
+        self.presence_book = Some(book);
         self
     }
 
@@ -586,6 +607,26 @@ impl MeshNode {
             }
         }
 
+        // Off-chain presence gossip (TECH_SPEC §7.3): share our known-peer directory so
+        // neighbors discover the swarm without a chain read/write. Fires promptly once we
+        // have peers + something to share (so a fresh link gets the book right away), then
+        // every interval; the slot is only consumed when we actually send.
+        if let Some(book) = self.presence_book.clone() {
+            let due = self.last_presence_gossip_ms == 0
+                || self.now_ms.saturating_sub(self.last_presence_gossip_ms)
+                    >= PRESENCE_GOSSIP_INTERVAL_MS;
+            if !self.links.is_empty() && due {
+                let records = book.sample(PRESENCE_GOSSIP_MAX);
+                if !records.is_empty() {
+                    self.last_presence_gossip_ms = self.now_ms;
+                    let msg = MeshMsg::PresenceGossip { records }.encode();
+                    for link in self.links.values() {
+                        link.send(Channel::Ctrl, msg.clone());
+                    }
+                }
+            }
+        }
+
         // Upload-slot fairness: re-evaluate which peers we serve (viewers ration; the
         // first eval fires as soon as we have peers, then every CHOKE_INTERVAL_MS).
         if !self.eng.peers.is_empty()
@@ -676,6 +717,20 @@ impl MeshNode {
                     if pid != self.me {
                         self.known_peers.insert(pid);
                     }
+                }
+            }
+            MeshMsg::PresenceGossip { records } => {
+                // Off-chain presence directory (TECH_SPEC §7.3): merge what a peer knows
+                // into the shared book (the session dials from it) and count them as
+                // discovered. Zero statement-store writes — pure in-mesh discovery.
+                for r in &records {
+                    let pid = PeerId(r.peer_id);
+                    if pid != self.me {
+                        self.known_peers.insert(pid);
+                    }
+                }
+                if let Some(book) = &self.presence_book {
+                    book.merge(records, &self.me);
                 }
             }
             MeshMsg::Pong { t_send_ms, .. } => {
