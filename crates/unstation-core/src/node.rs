@@ -78,6 +78,26 @@ fn select_unchokes(
     set
 }
 
+/// Manually SCALE-frame a `MeshMsg::SegmentData` chunk so the payload is copied ONCE
+/// (straight into the output buffer) instead of twice (`chunk.to_vec()` then
+/// `encode()`). The `frame_segment_data_matches_derive` test pins this byte-for-byte
+/// against the derived encoding, so a future change to the `MeshMsg` layout can't
+/// silently drift the hand-rolled framing.
+fn frame_segment_data(seq: Seq, total_len: u32, offset: u32, chunk: &[u8]) -> Vec<u8> {
+    use parity_scale_codec::Compact;
+    /// `MeshMsg` variant index of `SegmentData` (Hello, BufferMap, Want, Have, SegmentData, …).
+    const SEGMENT_DATA_TAG: u8 = 4;
+    let mut out = Vec::with_capacity(1 + 8 + 2 + 4 + 4 + 5 + chunk.len());
+    out.push(SEGMENT_DATA_TAG);
+    seq.encode_to(&mut out);
+    0u16.encode_to(&mut out); // track_id
+    total_len.encode_to(&mut out);
+    offset.encode_to(&mut out);
+    Compact(chunk.len() as u32).encode_to(&mut out);
+    out.extend_from_slice(chunk);
+    out
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct NodeStats {
     pub delivered: usize,
@@ -545,14 +565,10 @@ impl MeshNode {
         let total = bytes.len() as u32;
         let mut offset = 0u32;
         for chunk in bytes.chunks(CHUNK) {
-            let msg = MeshMsg::SegmentData {
-                seq,
-                track_id: 0,
-                total_len: total,
-                offset,
-                bytes: chunk.to_vec(),
-            };
-            link.send(Channel::Bulk, msg.encode());
+            // Frame manually so the chunk lands in the output buffer ONCE. The previous
+            // `SegmentData { bytes: chunk.to_vec() }.encode()` copied every byte twice
+            // (into the Vec, then into the encode buffer) on the busiest path — serving.
+            link.send(Channel::Bulk, frame_segment_data(seq, total, offset, chunk));
             offset += chunk.len() as u32;
         }
     }
@@ -649,5 +665,29 @@ mod tests {
     fn fewer_peers_than_slots_unchokes_all() {
         let peers = vec![(pid(1), 1.0, 10.0), (pid(2), 2.0, 10.0)];
         assert_eq!(select_unchokes(&peers, Role::Viewer, 4, 0).len(), 2);
+    }
+
+    #[test]
+    fn frame_segment_data_matches_derive() {
+        // The one-copy manual framing must be byte-identical to the derived encoding,
+        // and decode back to the same message — this guards the hardcoded variant tag.
+        let chunk = vec![0xABu8; 1234];
+        let manual = frame_segment_data(7, 9999, 16, &chunk);
+        let derived = MeshMsg::SegmentData {
+            seq: 7,
+            track_id: 0,
+            total_len: 9999,
+            offset: 16,
+            bytes: chunk.clone(),
+        }
+        .encode();
+        assert_eq!(manual, derived, "manual framing must byte-match the derive");
+        match MeshMsg::decode(&mut &manual[..]).unwrap() {
+            MeshMsg::SegmentData { seq, track_id, total_len, offset, bytes } => {
+                assert_eq!((seq, track_id, total_len, offset), (7, 0, 9999, 16));
+                assert_eq!(bytes, chunk);
+            }
+            other => panic!("expected SegmentData, got {other:?}"),
+        }
     }
 }
