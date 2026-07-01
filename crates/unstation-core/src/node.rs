@@ -11,7 +11,7 @@
 //! (live-edge propagation is D3). Verification is always against it.
 
 use crate::buffermap::BufferMap;
-use crate::config::{MeshConfig, Role};
+use crate::config::{MeshConfig, Mode, Role};
 use crate::media::MediaSink;
 use crate::peer::PeerState;
 use crate::picker::Source;
@@ -68,6 +68,24 @@ const PRESENCE_GOSSIP_MAX: usize = 32;
 /// `MANIFEST_CONTEXT` (the sr25519 signing context) and this tag separate an edge
 /// signature from a manifest signature, so neither can be replayed as the other.
 const EDGE_SIGN_TAG: &[u8] = b"unstation-edge-v1";
+/// Hostile-input bounds. Everything a peer can send that allocates on our side is
+/// capped: reassembly (entries + total buffered bytes + a completion TTL), gossip
+/// batch sizes, bitfield size, and the known-peer set. Violating messages are dropped.
+const MAX_REASM: usize = 64;
+const MAX_REASM_BYTES: u64 = 32 * 1024 * 1024;
+/// Evict a reassembler that never completed within this window — a *pushed* segment
+/// with a lost chunk has no `pending` entry, so the pending sweep can't reclaim it.
+const REASM_TTL_MS: u64 = 2 * PENDING_TIMEOUT_MS;
+/// How far ahead of our known head an unsolicited push is admitted (push-pull runs a
+/// hop or two ahead of the verified edge; anything further out is a spray).
+const PUSH_AHEAD: Seq = 16;
+const MAX_WANT_SEQS: usize = 32;
+const MAX_GOSSIP_PEERS: usize = 256;
+const MAX_GOSSIP_RECORDS: usize = 64;
+/// 8 KiB of bitfield = a 64k-segment window — far beyond any honest live window.
+const MAX_BITFIELD_BYTES: usize = 8 * 1024;
+/// `known_peers` is a stat + gossip seed, not a routing table — cap it.
+const KNOWN_PEERS_MAX: usize = 4096;
 
 /// Builds the exact bytes a publisher signs (and a viewer verifies) for one live-edge
 /// entry: tag ‖ stream ‖ seq ‖ content-id. A free fn so the sign + verify paths can't
@@ -159,12 +177,24 @@ impl MediaSink for DiscardSink {
     }
 }
 
+/// One in-progress reassembly, keyed by `(sender, seq)` — per-sender so a hostile
+/// peer's chunks can only ever poison a segment *it* is delivering, never a slot an
+/// honest peer is filling (cross-peer injection would hash-fail the honest peer's
+/// bytes and decay the wrong reputation).
+struct ReasmEntry {
+    r: Reassembler,
+    /// `now_ms` when the first chunk arrived — for the completion TTL sweep.
+    created_ms: u64,
+}
+
 pub struct MeshNode {
     me: PeerId,
     eng: MeshEngine,
     sink: Arc<dyn MediaSink>,
     links: HashMap<PeerId, Arc<dyn Link>>,
-    reasm: HashMap<Seq, Reassembler>,
+    reasm: HashMap<(PeerId, Seq), ReasmEntry>,
+    /// Total bytes buffered across `reasm` — bounded by [`MAX_REASM_BYTES`].
+    reasm_bytes: u64,
     segment_ids: HashMap<Seq, SegmentId>,
     /// Off-chain signaling (TECH_SPEC §6.4). `stream_id` binds edge signatures to this
     /// stream; `edge_signer` (publisher only) signs each new edge; `publisher_key` (viewer
@@ -203,6 +233,13 @@ pub struct MeshNode {
     /// node never uploads faster than its declared budget. 0 budget = unmetered.
     upload_tokens: f64,
     last_token_ms: u64,
+    /// Monotonic count of segments this node has obtained (produced or delivered).
+    /// The local buffer map's `count()` no longer works for this: a live viewer
+    /// prunes its window as playback advances, so that count *shrinks*.
+    delivered_total: usize,
+    /// Floor of the last live-window prune, so the per-tick prune only does work
+    /// (store + id map + buffer map) when the play head actually advanced.
+    last_prune_floor: Seq,
     stats: NodeStats,
 }
 
@@ -289,12 +326,14 @@ impl MeshNode {
         } else {
             0.0
         };
+        let preloaded = eng.local.count(); // a genesis-seed publisher starts full
         Self {
             me,
             eng,
             sink,
             links: HashMap::new(),
             reasm: HashMap::new(),
+            reasm_bytes: 0,
             segment_ids,
             stream_id: [0u8; 32],
             edge_signer: None,
@@ -316,6 +355,8 @@ impl MeshNode {
             optimistic_rr: 0,
             upload_tokens,
             last_token_ms: 0,
+            delivered_total: preloaded,
+            last_prune_floor: 0,
             stats: NodeStats::default(),
         }
     }
@@ -413,12 +454,13 @@ impl MeshNode {
                 }
             }
             if let Some(target) = stop_at_count {
-                if self.eng.local.count() >= target {
+                // Monotonic: a live viewer prunes its window, so `local.count()` shrinks.
+                if self.delivered_total >= target {
                     break;
                 }
             }
         }
-        self.stats.delivered = self.eng.local.count();
+        self.stats.delivered = self.delivered_total;
         self.stats.known_peers = self.known_peers.len();
         self.stats.peers = self.eng.peers.len();
         self.stats
@@ -442,8 +484,9 @@ impl MeshNode {
                 self.links.remove(&peer);
                 self.eng.peers.remove(&peer);
                 self.subscribers.remove(&peer);
-                // Release in-flight requests to this peer (and any partial reassembly)
-                // so the picker re-requests them from someone else next tick.
+                // Release in-flight requests to this peer, and drop ALL of its partial
+                // reassemblies (pulled AND pushed) so the picker re-requests elsewhere
+                // and the byte budget is returned.
                 let dropped: Vec<Seq> = self
                     .pending
                     .iter()
@@ -452,13 +495,20 @@ impl MeshNode {
                     .collect();
                 for seq in dropped {
                     self.pending.remove(&seq);
-                    self.reasm.remove(&seq);
+                }
+                let keys: Vec<(PeerId, Seq)> =
+                    self.reasm.keys().filter(|(p, _)| *p == peer).copied().collect();
+                for k in keys {
+                    self.remove_reasm(&k);
                 }
             }
             EngineEvent::Inbound { peer, channel, bytes } => self.on_inbound(peer, channel, &bytes),
             EngineEvent::Produced { seq, id, bytes } => {
                 // Publisher pipeline produced a segment — store it and start serving.
                 self.eng.store.insert(seq, id, bytes);
+                if !self.eng.local.has(seq) {
+                    self.delivered_total += 1;
+                }
                 self.eng.local.set(seq);
                 self.segment_ids.insert(seq, id);
                 self.eng.head_seq = self.eng.head_seq.max(seq);
@@ -529,6 +579,23 @@ impl MeshNode {
             self.eng.play_seq = head;
         }
 
+        // Live viewers slide their retention window with playback: prune the store
+        // (memory + disk spill), the seq→id map, and the local buffer map below
+        // `play − window`. Without this a multi-hour stream grows all three without
+        // bound — and re-advertises an ever-longer bitfield to every peer. Publishers
+        // keep everything (they're the origin); a seed's play head stays 0, so its
+        // cache is bounded by the store's own capacity instead.
+        if matches!(self.eng.cfg.mode, Mode::Live) && !matches!(self.eng.cfg.role, Role::Publisher)
+        {
+            let floor = self.eng.play_seq.saturating_sub(self.eng.cfg.window as Seq);
+            if floor > self.last_prune_floor {
+                self.last_prune_floor = floor;
+                self.eng.store.prune_below(floor);
+                self.eng.local.prune_below(floor);
+                self.segment_ids.retain(|s, _| *s >= floor);
+            }
+        }
+
         // Refill the upload token bucket at the budget rate (capped at the burst).
         if self.eng.cfg.upload_budget_bps > 0 {
             let dt = self.now_ms.saturating_sub(self.last_token_ms);
@@ -549,8 +616,24 @@ impl MeshNode {
             .map(|(s, _)| *s)
             .collect();
         for seq in stale {
-            self.clear_pending(seq);
-            self.reasm.remove(&seq); // re-request starts fresh
+            if let Some((pid, _)) = self.clear_pending(seq) {
+                self.remove_reasm(&(pid, seq)); // re-request starts fresh
+            }
+        }
+
+        // Evict reassemblies that never completed within their TTL. The pending sweep
+        // above can't reach these: a *pushed* segment has no `pending` entry, so a
+        // single lost chunk would otherwise pin its buffered bytes forever.
+        if !self.reasm.is_empty() {
+            let expired: Vec<(PeerId, Seq)> = self
+                .reasm
+                .iter()
+                .filter(|(_, e)| now.saturating_sub(e.created_ms) >= REASM_TTL_MS)
+                .map(|(k, _)| *k)
+                .collect();
+            for k in expired {
+                self.remove_reasm(&k);
+            }
         }
 
         // Evict push-ahead buffers whose seq slid below the play head: their id never
@@ -666,11 +749,18 @@ impl MeshNode {
         };
         match msg {
             MeshMsg::Hello { base_seq, bitfield, .. } | MeshMsg::BufferMap { base_seq, bitfield } => {
+                if bitfield.len() > MAX_BITFIELD_BYTES {
+                    return; // no honest live window is this wide — hostile allocation bait
+                }
                 let entry = self.eng.peers.entry(peer).or_insert_with(|| PeerState::new(peer));
                 entry.buffer = BufferMap::from_bytes(base_seq, &bitfield);
                 log::debug!("[mesh] ← Hello/BufferMap from {:?}: base_seq={base_seq}, {}B bitfield", peer, bitfield.len());
             }
             MeshMsg::Want { segment_seqs, .. } => {
+                // Batch cap: one Want never asks for more than the picker would issue.
+                if segment_seqs.len() > MAX_WANT_SEQS {
+                    return;
+                }
                 // Upload fairness: serve only peers we've unchoked (publishers/seeds
                 // never choke, so they always serve).
                 if self.eng.peers.get(&peer).map(|p| p.choked).unwrap_or(false) {
@@ -710,9 +800,12 @@ impl MeshNode {
                 // In-mesh peer discovery after bootstrap (TECH_SPEC §7.3): learned
                 // over the data channel, never the statement store. The node holds
                 // no signaling handle, so this provably incurs zero store writes.
+                if peers.len() > MAX_GOSSIP_PEERS {
+                    return;
+                }
                 for p in peers {
                     let pid = PeerId(p);
-                    if pid != self.me {
+                    if pid != self.me && self.known_peers.len() < KNOWN_PEERS_MAX {
                         self.known_peers.insert(pid);
                     }
                 }
@@ -721,9 +814,12 @@ impl MeshNode {
                 // Off-chain presence directory (TECH_SPEC §7.3): merge what a peer knows
                 // into the shared book (the session dials from it) and count them as
                 // discovered. Zero statement-store writes — pure in-mesh discovery.
+                if records.len() > MAX_GOSSIP_RECORDS {
+                    return;
+                }
                 for r in &records {
                     let pid = PeerId(r.peer_id);
-                    if pid != self.me {
+                    if pid != self.me && self.known_peers.len() < KNOWN_PEERS_MAX {
                         self.known_peers.insert(pid);
                     }
                 }
@@ -809,15 +905,40 @@ impl MeshNode {
         if total_len == 0 || total_len > MAX_SEGMENT_BYTES {
             return;
         }
+        // Admission gate: buffer only bytes we asked THIS peer for, or an in-window
+        // unsolicited push (push-pull runs a little ahead of the verified edge). An
+        // out-of-window spray for segments nobody asked about is dropped before it
+        // can allocate anything.
+        let asked_this_peer = self.pending.get(&seq).map(|(p, _)| *p == peer).unwrap_or(false);
+        let in_push_window =
+            seq >= self.eng.play_seq && seq <= self.eng.head_seq.saturating_add(PUSH_AHEAD);
+        if !asked_this_peer && !in_push_window {
+            return;
+        }
+        // Global caps. Refusing a NEW reassembly (rather than evicting an old one) means
+        // a flood can never displace a slot attached to a request we actually made.
+        let key = (peer, seq);
+        if !self.reasm.contains_key(&key)
+            && (self.reasm.len() >= MAX_REASM
+                || self.reasm_bytes.saturating_add(total_len as u64) > MAX_REASM_BYTES)
+        {
+            return;
+        }
+        let now = self.now_ms;
         let complete = {
-            let r = self.reasm.entry(seq).or_insert_with(|| Reassembler::new(total_len));
-            r.add(offset, bytes);
-            r.is_complete()
+            let e = self
+                .reasm
+                .entry(key)
+                .or_insert_with(|| ReasmEntry { r: Reassembler::new(total_len), created_ms: now });
+            self.reasm_bytes += e.r.add(offset, bytes) as u64;
+            e.r.is_complete()
         };
         if !complete {
             return;
         }
-        let Some(r) = self.reasm.remove(&seq) else { return };
+        let Some(entry) = self.reasm.remove(&key) else { return };
+        self.reasm_bytes = self.reasm_bytes.saturating_sub(entry.r.buffered_bytes());
+        let r = entry.r;
         match self.segment_ids.get(&seq).copied() {
             // We already know the authenticated id → verify against it now.
             Some(id) => match r.finish_verified(&id) {
@@ -861,6 +982,15 @@ impl MeshNode {
         entry
     }
 
+    /// Drop one in-progress reassembly and return its buffered bytes to the global
+    /// budget. Every `reasm` removal must go through here, or `reasm_bytes` drifts
+    /// and the [`MAX_REASM_BYTES`] cap starts refusing honest deliveries.
+    fn remove_reasm(&mut self, key: &(PeerId, Seq)) {
+        if let Some(e) = self.reasm.remove(key) {
+            self.reasm_bytes = self.reasm_bytes.saturating_sub(e.r.buffered_bytes());
+        }
+    }
+
     /// Store a verified segment, feed the player, update the sender's throughput, and
     /// (push-pull) reshare it to our own subscribers so the live edge propagates
     /// hop-by-hop without each downstream viewer paying a discovery + `Want` round-trip.
@@ -868,6 +998,9 @@ impl MeshNode {
         let n = b.len();
         self.stats.peer_bytes += n as u64;
         self.eng.store.insert(seq, id, b.clone());
+        if !self.eng.local.has(seq) {
+            self.delivered_total += 1;
+        }
         self.eng.local.set(seq);
         log::info!("[seg] seq={seq} verified → sink ({n} B)");
         self.sink.push_segment(seq, b);
@@ -1005,6 +1138,123 @@ mod tests {
     fn fewer_peers_than_slots_unchokes_all() {
         let peers = vec![(pid(1), 1.0, 10.0), (pid(2), 2.0, 10.0)];
         assert_eq!(select_unchokes(&peers, Role::Viewer, 4, 0).len(), 2);
+    }
+
+    /// A sink whose play head the test controls (for window-prune behavior).
+    struct FixedHeadSink(u64);
+    impl MediaSink for FixedHeadSink {
+        fn push_init(&self, _: Bytes) {}
+        fn push_segment(&self, _: u64, _: Bytes) {}
+        fn on_play_head(&self) -> u64 {
+            self.0
+        }
+    }
+
+    fn viewer_with_ids(ids: HashMap<Seq, SegmentId>, head: Seq) -> MeshNode {
+        MeshNode::new_viewer(
+            pid(9),
+            MeshConfig::default(),
+            100,
+            Arc::new(DiscardSink),
+            ids,
+            head,
+        )
+    }
+
+    #[test]
+    fn injected_chunk_cannot_poison_an_honest_peers_delivery() {
+        // We asked A for seq 5; hostile M injects a garbage chunk for the same seq.
+        // Reassembly is keyed by (sender, seq), so M's bytes land in M's own slot: A's
+        // delivery still verifies, and A's reputation is untouched. (Under the old
+        // seq-only keying, the combined buffer hash-failed and *A* took the blame.)
+        let a = pid(1);
+        let m = pid(6);
+        let payload: Vec<u8> = (0..100u32).map(|i| i as u8).collect();
+        let id = crypto::segment_id(&payload);
+        let mut node = viewer_with_ids(HashMap::from([(5u64, id)]), 5);
+        for p in [a, m] {
+            node.eng.peers.insert(p, PeerState::new(p));
+        }
+        node.pending.insert(5, (a, 0));
+
+        node.on_segment_data(m, 5, 100, 0, &[0xFFu8; 50]); // M's injection
+        node.on_segment_data(a, 5, 100, 0, &payload[..50]);
+        node.on_segment_data(a, 5, 100, 50, &payload[50..]);
+
+        assert!(node.eng.local.has(5), "honest delivery survives the injection");
+        assert_eq!(node.eng.peers[&a].reputation, 1.0, "honest peer keeps its reputation");
+        assert_eq!(node.reasm.len(), 1, "only M's own partial slot remains");
+        assert_eq!(node.reasm_bytes, 50, "byte budget tracks M's leftover chunk");
+    }
+
+    #[test]
+    fn out_of_window_spray_is_dropped_before_allocating() {
+        let mut node = viewer_with_ids(HashMap::new(), 5);
+        let p = pid(1);
+        node.eng.peers.insert(p, PeerState::new(p));
+        // Nothing pending and seq 1000 is far beyond head+PUSH_AHEAD.
+        node.on_segment_data(p, 1000, 100_000, 0, &[0u8; 1000]);
+        assert!(node.reasm.is_empty(), "no reassembler for an unrequested far seq");
+        assert_eq!(node.reasm_bytes, 0);
+    }
+
+    #[test]
+    fn reassembly_entry_cap_holds_under_a_multi_peer_flood() {
+        let mut node = viewer_with_ids(HashMap::new(), 5);
+        // 70 distinct peers each push a partial chunk for an in-window seq.
+        for i in 0..70u64 {
+            let p = pid(100 + i);
+            node.eng.peers.insert(p, PeerState::new(p));
+            node.on_segment_data(p, 6, 100_000, 0, &[1u8; 100]);
+        }
+        assert_eq!(node.reasm.len(), MAX_REASM, "entry cap enforced");
+        assert_eq!(node.reasm_bytes, (MAX_REASM * 100) as u64);
+    }
+
+    #[test]
+    fn incomplete_push_is_reclaimed_by_the_ttl_sweep() {
+        // A pushed segment with a lost chunk has no `pending` entry — only the TTL
+        // sweep can reclaim its buffered bytes.
+        let mut node = viewer_with_ids(HashMap::new(), 5);
+        let p = pid(1);
+        node.eng.peers.insert(p, PeerState::new(p));
+        node.on_segment_data(p, 6, 100_000, 0, &[1u8; 100]);
+        assert_eq!(node.reasm.len(), 1);
+
+        node.now_ms += REASM_TTL_MS;
+        node.on_tick();
+        assert!(node.reasm.is_empty(), "TTL sweep evicted the stalled push");
+        assert_eq!(node.reasm_bytes, 0, "its bytes returned to the budget");
+    }
+
+    #[test]
+    fn live_viewer_prunes_store_ids_and_buffer_map_behind_the_play_head() {
+        let ids: HashMap<Seq, SegmentId> = (0..50u64)
+            .map(|s| (s, crypto::segment_id(&[s as u8; 8])))
+            .collect();
+        let mut node = MeshNode::new_viewer(
+            pid(9),
+            MeshConfig::default(), // window 16
+            100,
+            Arc::new(FixedHeadSink(40)),
+            ids,
+            50,
+        );
+        for s in 0..40u64 {
+            let bytes = Bytes::from(vec![s as u8; 8]);
+            let id = crypto::segment_id(&bytes);
+            node.eng.store.insert(s, id, bytes);
+            node.eng.local.set(s);
+        }
+
+        node.on_tick(); // play head 40, window 16 → floor 24
+
+        assert!(!node.eng.store.has(0), "store pruned below the floor");
+        assert!(node.eng.store.has(30), "window contents retained");
+        assert!(!node.eng.local.has(0), "buffer map rebased");
+        assert!(node.eng.local.has(30));
+        assert!(!node.segment_ids.contains_key(&0), "id map pruned");
+        assert!(node.segment_ids.contains_key(&30));
     }
 
     #[test]

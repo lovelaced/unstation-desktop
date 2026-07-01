@@ -10,6 +10,23 @@ use parity_scale_codec::{Decode, Encode};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Presence records are dial hints gossiped by arbitrary peers — cap what one message
+/// can grow the book by, how large the book gets, and how long an entry stays alive
+/// (its own `ttl_s`, clamped so a forged record can't pin itself for hours).
+const PRESENCE_BOOK_MAX: usize = 1024;
+const PRESENCE_MERGE_MAX: usize = 32;
+const PRESENCE_CID_MAX: usize = 128;
+const PRESENCE_TTL_CLAMP_S: (u64, u64) = (5, 300);
+
+fn record_ttl(rec: &PresenceRecord) -> Duration {
+    Duration::from_secs((rec.ttl_s as u64).clamp(PRESENCE_TTL_CLAMP_S.0, PRESENCE_TTL_CLAMP_S.1))
+}
+
+fn is_live(entry: &(PresenceRecord, Instant)) -> bool {
+    entry.1.elapsed() < record_ttl(&entry.0)
+}
 
 /// A presence announcement published to the (sharded) discovery topic.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,7 +104,7 @@ impl From<PresenceRecord> for Presence {
 /// dial, since the manifest + signed live-edge still gate what a peer is trusted to serve.
 #[derive(Clone, Default)]
 pub struct PresenceBook {
-    inner: Arc<Mutex<HashMap<PeerId, PresenceRecord>>>,
+    inner: Arc<Mutex<HashMap<PeerId, (PresenceRecord, Instant)>>>,
 }
 
 impl PresenceBook {
@@ -97,41 +114,60 @@ impl PresenceBook {
 
     /// Poison-tolerant lock: the book is shared across the node loop and session tasks,
     /// and a panic elsewhere must not cascade into every reader/writer of a plain map.
-    fn guard(&self) -> std::sync::MutexGuard<'_, HashMap<PeerId, PresenceRecord>> {
+    fn guard(&self) -> std::sync::MutexGuard<'_, HashMap<PeerId, (PresenceRecord, Instant)>> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Validate + stamp + store one record, holding the book at its cap: expired
+    /// entries go first, then the stalest — never silently past `PRESENCE_BOOK_MAX`.
+    fn admit(g: &mut HashMap<PeerId, (PresenceRecord, Instant)>, rec: PresenceRecord) {
+        if rec.manifest_cid.as_ref().map_or(false, |c| c.len() > PRESENCE_CID_MAX) {
+            return; // oversized CID — hostile allocation bait, not a dial hint
+        }
+        let key = PeerId(rec.peer_id);
+        if !g.contains_key(&key) && g.len() >= PRESENCE_BOOK_MAX {
+            g.retain(|_, e| is_live(e));
+        }
+        if !g.contains_key(&key) && g.len() >= PRESENCE_BOOK_MAX {
+            if let Some(stalest) = g.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| *k) {
+                g.remove(&stalest);
+            }
+        }
+        g.insert(key, (rec, Instant::now()));
     }
 
     /// Record/refresh one peer's presence (latest write wins).
     pub fn insert(&self, rec: PresenceRecord) {
-        self.guard().insert(PeerId(rec.peer_id), rec);
+        Self::admit(&mut self.guard(), rec);
     }
 
-    /// Merge gossiped records, skipping our own entry (`me`).
+    /// Merge gossiped records, skipping our own entry (`me`). At most
+    /// `PRESENCE_MERGE_MAX` records are taken per call — one message can't flood the book.
     pub fn merge(&self, recs: impl IntoIterator<Item = PresenceRecord>, me: &PeerId) {
         let mut g = self.guard();
-        for rec in recs {
+        for rec in recs.into_iter().take(PRESENCE_MERGE_MAX) {
             if PeerId(rec.peer_id) != *me {
-                g.insert(PeerId(rec.peer_id), rec);
+                Self::admit(&mut g, rec);
             }
         }
     }
 
-    /// Every known record (for the session's discovery merge).
+    /// Every live (non-expired) record, for the session's discovery merge.
     pub fn snapshot(&self) -> Vec<PresenceRecord> {
-        self.guard().values().cloned().collect()
+        self.guard().values().filter(|e| is_live(e)).map(|(r, _)| r.clone()).collect()
     }
 
-    /// Up to `max` records to gossip onward, relay-capable peers first so reachable
+    /// Up to `max` live records to gossip onward, relay-capable peers first so reachable
     /// volunteers propagate fastest (bounds per-message size at scale).
     pub fn sample(&self, max: usize) -> Vec<PresenceRecord> {
-        let mut v: Vec<PresenceRecord> = self.guard().values().cloned().collect();
+        let mut v = self.snapshot();
         v.sort_by_key(|r| !r.relay);
         v.truncate(max);
         v
     }
 
     pub fn len(&self) -> usize {
-        self.guard().len()
+        self.guard().values().filter(|e| is_live(e)).count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -240,6 +276,42 @@ mod tests {
         let s = book.sample(2);
         assert_eq!(s.len(), 2);
         assert!(s.iter().all(|r| r.relay), "relay-capable peers are sampled first");
+    }
+
+    #[test]
+    fn merge_is_capped_and_validates_records() {
+        let book = PresenceBook::new();
+        let me = PeerId([255u8; 32]);
+        // 40 gossiped records in one message → only PRESENCE_MERGE_MAX admitted.
+        let batch: Vec<PresenceRecord> = (1..=40u8).map(|i| rec(i, false)).collect();
+        book.merge(batch, &me);
+        assert_eq!(book.len(), PRESENCE_MERGE_MAX, "one message can't flood the book");
+
+        // An oversized manifest CID is allocation bait, not a dial hint.
+        let mut bad = rec(200, true);
+        bad.manifest_cid = Some("x".repeat(PRESENCE_CID_MAX + 1));
+        book.insert(bad);
+        assert_eq!(book.len(), PRESENCE_MERGE_MAX, "oversized CID rejected");
+    }
+
+    #[test]
+    fn book_evicts_at_the_cap_instead_of_growing() {
+        let book = PresenceBook::new();
+        for i in 0..(PRESENCE_BOOK_MAX + 50) {
+            // Distinct peer ids across the u8 range boundary.
+            let mut id = [0u8; 32];
+            id[0] = (i % 256) as u8;
+            id[1] = (i / 256) as u8;
+            book.insert(PresenceRecord {
+                peer_id: id,
+                publisher: id,
+                caps_upload_bps: 1,
+                ttl_s: 30,
+                manifest_cid: None,
+                relay: false,
+            });
+        }
+        assert!(book.len() <= PRESENCE_BOOK_MAX, "cap held: {}", book.len());
     }
 
     #[test]

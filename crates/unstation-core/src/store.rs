@@ -80,6 +80,28 @@ impl SegmentStore {
         std::fs::read(path).ok().map(Bytes::from)
     }
 
+    /// Drop everything below `floor` — memory, index, and (best-effort) spilled files.
+    /// A live viewer calls this as its play head advances, so a multi-hour stream can't
+    /// grow the disk tier without bound; publishers/VOD keep everything and never call
+    /// it. A spilled file is only unlinked when no retained seq still references the
+    /// same content id (identical bytes dedup to one file).
+    pub fn prune_below(&mut self, floor: Seq) {
+        self.mem = self.mem.split_off(&floor);
+        let dropped = {
+            let kept = self.index.split_off(&floor);
+            std::mem::replace(&mut self.index, kept)
+        };
+        if self.dir.is_some() {
+            for id in dropped.values() {
+                if !self.index.values().any(|kept| kept == id) {
+                    if let Some(path) = self.path_for(id) {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.index.len()
     }
@@ -102,6 +124,30 @@ mod tests {
         assert!(s.has(1));
         assert_eq!(s.get(1).unwrap(), bytes);
         assert!(!s.has(2));
+    }
+
+    #[test]
+    fn prune_below_drops_memory_and_disk_but_keeps_shared_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = SegmentStore::with_disk(1, dir.path().to_path_buf()).unwrap();
+        // seq 0 and seq 5 share identical bytes (one content-addressed file);
+        // seq 1 is unique. Capacity 1 forces everything old onto disk.
+        let shared = Bytes::from(vec![7u8; 32]);
+        let unique = Bytes::from(vec![9u8; 32]);
+        s.insert(0, crypto::segment_id(&shared), shared.clone());
+        s.insert(1, crypto::segment_id(&unique), unique.clone());
+        s.insert(5, crypto::segment_id(&shared), shared.clone());
+
+        s.prune_below(2);
+
+        assert!(!s.has(0), "pruned seq gone");
+        assert!(!s.has(1));
+        assert!(s.has(5), "retained seq still readable");
+        assert_eq!(s.get(5).unwrap(), shared, "shared content file survived the prune");
+        assert_eq!(s.len(), 1);
+        // The unique segment's spill file is actually unlinked.
+        let unique_path = dir.path().join(format!("{}.seg", crypto::hex32(&crypto::segment_id(&unique).0)));
+        assert!(!unique_path.exists(), "unreferenced spill file removed");
     }
 
     #[test]

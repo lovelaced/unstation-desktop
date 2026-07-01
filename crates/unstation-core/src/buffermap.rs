@@ -65,6 +65,22 @@ impl BufferMap {
     pub fn to_bytes(&self) -> Vec<u8> {
         self.bits.clone().into_vec()
     }
+
+    /// Advance `base` to `floor`, dropping bits below it. The live window slides
+    /// forward with playback, so a multi-hour stream must not grow the bitfield —
+    /// and the every-500 ms advertisement of it to every peer — without bound.
+    pub fn prune_below(&mut self, floor: Seq) {
+        if floor <= self.base {
+            return;
+        }
+        let drop = (floor - self.base) as usize;
+        if drop >= self.bits.len() {
+            self.bits.clear();
+        } else {
+            self.bits.drain(..drop);
+        }
+        self.base = floor;
+    }
 }
 
 #[cfg(test)]
@@ -83,6 +99,29 @@ mod tests {
         assert!(!b.has(104));
         assert_eq!(b.count(), 2);
         assert_eq!(b.highest(), Some(105));
+    }
+
+    #[test]
+    fn prune_below_rebases_and_keeps_semantics() {
+        let mut b = BufferMap::new(0);
+        for s in [2u64, 10, 30, 31] {
+            b.set(s);
+        }
+        b.prune_below(30);
+        assert_eq!(b.base(), 30);
+        assert!(!b.has(2), "below the floor is gone");
+        assert!(!b.has(10));
+        assert!(b.has(30), "window contents survive the rebase");
+        assert!(b.has(31));
+        assert_eq!(b.count(), 2);
+        // Wire round-trip still agrees after the rebase.
+        let restored = BufferMap::from_bytes(b.base(), &b.to_bytes());
+        assert!(restored.has(30) && restored.has(31) && !restored.has(32));
+        // Pruning past everything empties the map but stays usable.
+        b.prune_below(100);
+        assert_eq!(b.count(), 0);
+        b.set(100);
+        assert!(b.has(100));
     }
 
     #[test]
