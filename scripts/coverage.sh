@@ -7,7 +7,7 @@
 #   * unstation-node/src/main — the thin CLI entrypoint.
 #
 #   scripts/coverage.sh            # print summary + write HTML (target/llvm-cov/html)
-#   scripts/coverage.sh --check    # gate: fail if line coverage < $COVERAGE_MIN (default 88)
+#   scripts/coverage.sh --check    # gate: fail if line coverage < $COVERAGE_MIN (default 90)
 #
 # Needs cargo-llvm-cov + the llvm-tools component:
 #   cargo install cargo-llvm-cov && rustup component add llvm-tools-preview
@@ -15,7 +15,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 IGNORE='transport-libdc/src|unstation-node/src/main'
-THRESHOLD="${COVERAGE_MIN:-88}"
+THRESHOLD="${COVERAGE_MIN:-90}"
 
 if [ "${1:-}" = "--check" ]; then
   echo "[coverage] gating engine line coverage at >= ${THRESHOLD}%"

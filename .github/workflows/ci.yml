@@ -66,6 +66,31 @@ jobs:
       - name: Coverage gate
         run: scripts/coverage.sh --check
 
+  fuzz-smoke:
+    name: fuzz smoke (hostile-input targets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # Advisory while the corpus is young; flip to required once it's been green a while.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake pkg-config libssl-dev clang
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/unstation-core/fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      # 60s per target: not a deep campaign, just "hostile input never panics and the
+      # byte-budget/cap invariants hold" on every PR. Deep runs are a manual/nightly affair.
+      - name: Fuzz smoke (60s per target)
+        working-directory: crates/unstation-core
+        run: |
+          for t in protocol_decode reassembler buffermap_bytes presence_merge; do
+            cargo +nightly fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=4096
+          done
+
   chain-crates:
     name: chain + session crates (SDK)
     runs-on: ubuntu-latest

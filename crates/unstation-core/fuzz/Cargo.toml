@@ -12,6 +12,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 parity-scale-codec = "3"
+arbitrary = { version = "1", features = ["derive"] }
 
 [dependencies.unstation-core]
 path = ".."
@@ -19,6 +20,27 @@ path = ".."
 [[bin]]
 name = "protocol_decode"
 path = "fuzz_targets/protocol_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reassembler"
+path = "fuzz_targets/reassembler.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "buffermap_bytes"
+path = "fuzz_targets/buffermap_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "presence_merge"
+path = "fuzz_targets/presence_merge.rs"
 test = false
 doc = false
 bench = false
