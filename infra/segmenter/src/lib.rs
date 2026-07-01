@@ -128,12 +128,21 @@ fn ffmpeg_command(source: &Source, out_dir: &Path, seg_secs: u32) -> Command {
     // connecting (or why it didn't).
     cmd.args(["-loglevel", if live { "info" } else { "error" }]);
 
+    // Low-latency encode. Keyframes are forced at EXACTLY the segment cadence
+    // (`expr:gte(t,n_forced*seg)`) rather than via a fixed `-g <frames>`: a fixed GOP
+    // only aligns with `-hls_time` at one assumed frame rate (30fps → -g 30), so a
+    // 60fps or 24fps OBS source would drift, and the muxer would emit longer,
+    // uneven segments — extra glass-to-glass latency and jerky live-edge tracking.
+    // Forcing on the segment boundary keeps every segment ~`seg_secs` at any fps.
+    let seg = seg_secs.max(1);
     cmd.args([
         "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-        "-g", "30", "-bf", "0", "-pix_fmt", "yuv420p",
+        "-force_key_frames", &format!("expr:gte(t,n_forced*{seg})"),
+        "-bf", "0", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "96k",
         "-f", "hls",
-        "-hls_time", &seg_secs.to_string(),
+        "-hls_time", &seg.to_string(),
+        "-hls_flags", "independent_segments",
         "-hls_segment_type", "fmp4",
         "-hls_fmp4_init_filename", "init.mp4",
         "-hls_list_size", "0",
@@ -294,6 +303,28 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), cmaf.segments.len(), "unique content ids");
         assert!(probe_is_h264(&cmaf.init, &cmaf.segments[0].bytes, dir.path()));
+    }
+
+    #[test]
+    fn segment_cadence_tracks_seg_secs() {
+        // Forced keyframes on the segment boundary mean the segment COUNT scales with
+        // the requested duration: an 8 s source at 1 s ≈ 8 segments, at 2 s ≈ 4. A
+        // fixed `-g` would have pinned the cadence regardless. (Boundaries can round,
+        // so assert the ratio, not exact counts.)
+        if !ffmpeg_available() {
+            eprintln!("ffmpeg not found — skipping");
+            return;
+        }
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        let one = demo_stream(d1.path(), 8, 1).expect("1s segments");
+        let two = demo_stream(d2.path(), 8, 2).expect("2s segments");
+        assert!(
+            one.segments.len() > two.segments.len(),
+            "1s cadence ({}) should yield more segments than 2s ({})",
+            one.segments.len(),
+            two.segments.len(),
+        );
     }
 
     #[test]
