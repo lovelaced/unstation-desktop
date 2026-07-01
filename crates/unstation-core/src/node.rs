@@ -204,6 +204,10 @@ fn frame_segment_data(seq: Seq, total_len: u32, offset: u32, chunk: &[u8]) -> Ve
 pub struct NodeStats {
     pub delivered: usize,
     pub peer_bytes: u64,
+    /// Segment bytes served TO peers (a publisher's uplink contribution — the
+    /// dashboard's real "you're carrying N kbps" number). The off-loop disk-serve
+    /// path isn't counted; the app's live nodes are memory-only, so nothing is missed.
+    pub sent_bytes: u64,
     pub hash_failures: u64,
     /// Live-edge lag in seconds: `(head_seq − play_seq) × seg_ms` — how far behind
     /// the newest known segment playback currently is. The real number the UI's
@@ -1038,7 +1042,8 @@ impl MeshNode {
         }
     }
 
-    fn send_segment(&self, link: &Arc<dyn Link>, seq: Seq, bytes: &[u8]) {
+    fn send_segment(&mut self, link: &Arc<dyn Link>, seq: Seq, bytes: &[u8]) {
+        self.stats.sent_bytes += bytes.len() as u64;
         send_segment_on(link, seq, bytes);
     }
 

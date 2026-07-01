@@ -25,7 +25,7 @@ use hls_server::HlsServer;
 mod camera;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, State};
@@ -133,6 +133,20 @@ struct MeshStatsMsg {
 #[derive(Serialize, Clone)]
 struct PublishStatsMsg {
     viewers: usize,
+    /// Encoder → ingest bitrate over the last window (what the encoder is producing).
+    ingest_kbps: u32,
+    /// Mesh uplink over the last window (what this machine is serving to viewers).
+    uplink_kbps: u32,
+}
+
+/// Go-Live preflight progress (spec §10.4: `identity ✓ · announced ✓ · encoder ✓`).
+/// `ok=false` with a detail is a *quiet degradation*, not an error (e.g. the durable
+/// backup copy still pending while the stream is already live).
+#[derive(Serialize, Clone)]
+struct PublishProgressMsg {
+    step: String,
+    ok: bool,
+    detail: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -687,16 +701,52 @@ fn watch_status(state: State<'_, AppState>) -> Option<WatchStatus> {
 /// init segment (filled into `init_slot` by the feeder), puts it on Bulletin, references it in
 /// the manifest's `init_segment_cid`, signs, and publishes — spawned so a slow chain never
 /// blocks going live. Shared by the desktop (ffmpeg) and Android (camera) publish paths.
+/// Publisher dashboard numbers, every 2s: live viewer count plus ingest/uplink
+/// bitrates from windowed byte deltas (feeder meter / the node's sent_bytes stat).
+#[cfg(feature = "publish")]
+fn spawn_publish_stats(
+    app: AppHandle,
+    session: Session,
+    ingest_bytes: Arc<AtomicU64>,
+    stats_rx: tokio::sync::watch::Receiver<unstation_core::node::NodeStats>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut last_ingest = 0u64;
+        let mut last_sent = 0u64;
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let ing = ingest_bytes.load(Ordering::Relaxed);
+            let sent = stats_rx.borrow().sent_bytes;
+            let ingest_kbps = (ing.saturating_sub(last_ingest) * 8 / 2 / 1000) as u32;
+            let uplink_kbps = (sent.saturating_sub(last_sent) * 8 / 2 / 1000) as u32;
+            last_ingest = ing;
+            last_sent = sent;
+            let _ = app.emit(
+                "publish-stats",
+                PublishStatsMsg { viewers: session.peer_count(), ingest_kbps, uplink_kbps },
+            );
+        }
+    })
+}
+
 #[cfg(feature = "publish")]
 fn spawn_manifest_publish(
+    app: AppHandle,
     session: &Session,
     stream: StreamId,
     init_slot: Arc<Mutex<Option<Bytes>>>,
 ) -> JoinHandle<()> {
     let session_mc = session.clone();
     tokio::spawn(async move {
+        let progress = |ok: bool, detail: &str| {
+            let _ = app.emit(
+                "publish-progress",
+                PublishProgressMsg { step: "announced".into(), ok, detail: detail.into() },
+            );
+        };
         let Some(publisher) = unstation_chain::identity_public() else {
             log::warn!("[publish] no chain identity — skipping signed-manifest publish");
+            progress(false, "No signed-in identity — the stream isn’t announced.");
             return;
         };
         let init_bytes = loop {
@@ -712,6 +762,9 @@ fn spawn_manifest_publish(
             }
             Err(e) => {
                 log::warn!("[publish] init put to Bulletin failed: {e:?}");
+                // Degrade quietly, never into an error: the live mesh works without
+                // the durable copy; only the cold-start/late-joiner anchor is pending.
+                progress(false, "Live now — backup copy pending.");
                 String::new()
             }
         };
@@ -739,8 +792,12 @@ fn spawn_manifest_publish(
             Ok(cid) => {
                 log::info!("[publish] signed manifest on Bulletin: {cid}");
                 session_mc.set_manifest_cid(cid);
+                progress(true, "");
             }
-            Err(e) => log::warn!("[publish] manifest put to Bulletin failed: {e:?}"),
+            Err(e) => {
+                log::warn!("[publish] manifest put to Bulletin failed: {e:?}");
+                progress(false, "Live now — backup copy pending.");
+            }
         }
     })
 }
@@ -803,6 +860,14 @@ async fn start_publish(
     // inbound viewers than a plain viewer's default admission cap allows.
     let session = Session::start(stream, 1, stun(), pub_tx.clone())?;
     session.set_max_inbound(128);
+    // Preflight (spec §10.4): identity is already proven (chain_ready gated above).
+    let _ = app.emit(
+        "publish-progress",
+        PublishProgressMsg { step: "identity".into(), ok: true, detail: String::new() },
+    );
+    // Uplink metering: the node reports sent_bytes on its stats channel.
+    let (pub_stats_tx, pub_stats_rx) =
+        tokio::sync::watch::channel(unstation_core::node::NodeStats::default());
     let publisher = MeshNode::new_live_publisher(
         session.my_peer,
         cfg(Mode::Live, Role::Publisher),
@@ -816,7 +881,8 @@ async fn start_publish(
     // Gossip the presence book so viewers discover the swarm in-mesh.
     .with_presence_book(session.presence_book())
     // Convictions (forged bytes, floods) bar re-dials + offers at the session edge.
-    .with_ban_list(session.ban_list());
+    .with_ban_list(session.ban_list())
+    .with_stats(pub_stats_tx);
     tokio::spawn(async move {
         let _ = publisher.run(pub_rx, TICK, None).await;
     });
@@ -834,9 +900,13 @@ async fn start_publish(
     // publisher waits for it, puts it on Bulletin, and references it in the signed manifest so
     // viewers can initialize MSE before any media fragment.
     let init_slot: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
-    tasks.push(spawn_manifest_publish(&session, stream, init_slot.clone()));
+    tasks.push(spawn_manifest_publish(app.clone(), &session, stream, init_slot.clone()));
     let (edge_tx, edge_rx) = unbounded_channel::<(Seq, SegmentId)>();
     tasks.push(session.spawn_edge_publisher(edge_rx));
+
+    // Encoder→ingest byte meter (the feeder counts fragment bytes; the stats task
+    // turns the delta into a bitrate for the publisher dashboard).
+    let ingest_bytes = Arc::new(AtomicU64::new(0));
 
     // Feeder: tail the ingest dir → preview sink + the publisher's mesh seed +
     // the live-edge manifest. Emits `publish-state` and keeps `live_flag` current so
@@ -846,6 +916,7 @@ async fn start_publish(
     let init_slot_feeder = init_slot.clone();
     let live_flag = Arc::new(AtomicBool::new(false));
     let live_w = live_flag.clone();
+    let ingest_w = ingest_bytes.clone();
     let feeder = tokio::spawn(async move {
         // Keep an ingest listener available AT ALL TIMES so the encoder can connect or
         // reconnect whenever — no ordering required. ffmpeg's RTMP `-listen` is one-shot,
@@ -898,6 +969,7 @@ async fn start_publish(
                     }
                     if init_sent {
                         for s in news {
+                            ingest_w.fetch_add(s.bytes.len() as u64, Ordering::Relaxed);
                             preview.push_segment(s.seq, s.bytes.clone());
                             let _ = ptx.send(EngineEvent::Produced { seq: s.seq, id: s.id, bytes: s.bytes });
                             let _ = edge_tx.send((s.seq, s.id));
@@ -915,21 +987,17 @@ async fn start_publish(
                 state_sent = true;
                 live_w.store(live, Ordering::Relaxed);
                 let _ = appc.emit("publish-state", PublishStateMsg { live });
+                // Preflight: the encoder check flips with the real fragment flow.
+                let _ = appc.emit(
+                    "publish-progress",
+                    PublishProgressMsg { step: "encoder".into(), ok: live, detail: String::new() },
+                );
             }
         }
     });
 
-    // Stream the live viewer count (peers connected over WebRTC) to the UI.
-    let stats = {
-        let s = session.clone();
-        let appc = app.clone();
-        tokio::spawn(async move {
-            loop {
-                let _ = appc.emit("publish-stats", PublishStatsMsg { viewers: s.peer_count() });
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-        })
-    };
+    // Publisher dashboard numbers: viewer count + ingest/uplink bitrates.
+    let stats = spawn_publish_stats(app.clone(), session.clone(), ingest_bytes, pub_stats_rx);
 
     tasks.push(feeder);
     tasks.push(stats);
@@ -989,6 +1057,12 @@ async fn start_publish(
     // Phone uplinks fan out to fewer directly-served viewers than desktop, but the
     // origin still shouldn't sit at the viewer default.
     session.set_max_inbound(64);
+    let _ = app.emit(
+        "publish-progress",
+        PublishProgressMsg { step: "identity".into(), ok: true, detail: String::new() },
+    );
+    let (pub_stats_tx, pub_stats_rx) =
+        tokio::sync::watch::channel(unstation_core::node::NodeStats::default());
     let publisher = MeshNode::new_live_publisher(
         session.my_peer,
         cfg(Mode::Live, Role::Publisher),
@@ -999,7 +1073,8 @@ async fn start_publish(
     .with_edge_signer(Arc::new(IdentityEdgeSigner))
     .with_presence_book(session.presence_book())
     // Convictions (forged bytes, floods) bar re-dials + offers at the session edge.
-    .with_ban_list(session.ban_list());
+    .with_ban_list(session.ban_list())
+    .with_stats(pub_stats_tx);
     tokio::spawn(async move {
         let _ = publisher.run(pub_rx, TICK, None).await;
     });
@@ -1008,10 +1083,13 @@ async fn start_publish(
     tasks.push(session.spawn_presence(80_000_000, true));
 
     let init_slot: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
-    tasks.push(spawn_manifest_publish(&session, stream, init_slot.clone()));
+    tasks.push(spawn_manifest_publish(app.clone(), &session, stream, init_slot.clone()));
 
     let (edge_tx, edge_rx) = unbounded_channel::<(Seq, SegmentId)>();
     tasks.push(session.spawn_edge_publisher(edge_rx));
+
+    // Camera → CMAF byte meter for the dashboard's ingest bitrate.
+    let ingest_bytes = Arc::new(AtomicU64::new(0));
 
     // Feeder: drain encoded AUs from the camera plugin → mux to CMAF → the three sinks
     // (self-preview, mesh `Produced`, live edge), exactly like the ffmpeg feeder's tail.
@@ -1019,6 +1097,7 @@ async fn start_publish(
     let appc = app.clone();
     let live_flag = Arc::new(AtomicBool::new(false));
     let live_w = live_flag.clone();
+    let ingest_w = ingest_bytes.clone();
     // Open the AU intake synchronously — BEFORE returning to JS (which then starts the camera
     // plugin) — so the encoder's config/frames aren't dropped, nor its config cleared by a late
     // open_stream racing the plugin's `nativeConfig`.
@@ -1047,6 +1126,10 @@ async fn start_publish(
         preview.push_init(init);
         live_w.store(true, Ordering::Relaxed);
         let _ = appc.emit("publish-state", PublishStateMsg { live: true });
+        let _ = appc.emit(
+            "publish-progress",
+            PublishProgressMsg { step: "encoder".into(), ok: true, detail: String::new() },
+        );
 
         let mut last_pts: Option<i64> = None;
         while let Some(au) = rx.recv().await {
@@ -1059,6 +1142,7 @@ async fn start_publish(
             last_pts = Some(au.pts_us);
             if let Some(seg) = fb.push_au(&au.data, dur.max(1), au.keyframe) {
                 log::info!("[publish] fragment seq={} ({} B)", seg.seq, seg.bytes.len());
+                ingest_w.fetch_add(seg.bytes.len() as u64, Ordering::Relaxed);
                 preview.push_segment(seg.seq, seg.bytes.clone());
                 let _ = ptx.send(EngineEvent::Produced { seq: seg.seq, id: seg.id, bytes: seg.bytes });
                 let _ = edge_tx.send((seg.seq, seg.id));
@@ -1066,16 +1150,7 @@ async fn start_publish(
         }
     });
 
-    let stats = {
-        let s = session.clone();
-        let appc = app.clone();
-        tokio::spawn(async move {
-            loop {
-                let _ = appc.emit("publish-stats", PublishStatsMsg { viewers: s.peer_count() });
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-        })
-    };
+    let stats = spawn_publish_stats(app.clone(), session.clone(), ingest_bytes, pub_stats_rx);
 
     // No RTMP ingest on Android — the camera is the source; the UI hides the OBS rail.
     let info = PublishInfo { ingest_server: String::new(), stream_key: String::new(), hls_url };
