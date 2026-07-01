@@ -156,6 +156,19 @@ struct MeshStatusMsg {
     detail: String,
 }
 
+/// The viewer journey's honest state machine (IMPLEMENTATION_SPEC §10.3), emitted as
+/// real conditions change — the finding scene, catch-up ladder, ended screen, and
+/// unreachable state all key off this instead of hardcoded timers. Phases:
+/// `resolving | verifying | discovering | connecting | buffering | live |
+/// catching-up | ended | unreachable`.
+#[derive(Serialize, Clone)]
+struct WatchPhaseMsg {
+    phase: String,
+    detail: String,
+    /// Milliseconds since this watch started (for the UI's time-to-first-frame).
+    since_ms: u64,
+}
+
 #[derive(Serialize, Clone)]
 struct PublishInfo {
     ingest_server: String,
@@ -303,6 +316,24 @@ async fn start_watch(
     // (stable) peer id, so the publisher ignores the new connection and the re-watch hangs.
     teardown_watch(&state);
 
+    // The honest viewer state machine starts NOW (name→id is instant, but the phase
+    // still renders so the journey is legible).
+    let watch_started = std::time::Instant::now();
+    let emit_phase = {
+        let app = app.clone();
+        move |phase: &str, detail: &str, since: &std::time::Instant| {
+            let _ = app.emit(
+                "watch-phase",
+                WatchPhaseMsg {
+                    phase: phase.into(),
+                    detail: detail.into(),
+                    since_ms: since.elapsed().as_millis() as u64,
+                },
+            );
+        }
+    };
+    emit_phase("resolving", "", &watch_started);
+
     // Localhost HLS re-server → the webview <video> plays from here.
     let hls = HlsServer::start(1000).map_err(|e| e.to_string())?;
     let hls_url = hls.url();
@@ -376,16 +407,20 @@ async fn start_watch(
         let appc = app.clone();
         let sink_init = sink_for_init.clone();
         let init_installed = Arc::new(AtomicBool::new(false));
+        let phase = emit_phase.clone();
+        let started = watch_started;
         let filter: Arc<dyn Fn(Presence) -> BoxFuture<'static, bool> + Send + Sync> =
             Arc::new(move |cand: Presence| {
                 let vtx = vtx.clone();
                 let appc = appc.clone();
                 let sink_init = sink_init.clone();
                 let init_installed = init_installed.clone();
+                let phase = phase.clone();
                 Box::pin(async move {
                     let Some(cid) = cand.manifest_cid.clone() else {
                         return true; // a resharing viewer — no manifest to check
                     };
+                    phase("verifying", "", &started);
                     match BulletinOrigin.fetch_manifest(cid).await {
                         Ok(m) if m.verify(&cand.publisher).is_ok() => {
                             // Verified publisher → its personhood key is the trust
@@ -403,6 +438,7 @@ async fn start_watch(
                                     Err(e) => log::warn!("[watch] init fetch failed: {e:?}"),
                                 }
                             }
+                            phase("connecting", "", &started);
                             true
                         }
                         Ok(_) => {
@@ -414,12 +450,69 @@ async fn start_watch(
                         }
                         Err(e) => {
                             log::warn!("[watch] manifest fetch failed ({e:?}); proceeding (segments still hash-verified)");
+                            phase("connecting", "", &started);
                             true
                         }
                     }
                 })
             });
         tasks.push(session.spawn_maintainer(3, filter));
+    }
+
+    // The phase watcher: derives the honest viewer state from REAL conditions — peer
+    // count, live-edge freshness, delivered segments, play head — and emits
+    // `watch-phase` on every transition. This is what makes "finding" real instead of
+    // a hardcoded animation, gives "ended" an actual trigger, and keeps "unreachable"
+    // honest (the maintainer keeps retrying underneath; the UI stops pretending).
+    {
+        let s = session.clone();
+        let mut rx = stats_rx.clone();
+        let phase = emit_phase.clone();
+        let started = watch_started;
+        tasks.push(tokio::spawn(async move {
+            let mut cur = String::from("resolving");
+            let mut was_live = false;
+            let mut last_head: u64 = 0;
+            let mut last_head_change = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let ns = rx.borrow_and_update().clone();
+                let peers = s.peer_count();
+                if ns.head_seq > last_head {
+                    last_head = ns.head_seq;
+                    last_head_change = std::time::Instant::now();
+                }
+                let head_stale = last_head_change.elapsed();
+                let playing = ns.play_seq > 0;
+                let next = if was_live && head_stale > Duration::from_secs(20) {
+                    // Nothing new produced for 20s: the broadcast is over (or so badly
+                    // stalled the difference doesn't matter to the viewer).
+                    "ended"
+                } else if was_live && head_stale > Duration::from_secs(6) {
+                    "catching-up"
+                } else if playing {
+                    was_live = true;
+                    "live"
+                } else if ns.delivered > 0 {
+                    "buffering"
+                } else if peers > 0 {
+                    "connecting"
+                } else if !was_live && started.elapsed() > Duration::from_secs(30) {
+                    // 30s with zero connections: stop pretending. The maintainer keeps
+                    // retrying underneath; if a peer appears this moves forward again.
+                    "unreachable"
+                } else {
+                    "discovering"
+                };
+                if next != cur {
+                    cur = next.to_string();
+                    phase(next, "", &started);
+                    if next == "ended" {
+                        return; // terminal for this watch; a rejoin starts a new one
+                    }
+                }
+            }
+        }));
     }
 
     // Stream REAL mesh stats to the webview: live transport peer count + the node's
