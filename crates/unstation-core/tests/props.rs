@@ -5,6 +5,8 @@ use proptest::prelude::*;
 use unstation_core::buffermap::BufferMap;
 use unstation_core::crypto::segment_id;
 use unstation_core::reassembly::Reassembler;
+use unstation_core::signaling::{PresenceBook, PresenceRecord};
+use unstation_core::types::PeerId;
 
 proptest! {
     /// Any byte string, split into any chunk size and delivered out of order,
@@ -99,5 +101,59 @@ proptest! {
         r.add(0, &data);
         prop_assert!(r.is_complete());
         prop_assert!(r.finish_verified(&wrong_id).is_none());
+    }
+
+    /// `Reassembler::add`'s return values always sum to `buffered_bytes()` — the
+    /// contract the node's global reassembly byte budget depends on. Any drift and
+    /// the cap either leaks or starts refusing honest deliveries.
+    #[test]
+    fn reassembly_byte_accounting_never_drifts(
+        total in 1u32..4096,
+        chunks in proptest::collection::vec((0u32..4096, 1usize..256), 0..64),
+    ) {
+        let mut r = Reassembler::new(total);
+        let mut accounted: u64 = 0;
+        for (off, len) in chunks {
+            accounted += r.add(off, &vec![0xA5u8; len]) as u64;
+        }
+        prop_assert_eq!(r.buffered_bytes(), accounted);
+        prop_assert!(accounted <= total as u64, "never buffers past total_len");
+    }
+
+    /// The presence book never exceeds its cap and never admits an oversized CID,
+    /// for arbitrary gossip batches — the invariant behind unbounded-peer safety.
+    #[test]
+    fn presence_book_stays_bounded(
+        batches in proptest::collection::vec(
+            proptest::collection::vec((any::<u8>(), any::<u8>(), 0u32..600, 0usize..200), 0..64),
+            1..8,
+        ),
+    ) {
+        let book = PresenceBook::new();
+        let me = PeerId([255u8; 32]);
+        for batch in batches {
+            let recs: Vec<PresenceRecord> = batch
+                .into_iter()
+                .map(|(b0, b1, ttl, cid_len)| {
+                    let mut id = [0u8; 32];
+                    id[0] = b0;
+                    id[1] = b1;
+                    PresenceRecord {
+                        peer_id: id,
+                        publisher: id,
+                        caps_upload_bps: 1,
+                        ttl_s: ttl,
+                        manifest_cid: if cid_len == 0 { None } else { Some("x".repeat(cid_len)) },
+                        relay: b0 % 2 == 0,
+                    }
+                })
+                .collect();
+            book.merge(recs, &me);
+        }
+        prop_assert!(book.len() <= 1024, "book cap held: {}", book.len());
+        for rec in book.snapshot() {
+            prop_assert!(rec.manifest_cid.map_or(0, |c| c.len()) <= 128, "no oversized CID admitted");
+            prop_assert_ne!(PeerId(rec.peer_id), me, "own entry never merged");
+        }
     }
 }

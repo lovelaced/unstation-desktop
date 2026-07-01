@@ -9,27 +9,37 @@ use std::collections::BTreeMap;
 pub struct Reassembler {
     total_len: u32,
     chunks: BTreeMap<u32, Vec<u8>>,
+    /// Running sum of `chunks` lengths — kept so `add` can enforce the total-len
+    /// bound in O(1) and `buffered_bytes` is a field read, not a fold.
+    buffered: u32,
 }
 
 impl Reassembler {
     pub fn new(total_len: u32) -> Self {
-        Self { total_len, chunks: BTreeMap::new() }
+        Self { total_len, chunks: BTreeMap::new(), buffered: 0 }
     }
 
     /// Add a chunk at `offset`, returning how many bytes were actually buffered (0 for
     /// duplicates and rejects) so the caller can keep a global byte budget. Empty,
     /// out-of-range, and **overshooting** chunks are ignored — a peer must not be able
-    /// to write past `total_len` (which would make `is_complete` unsatisfiable / waste
-    /// memory).
+    /// to write past `total_len`. Crucially, total buffered bytes are capped at
+    /// `total_len`: overlapping chunks at distinct offsets would otherwise let a
+    /// hostile peer inflate one reassembler far past the segment size (amplification
+    /// past the per-entry admission estimate).
     pub fn add(&mut self, offset: u32, bytes: &[u8]) -> usize {
-        if bytes.is_empty() || offset.saturating_add(bytes.len() as u32) > self.total_len {
+        let len = bytes.len() as u32;
+        if len == 0 || offset.saturating_add(len) > self.total_len {
             return 0;
+        }
+        if self.buffered.saturating_add(len) > self.total_len {
+            return 0; // would exceed the segment size ⇒ overlap/duplication, reject
         }
         match self.chunks.entry(offset) {
             std::collections::btree_map::Entry::Occupied(_) => 0,
             std::collections::btree_map::Entry::Vacant(v) => {
                 v.insert(bytes.to_vec());
-                bytes.len()
+                self.buffered += len;
+                len as usize
             }
         }
     }
@@ -37,7 +47,7 @@ impl Reassembler {
     /// Bytes currently buffered — the counterpart of [`Reassembler::add`]'s return
     /// value, released back to the caller's budget when this reassembler is dropped.
     pub fn buffered_bytes(&self) -> u64 {
-        self.chunks.values().map(|c| c.len() as u64).sum()
+        self.buffered as u64
     }
 
     /// All bytes present and contiguous from 0..total_len.

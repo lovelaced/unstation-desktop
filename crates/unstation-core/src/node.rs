@@ -189,6 +189,11 @@ pub struct NodeStats {
     pub delivered: usize,
     pub peer_bytes: u64,
     pub hash_failures: u64,
+    /// Leak/bound gauges, snapshotted when the loop exits: the adversarial + churn
+    /// suites assert these stay inside their caps and drain to zero after churn.
+    pub reasm_entries: usize,
+    pub reasm_bytes: u64,
+    pub pending_entries: usize,
     /// Connected neighbors in the peer table.
     pub peers: usize,
     /// Peers learned via in-mesh `PeerGossip` (no statement-store writes).
@@ -504,6 +509,9 @@ impl MeshNode {
         self.stats.delivered = self.delivered_total;
         self.stats.known_peers = self.known_peers.len();
         self.stats.peers = self.eng.peers.len();
+        self.stats.reasm_entries = self.reasm.len();
+        self.stats.reasm_bytes = self.reasm_bytes;
+        self.stats.pending_entries = self.pending.len();
         self.stats
     }
 
