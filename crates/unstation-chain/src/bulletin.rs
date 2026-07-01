@@ -36,7 +36,7 @@ impl BulletinOrigin {
 
     /// Store arbitrary bytes (e.g. the init segment); returns the Bulletin CID.
     pub async fn put_bytes(&self, bytes: Vec<u8>) -> Result<Cid> {
-        bulletin::submit_preimage_testnet(bytes).await.map_err(Error::Signaling)
+        bulletin::submit_preimage(bytes).await.map_err(Error::Signaling)
     }
 }
 
@@ -54,7 +54,7 @@ impl OriginOfRecord for BulletinOrigin {
 
     fn put_manifest(&self, manifest: SignedManifest) -> BoxFuture<'static, Result<Cid>> {
         Box::pin(async move {
-            bulletin::submit_preimage_testnet(manifest.encode())
+            bulletin::submit_preimage(manifest.encode())
                 .await
                 .map_err(Error::Signaling)
         })
@@ -71,7 +71,7 @@ impl OriginOfRecord for BulletinOrigin {
     /// returned CID — Bulletin content-addresses by its own key, not our `SegmentId`.
     fn put_segment(&self, _id: SegmentId, bytes: Bytes) -> BoxFuture<'static, Result<Cid>> {
         Box::pin(async move {
-            bulletin::submit_preimage_testnet(bytes.to_vec())
+            bulletin::submit_preimage(bytes.to_vec())
                 .await
                 .map_err(Error::Signaling)
         })
