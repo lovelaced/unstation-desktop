@@ -1,4 +1,5 @@
 // Viewer connection health. A plain-language verdict + a DOM renderer.
+import { STRINGS } from './copy.js';
 // We only have REAL signals (peer count + whether video is actually playing) — so we
 // never show fake precision (no invented latency/%/ICE type). The "your connection"
 // popup and the always-on pill dot share this verdict.
@@ -13,7 +14,7 @@ export function renderViewerHealth(o){
   const set=(id,t)=>{ const el=document.getElementById(id); if(el) el.textContent=t; };
   set('vHealthLabel', v.label); set('vHealthNote', v.note);
   set('vPeers', peers + ' ' + (peers===1?'person':'people'));
-  set('vSource', o.mode==='seed' ? 'a volunteer relay' : 'directly from peers');
+  set('vSource', o.mode==='seed' ? STRINGS.sourceHelper : STRINGS.sourcePeers);
   if(o.publisher) set('mPub', o.publisher);
   set('peerCount', String(peers));
   const vd=document.getElementById('vHealthDot'); if(vd) vd.dataset.h=v.dot;
