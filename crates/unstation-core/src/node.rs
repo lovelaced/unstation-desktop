@@ -504,6 +504,7 @@ impl MeshNode {
     fn apply_edge(&mut self, seq: Seq, id: SegmentId) {
         self.segment_ids.insert(seq, id);
         self.eng.head_seq = self.eng.head_seq.max(seq);
+        log::info!("[edge] learned seq={seq} → head_seq={}", self.eng.head_seq);
         self.try_verify_pending(seq);
     }
 
@@ -653,6 +654,7 @@ impl MeshNode {
                         deadline_hint_ms: 0,
                     };
                     link.send(Channel::Ctrl, want.encode());
+                    log::info!("[mesh] → Want seq={} to {:?}", r.seq, pid);
                     self.pending.insert(r.seq, (pid, self.now_ms));
                     if let Some(p) = self.eng.peers.get_mut(&pid) {
                         p.pending_bytes = p.pending_bytes.saturating_add(self.eng.seg_bytes);
@@ -671,6 +673,7 @@ impl MeshNode {
             MeshMsg::Hello { base_seq, bitfield, .. } | MeshMsg::BufferMap { base_seq, bitfield } => {
                 let entry = self.eng.peers.entry(peer).or_insert_with(|| PeerState::new(peer));
                 entry.buffer = BufferMap::from_bytes(base_seq, &bitfield);
+                log::debug!("[mesh] ← Hello/BufferMap from {:?}: base_seq={base_seq}, {}B bitfield", peer, bitfield.len());
             }
             MeshMsg::Want { segment_seqs, .. } => {
                 // Upload fairness: serve only peers we've unchoked (publishers/seeds
@@ -765,12 +768,17 @@ impl MeshNode {
             MeshMsg::EdgeAnnounce { seq, id, sig } => {
                 let pubkey = match self.publisher_key {
                     Some(k) => k,
-                    None => return, // no trust anchor → can't trust a gossiped edge.
+                    None => {
+                        log::warn!("[edge] ← gossip seq={seq} dropped: no publisher_key yet");
+                        return; // no trust anchor → can't trust a gossiped edge.
+                    }
                 };
                 let sid = SegmentId(id);
                 if !crypto::verify_sr25519(&pubkey, &edge_payload(&self.stream_id, seq, &sid), &sig) {
+                    log::warn!("[edge] ← gossip seq={seq} verify FAILED vs publisher_key");
                     return; // forged / wrong stream → never propagate it.
                 }
+                log::debug!("[edge] ← gossip seq={seq} verified");
                 if !self.edge_seen.insert(seq) {
                     return; // already seen this edge — don't re-apply or re-storm.
                 }
@@ -798,6 +806,9 @@ impl MeshNode {
     fn on_segment_data(&mut self, peer: PeerId, seq: Seq, total_len: u32, offset: u32, bytes: &[u8]) {
         if self.eng.local.has(seq) {
             return;
+        }
+        if offset == 0 {
+            log::debug!("[seg] ← seq={seq} from {:?} ({total_len} B total)", peer);
         }
         // Reject absurd/zero sizes before allocating a reassembler (hostile peer guard).
         if total_len == 0 || total_len > MAX_SEGMENT_BYTES {
@@ -846,6 +857,7 @@ impl MeshNode {
         self.stats.peer_bytes += n as u64;
         self.eng.store.insert(seq, id, b.clone());
         self.eng.local.set(seq);
+        log::info!("[seg] seq={seq} verified → sink ({n} B)");
         self.sink.push_segment(seq, b);
         // Real throughput: bytes delivered / time since we asked (push deliveries have no
         // matching `pending` entry, so they just don't update the estimate — correct).

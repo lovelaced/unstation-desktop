@@ -119,6 +119,7 @@ mod tests {
         let msg = MeshMsg::PresenceGossip {
             records: vec![PresenceRecord {
                 peer_id: [5u8; 32],
+                publisher: [6u8; 32],
                 caps_upload_bps: 20_000_000,
                 ttl_s: 30,
                 manifest_cid: Some("bafy-cid".into()),
@@ -137,6 +138,7 @@ mod tests {
     fn all_variants_roundtrip_with_stable_tags() {
         let rec = PresenceRecord {
             peer_id: [7u8; 32],
+            publisher: [8u8; 32],
             caps_upload_bps: 19,
             ttl_s: 30,
             manifest_cid: Some("cid".into()),

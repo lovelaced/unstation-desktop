@@ -1706,6 +1706,7 @@ dependencies = [
  "blake2",
  "bytes",
  "criterion",
+ "log",
  "parity-scale-codec",
  "pollster",
  "proptest",

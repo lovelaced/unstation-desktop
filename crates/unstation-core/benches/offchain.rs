@@ -12,6 +12,7 @@ use unstation_core::types::PeerId;
 fn rec(i: u64) -> PresenceRecord {
     PresenceRecord {
         peer_id: PeerId::from_u64(i).0,
+        publisher: PeerId::from_u64(i).0,
         caps_upload_bps: 20_000_000,
         ttl_s: 30,
         manifest_cid: if i % 5 == 0 { Some("bafy-some-manifest-cid-placeholder".into()) } else { None },

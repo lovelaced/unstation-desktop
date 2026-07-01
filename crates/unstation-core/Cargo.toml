@@ -16,6 +16,10 @@ tracing.workspace = true
 blake2 = "0.10"
 schnorrkel = "0.11"
 tokio.workspace = true
+# Lightweight logging facade for mesh observability (discovery, edge, Want/segment flow).
+# Calls are no-ops unless the host installs a logger, so the deterministic simulator is
+# unaffected; the desktop/mobile shells route it through env_logger.
+log = "0.4"
 
 [dev-dependencies]
 criterion = "0.5"

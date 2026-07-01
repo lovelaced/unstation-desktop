@@ -14,7 +14,9 @@
 //! through the real chain. The live-edge subscription (`subscribe_edge`) and the
 //! `OriginOfRecord`/Bulletin impl land in M1/M2.
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use parity_scale_codec::{Decode, Encode};
@@ -65,10 +67,13 @@ pub fn sign_with_identity(payload: &[u8]) -> Option<[u8; 64]> {
     Some(unstation_core::crypto::sign_sr25519(&kp, payload))
 }
 
-/// The host's public key (== its `PeerId`) — the manifest's `publisher` field and the
-/// trust anchor a viewer checks against. `None` until the identity is initialized.
+/// The host's **personhood** public key (the statement-store account) — the manifest's
+/// `publisher` field and the trust anchor a viewer verifies the signed manifest + live-edge
+/// against. Stable across all of a person's devices. `None` until the identity is
+/// initialized. NOTE: this is deliberately NOT [`local_peer_id`] — that is a per-device
+/// routing id, distinct so two devices of the same person don't collide in the mesh.
 pub fn identity_public() -> Option<[u8; 32]> {
-    local_peer_id().map(|p| p.0)
+    ss::public_key_bytes()
 }
 
 /// Point the statement-store client at specific WS endpoint(s) — e.g. a local `--dev`
@@ -135,12 +140,35 @@ pub fn wait_ready(timeout: Duration) -> bool {
     ss::wait_until_subscribed(timeout)
 }
 
-/// Our ephemeral `PeerId` = the statement-store account public key. Ties the
-/// mesh identity (presence, signaling envelopes, discovery) to the on-chain
-/// signer, so the answerer can route replies and (in M2) verify the sender.
-/// `None` until [`init_statement_store`] has run.
+/// Per-**device** mesh `PeerId`: a process-random routing id used for presence,
+/// signaling-envelope addressing, dial targeting, and self-filtering — **not** a
+/// signing key and **not** the personhood/statement-store pubkey.
+///
+/// Historically this WAS the statement-store account pubkey, which made every device a
+/// person signs into share one `PeerId`; two such devices then filtered each other out of
+/// discovery as "self" (`p.peer_id != my_peer`) and collided on the per-peer signaling
+/// topic — so cross-machine watch between a person's own devices could never connect.
+/// Decoupling it fixes that. Trust is unaffected: the personhood key (the manifest/edge
+/// signer + verify anchor) is still exposed via [`identity_public`] and carried in
+/// [`Presence::publisher`]. The id need not persist across launches — presence is
+/// re-announced each session with a short TTL — so a fresh per-process value is fine and
+/// avoids any on-disk key management.
+///
+/// `None` until an identity is initialized (preserves the "not signed in yet" signal
+/// callers rely on).
 pub fn local_peer_id() -> Option<PeerId> {
-    ss::public_key_bytes().map(PeerId)
+    ss::public_key_bytes()?;
+    Some(PeerId(*DEVICE_PEER_ID.get_or_init(random_device_id)))
+}
+
+/// The per-process device routing id (see [`local_peer_id`]). Opaque 32 bytes.
+static DEVICE_PEER_ID: OnceLock<[u8; 32]> = OnceLock::new();
+
+/// A random 32-byte routing id, sourced from schnorrkel's CSPRNG (already a dependency).
+/// The bytes are a fresh public key we never sign with — purely an opaque, collision-free
+/// mesh address distinct from the shared personhood key.
+fn random_device_id() -> [u8; 32] {
+    schnorrkel::Keypair::generate().public.to_bytes()
 }
 
 /// Tear down the global statement-store client (stops the poll thread).
@@ -154,17 +182,29 @@ fn err<E: std::fmt::Display>(e: E) -> unstation_core::Error {
 
 /// [`Signaling`] implemented over the People-chain statement store.
 ///
-/// Cheap to clone; all state (the signing keypair, the live connection) lives in
-/// the process-global SDK client initialized by [`init_statement_store`].
+/// Cheap to clone; the keypair + live connection live in the process-global SDK client
+/// initialized by [`init_statement_store`]. The signaling `outbox`/`prio` are shared across
+/// clones (Arc) so every send to a peer accumulates into the same bundle.
 #[derive(Clone)]
 pub struct ChainSignaling {
     stream: StreamId,
     n_shards: u32,
+    /// Per-recipient outbound-signal accumulator (see [`ChainSignaling::publish_signal`]):
+    /// to-peer → the envelopes we have sent it, resent as one growing bundle so the
+    /// statement store's last-write-wins doesn't drop all but the latest signal.
+    outbox: Arc<Mutex<HashMap<[u8; 32], Vec<Vec<u8>>>>>,
+    /// Monotonic statement priority so each rewritten bundle supersedes the previous.
+    prio: Arc<AtomicU32>,
 }
 
 impl ChainSignaling {
     pub fn new(stream: StreamId, n_shards: u32) -> Self {
-        Self { stream, n_shards: n_shards.max(1) }
+        Self {
+            stream,
+            n_shards: n_shards.max(1),
+            outbox: Arc::new(Mutex::new(HashMap::new())),
+            prio: Arc::new(AtomicU32::new(1)),
+        }
     }
 }
 
@@ -194,6 +234,7 @@ impl Signaling for ChainSignaling {
                     .await
                     .map_err(err)?
                     .map_err(err)?;
+            let raw = statements.len();
             let mut out = Vec::new();
             for st in statements.into_iter().take(max) {
                 // Drop anything that isn't a well-formed presence record.
@@ -201,6 +242,7 @@ impl Signaling for ChainSignaling {
                     out.push(rec.into());
                 }
             }
+            log::debug!("[sig] read_presence → {raw} raw statement(s), {} presence", out.len());
             Ok(out)
         })
     }
@@ -253,6 +295,20 @@ fn decode_envelope(bytes: &[u8]) -> Option<(PeerId, SignalMsg)> {
     Some((PeerId(id), msg))
 }
 
+/// Signaling bundle codec. The statement store keeps only the highest-priority statement per
+/// (account, channel), and reads match on that channel — so a sender cannot spread an offer,
+/// its answer, and its trickled ICE candidates across separate statements (they would evict
+/// one another, and per-message channels don't come back on a topic read). Instead a sender
+/// resends the FULL set of envelopes it has produced for a peer as one statement each time
+/// (see [`ChainSignaling::publish_signal`]); the bundle is a SCALE `Vec<Vec<u8>>` of envelopes.
+fn encode_bundle(envelopes: &[Vec<u8>]) -> Vec<u8> {
+    envelopes.to_vec().encode()
+}
+
+fn decode_bundle(data: &[u8]) -> Vec<Vec<u8>> {
+    Vec::<Vec<u8>>::decode(&mut &data[..]).unwrap_or_default()
+}
+
 impl ChainSignaling {
     /// Post a signaling message to `to`'s signaling topic, tagged with our own
     /// `PeerId` so the recipient can route its reply back.
@@ -263,8 +319,20 @@ impl ChainSignaling {
         msg: SignalMsg,
     ) -> unstation_core::Result<()> {
         let topic = signaling_topic(&self.stream, &to);
-        let data = encode_envelope(from, &msg);
-        tokio::task::spawn_blocking(move || ss::submit_fixed_topic(topic, &[topic], &data, 0))
+        let envelope = encode_envelope(from, &msg);
+        // The statement store keeps only ONE statement per (account, channel=topic) —
+        // last-write-wins — so an offer/answer and its trickled ICE candidates would evict
+        // one another (only the newest survives). Instead ACCUMULATE every signal we've sent
+        // this peer and rewrite the whole set as one statement, with a strictly-increasing
+        // priority so the newest (largest) bundle always wins. `read_signals` unpacks the set;
+        // the caller dedups by (from, msg), so resending earlier envelopes is harmless.
+        let (data, prio) = {
+            let mut outbox = self.outbox.lock().unwrap_or_else(|e| e.into_inner());
+            let list = outbox.entry(to.0).or_default();
+            list.push(envelope);
+            (encode_bundle(list), self.prio.fetch_add(1, Ordering::SeqCst))
+        };
+        tokio::task::spawn_blocking(move || ss::submit_fixed_topic(topic, &[topic], &data, prio))
             .await
             .map_err(err)?
             .map_err(err)
@@ -283,8 +351,11 @@ impl ChainSignaling {
             .map_err(err)?;
         let mut out = Vec::new();
         for st in statements {
-            if let Some(pair) = decode_envelope(&st.data) {
-                out.push(pair);
+            // Each statement is a bundle of envelopes (see `publish_signal`).
+            for env in decode_bundle(&st.data) {
+                if let Some(pair) = decode_envelope(&env) {
+                    out.push(pair);
+                }
             }
         }
         Ok(out)
@@ -376,7 +447,7 @@ mod tests {
         let stream = StreamId([7u8; 32]);
         let sig = ChainSignaling::new(stream, 1);
         let me = PeerId::from_u64(42);
-        let pres = Presence { peer_id: me, caps_upload_bps: 5_000_000, ttl_s: 30, manifest_cid: None, relay: false };
+        let pres = Presence { peer_id: me, publisher: me.0, caps_upload_bps: 5_000_000, ttl_s: 30, manifest_cid: None, relay: false };
 
         // Best-effort: a fresh ephemeral key has no allowance until provisioned,
         // so a `noAllowance` here is an environment skip, not a code failure.

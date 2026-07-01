@@ -124,11 +124,38 @@ fn content_type(ct: &str) -> tiny_http::Header {
         .expect("valid header")
 }
 
+/// `Access-Control-Allow-Origin: *`. hls.js (Android WebView) fetches the playlist +
+/// segments via XHR from the app's origin (`http://tauri.localhost`), which is cross-origin
+/// to this loopback server — so Chromium enforces CORS and drops responses lacking this
+/// header (hls.js reports `manifestLoadError`). Native `<video src>` (desktop) isn't subject
+/// to XHR CORS, so this only bites the mobile hls.js path. Allowing any origin is safe: the
+/// server binds 127.0.0.1 and serves only this app's own stream — no cross-site data to leak.
+fn cors() -> tiny_http::Header {
+    tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..])
+        .expect("valid header")
+}
+
 fn not_found() -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     tiny_http::Response::from_string("not found").with_status_code(404)
 }
 
 fn handle(req: tiny_http::Request, shared: &Arc<Mutex<Shared>>, play_head: &Arc<AtomicU64>) {
+    // CORS preflight: hls.js may OPTIONS-probe before a cross-origin segment fetch (e.g. with
+    // a Range header). Answer permissively and return — loopback-only, this app's own stream.
+    if req.method() == &tiny_http::Method::Options {
+        let resp = tiny_http::Response::empty(204)
+            .with_header(cors())
+            .with_header(
+                tiny_http::Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"GET, OPTIONS"[..])
+                    .expect("valid header"),
+            )
+            .with_header(
+                tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Range"[..])
+                    .expect("valid header"),
+            );
+        let _ = req.respond(resp);
+        return;
+    }
     let raw = req.url().to_string();
     let url = raw.split('?').next().unwrap_or(&raw); // tolerate cache-busting queries
     let g = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -159,6 +186,7 @@ fn handle(req: tiny_http::Request, shared: &Arc<Mutex<Shared>>, play_head: &Arc<
         not_found()
     };
     drop(g);
+    let resp = resp.with_header(cors());
     let _ = req.respond(resp);
 }
 

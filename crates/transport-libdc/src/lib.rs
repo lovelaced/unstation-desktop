@@ -512,6 +512,7 @@ fn handle_cmd(
                     if p.inbound {
                         reachable.store(true, Ordering::Relaxed);
                     }
+                    log::info!("[libdc] {peer:?}: PeerConnected — ctrl+bulk channels open");
                     let link: Arc<dyn Link> =
                         Arc::new(LibDcLink { remote: peer, cmd: reactor_cmd.clone() });
                     let _ = inbox.send(EngineEvent::PeerConnected { peer, link });

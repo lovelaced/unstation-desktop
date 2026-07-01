@@ -276,11 +276,15 @@ async fn start_watch(
         return Err("Sign in with the Polkadot app to watch — peers need a verified identity.".into());
     }
     let stream = stream_id_from(&target);
+    log::info!("[watch] target={target:?} → stream_id={}", crypto::hex32(&stream.0));
 
     // Localhost HLS re-server → the webview <video> plays from here.
     let hls = HlsServer::start(1000).map_err(|e| e.to_string())?;
     let hls_url = hls.url();
     let sink: Arc<dyn MediaSink> = Arc::new(hls.sink());
+    // A second handle to the SAME local HLS server so the dial loop can install the CMAF
+    // init segment it fetches from Bulletin, alongside the media segments the node feeds.
+    let sink_for_init = sink.clone();
 
     // Viewer node inbox; the transport posts PeerConnected/Inbound here.
     let (view_tx, view_rx) = unbounded_channel::<EngineEvent>();
@@ -326,7 +330,9 @@ async fn start_watch(
         let s = session.clone();
         let appc = app.clone();
         let vtx = view_tx.clone();
+        let sink_init = sink_for_init.clone();
         tasks.push(tokio::spawn(async move {
+            let mut init_installed = false;
             loop {
                 // Mesh-as-relay (M4): hold a few peer connections, dialing whichever
                 // discovered candidates we can reach. A NAT-restricted viewer only needs
@@ -339,17 +345,33 @@ async fn start_watch(
                             break;
                         }
                         // M2 trust gate: only the publisher announces a signed-manifest CID;
-                        // verify it against its PeerId and skip impostors. Resharing viewers
-                        // carry no manifest — their segments are still hash-verified against
-                        // the publisher-authenticated live edge.
+                        // verify it against its PERSONHOOD key (`publisher`, stable across
+                        // the publisher's devices) and skip impostors. `peer_id` is only a
+                        // per-device routing address, so it can't be the trust anchor.
+                        // Resharing viewers carry no manifest — their segments are still
+                        // hash-verified against the publisher-authenticated live edge.
                         if let Some(cid) = cand.manifest_cid.clone() {
                             match BulletinOrigin.fetch_manifest(cid).await {
-                                Ok(m) if m.verify(&cand.peer_id.0).is_ok() => {
-                                    // Verified publisher → its PeerId is the trust anchor
-                                    // for gossiped live-edge announcements (#17).
+                                Ok(m) if m.verify(&cand.publisher).is_ok() => {
+                                    // Verified publisher → its personhood key is the trust
+                                    // anchor for gossiped live-edge announcements (#17).
                                     let _ = vtx.send(EngineEvent::SetPublisherKey {
-                                        key: cand.peer_id.0,
+                                        key: cand.publisher,
                                     });
+                                    // Install the CMAF init segment (ftyp+moov) into the local
+                                    // HLS server so it can serve /init.mp4 — hls.js needs it
+                                    // before ANY media fragment (the playlist's EXT-X-MAP), else
+                                    // it can't initialize MSE (fragLoadError). Once per watch.
+                                    if !init_installed && !m.manifest.init_segment_cid.is_empty() {
+                                        match BulletinOrigin.fetch_bytes(&m.manifest.init_segment_cid).await {
+                                            Ok(b) => {
+                                                log::info!("[watch] init segment installed ({} B)", b.len());
+                                                sink_init.push_init(b);
+                                                init_installed = true;
+                                            }
+                                            Err(e) => log::warn!("[watch] init fetch failed: {e:?}"),
+                                        }
+                                    }
                                 }
                                 Ok(_) => {
                                     let _ = appc.emit(
@@ -630,12 +652,36 @@ async fn start_publish(
     // (the same key as presence), so a viewer verifies it against our PeerId before
     // trusting the stream. Spawned, not awaited, so a slow/unavailable chain never
     // blocks going live; the presence loop picks up the CID once it's set.
+    // The encoder's CMAF init segment (ftyp+moov), handed from the feeder (which loads it off
+    // disk) to the manifest publisher (which puts it on Bulletin so viewers can initialize MSE
+    // before any media fragment — see the viewer's init install in `start_watch`).
+    let init_slot: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
     {
         let session_mc = session.clone();
+        let init_slot = init_slot.clone();
         tokio::spawn(async move {
             let Some(publisher) = unstation_chain::identity_public() else {
                 log::warn!("[publish] no chain identity — skipping signed-manifest publish");
                 return;
+            };
+            // Wait for the init segment, then publish it to Bulletin and reference it in the
+            // manifest (`init_segment_cid`). Viewers fetch + install it before any media
+            // fragment; without it hls.js can't initialize MSE (fragLoadError on init.mp4).
+            let init_bytes = loop {
+                if let Some(b) = init_slot.lock().unwrap().clone() {
+                    break b;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            };
+            let init_segment_cid = match BulletinOrigin.put_bytes(init_bytes.to_vec()).await {
+                Ok(cid) => {
+                    log::info!("[publish] init segment on Bulletin: {cid}");
+                    cid
+                }
+                Err(e) => {
+                    log::warn!("[publish] init put to Bulletin failed: {e:?}");
+                    String::new()
+                }
             };
             let created_at = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -644,9 +690,9 @@ async fn start_publish(
             let manifest = Manifest {
                 stream_id: stream,
                 kind: Kind::Live,
-                // TODO(M2.1): derive codec / init-segment CID / track dims from the CMAF init.
+                // TODO(M2.1): derive codec / track dims from the CMAF init.
                 codec: "avc1.640028,mp4a.40.2".into(),
-                init_segment_cid: String::new(),
+                init_segment_cid,
                 target_segment_ms: 2000,
                 ll_mode: false,
                 tracks: vec![Track { id: "v".into(), bitrate: 0, w: 0, h: 0 }],
@@ -674,6 +720,7 @@ async fn start_publish(
     // a re-attaching UI can read the true live state via `publish_status`.
     let ptx = pub_tx.clone();
     let appc = app.clone();
+    let init_slot_feeder = init_slot.clone();
     let live_flag = Arc::new(AtomicBool::new(false));
     let live_w = live_flag.clone();
     let feeder = tokio::spawn(async move {
@@ -718,6 +765,9 @@ async fn start_publish(
                 if !news.is_empty() {
                     if !init_sent {
                         if let Some(init) = segmenter::load_init(&dir) {
+                            // Hand the init to the manifest publisher (→ Bulletin → viewers)
+                            // and feed our own self-preview. (Bytes clone is cheap.)
+                            *init_slot_feeder.lock().unwrap() = Some(init.clone());
                             preview.push_init(init);
                             init_sent = true;
                         }
@@ -789,9 +839,14 @@ fn stop_publish(state: State<'_, AppState>) {
 /// Initialize stderr logging so chain/transport/SDK errors are visible (default: `info`;
 /// override with `RUST_LOG`). Idempotent — safe to call once at each shell's startup.
 pub fn init_logging() {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info,sqlx=warn,jsonrpsee=warn"),
-    )
+    // Quiet the statement-store subscribe/notification spam (per-poll "fetched N statements"),
+    // and turn UP the mesh/signaling/transport internals we actually debug against (discovery,
+    // dial, SDP/ICE, PeerConnected). RUST_LOG still overrides all of this when set.
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
+        "info,sqlx=warn,jsonrpsee=warn,\
+         useragent_chain::statement_store=warn,\
+         unstation_session=debug,transport_libdc=debug,unstation_chain=debug,unstation_core=debug",
+    ))
     .try_init();
     log::info!("Unstation starting");
 }

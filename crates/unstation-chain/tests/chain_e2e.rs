@@ -48,7 +48,7 @@ async fn local_chain_round_trips_presence_signaling_and_edge() {
     let sig = ChainSignaling::new(stream, 1);
 
     // ---- presence (short retry to absorb the allowance landing in a block) ----
-    let pres = Presence { peer_id: me, caps_upload_bps: 20_000_000, ttl_s: 30, manifest_cid: None, relay: true };
+    let pres = Presence { peer_id: me, publisher: me.0, caps_upload_bps: 20_000_000, ttl_s: 30, manifest_cid: None, relay: true };
     let mut waited = 0u64;
     loop {
         match sig.publish_presence(pres.clone()).await {

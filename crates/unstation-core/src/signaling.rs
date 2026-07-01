@@ -14,11 +14,21 @@ use std::sync::{Arc, Mutex};
 /// A presence announcement published to the (sharded) discovery topic.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Presence {
+    /// Per-**device** mesh routing id (signaling address, dial target, self-filter).
+    /// NOT a signing key and NOT the personhood key: two devices of the SAME person
+    /// share a personhood/statement-store key but MUST have distinct `peer_id`s, else
+    /// each filters the other out of discovery as "self" (the bug that made cross-machine
+    /// watch impossible). The personhood key lives in `publisher`.
     pub peer_id: PeerId,
+    /// The publisher's **personhood** (statement-store) public key — the trust anchor a
+    /// viewer verifies the signed manifest + gossiped live-edge against. Stable across a
+    /// person's devices (the `peer_id` is not). For plain viewers this equals their own
+    /// personhood key and is unused by the dial trust gate (they carry no manifest).
+    pub publisher: [u8; 32],
     pub caps_upload_bps: u64,
     pub ttl_s: u32,
     /// Bulletin CID of the publisher's signed manifest (M2). A viewer fetches +
-    /// verifies it against `peer_id` (which is the publisher's sr25519 pubkey)
+    /// verifies it against `publisher` (the publisher's sr25519 personhood pubkey)
     /// before trusting the stream. `None` until the publisher has published it
     /// (e.g. before the encoder's init segment exists), or for plain viewers.
     pub manifest_cid: Option<String>,
@@ -32,6 +42,8 @@ pub struct Presence {
 #[derive(Encode, Decode, Clone, Debug, PartialEq, Eq)]
 pub struct PresenceRecord {
     pub peer_id: [u8; 32],
+    /// Personhood/statement-store pubkey — trust anchor (see [`Presence::publisher`]).
+    pub publisher: [u8; 32],
     pub caps_upload_bps: u64,
     pub ttl_s: u32,
     pub manifest_cid: Option<String>,
@@ -42,6 +54,7 @@ impl From<&Presence> for PresenceRecord {
     fn from(p: &Presence) -> Self {
         Self {
             peer_id: p.peer_id.0,
+            publisher: p.publisher,
             caps_upload_bps: p.caps_upload_bps,
             ttl_s: p.ttl_s,
             manifest_cid: p.manifest_cid.clone(),
@@ -53,6 +66,7 @@ impl From<PresenceRecord> for Presence {
     fn from(r: PresenceRecord) -> Self {
         Self {
             peer_id: PeerId(r.peer_id),
+            publisher: r.publisher,
             caps_upload_bps: r.caps_upload_bps,
             ttl_s: r.ttl_s,
             manifest_cid: r.manifest_cid,
@@ -168,6 +182,7 @@ mod tests {
         // flag through a SCALE round-trip (the chain publishes/reads via PresenceRecord).
         let rec = PresenceRecord {
             peer_id: [7u8; 32],
+            publisher: [8u8; 32],
             caps_upload_bps: 20_000_000,
             ttl_s: 30,
             manifest_cid: Some("bafy-manifest-cid".into()),
@@ -185,6 +200,7 @@ mod tests {
     fn presence_record_converts_to_and_from_presence() {
         let p = Presence {
             peer_id: PeerId([9u8; 32]),
+            publisher: [10u8; 32],
             caps_upload_bps: 5,
             ttl_s: 30,
             manifest_cid: Some("cid".into()),
@@ -196,7 +212,7 @@ mod tests {
     }
 
     fn rec(id: u8, relay: bool) -> PresenceRecord {
-        PresenceRecord { peer_id: [id; 32], caps_upload_bps: 1, ttl_s: 30, manifest_cid: None, relay }
+        PresenceRecord { peer_id: [id; 32], publisher: [id; 32], caps_upload_bps: 1, ttl_s: 30, manifest_cid: None, relay }
     }
 
     #[test]

@@ -538,6 +538,7 @@ async fn presence_gossip_populates_the_book_and_is_rebroadcast() {
     // A connected peer gossips presence for a (relay-capable) peer X to us.
     let rec = PresenceRecord {
         peer_id: peerx.0,
+        publisher: peerx.0,
         caps_upload_bps: 9_000_000,
         ttl_s: 30,
         manifest_cid: None,

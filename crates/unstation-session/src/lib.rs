@@ -132,7 +132,12 @@ impl Session {
                 // Advertise relay-capability if explicitly opted in OR we've proven
                 // reachable (a peer connected to us inbound) — emergent volunteer relay.
                 let relay = relay_opt_in || transport.reachable();
-                let p = Presence { peer_id: me, caps_upload_bps, ttl_s: PRESENCE_TTL_S, manifest_cid: mc, relay };
+                // `peer_id` is our per-device routing id; `publisher` is our stable
+                // personhood key — the trust anchor viewers verify the manifest/edge
+                // against. Splitting them lets two devices of the same person coexist in
+                // the mesh (they share `publisher` but differ in `peer_id`).
+                let publisher = unstation_chain::identity_public().unwrap_or(me.0);
+                let p = Presence { peer_id: me, publisher, caps_upload_bps, ttl_s: PRESENCE_TTL_S, manifest_cid: mc, relay };
                 // Off-chain presence (TECH_SPEC §7.3): always refresh our own entry in the
                 // in-mesh book so neighbors gossip us onward. Only ANCHORS (publishers +
                 // reachable relay volunteers) ALSO write to the chain — the bootstrap set a
@@ -237,6 +242,7 @@ impl Session {
         // bridges before random peers (the decentralized stand-in for a TURN server).
         out.sort_by_key(|p| !p.relay);
         out.truncate(max);
+        log::info!("[session] discover_peers → {} candidate(s)", out.len());
         out
     }
 
@@ -267,8 +273,12 @@ impl Session {
             loop {
                 tick.tick().await;
                 if let Ok(edge) = signaling.read_edge().await {
+                    if !edge.is_empty() {
+                        log::debug!("[edge] chain poll → {} entr(ies)", edge.len());
+                    }
                     for (seq, id) in edge {
                         if seen.insert(seq) {
+                            log::info!("[edge] chain → LiveEdge seq={seq}");
                             let _ = inbox.send(EngineEvent::LiveEdge { seq, id });
                         }
                     }
@@ -298,8 +308,16 @@ async fn relay_outbound(
                 (peer, SignalMsg::IceCandidate { offer_id: String::new(), sdp: cand })
             }
         };
+        let kind = match &msg {
+            SignalMsg::Offer { .. } => "Offer",
+            SignalMsg::Answer { .. } => "Answer",
+            SignalMsg::IceCandidate { .. } => "IceCandidate",
+            SignalMsg::Closed { .. } => "Closed",
+        };
         if let Err(e) = signaling.publish_signal(me, to, msg).await {
-            log::warn!("[session] publish_signal: {e}");
+            log::warn!("[session] → {kind} to {to:?} FAILED: {e}");
+        } else {
+            log::info!("[session] → {kind} to {to:?} sent");
         }
     }
 }
@@ -326,10 +344,10 @@ async fn relay_inbound(signaling: ChainSignaling, me: PeerId, transport: LibDcTr
                 continue;
             }
             match msg {
-                SignalMsg::Offer { sdp } => transport.accept(from, sdp),
-                SignalMsg::Answer { sdp, .. } => transport.remote_description(from, sdp),
-                SignalMsg::IceCandidate { sdp, .. } => transport.remote_candidate(from, sdp),
-                SignalMsg::Closed { .. } => transport.close(from),
+                SignalMsg::Offer { sdp } => { log::info!("[session] ← Offer from {from:?}"); transport.accept(from, sdp); }
+                SignalMsg::Answer { sdp, .. } => { log::info!("[session] ← Answer from {from:?}"); transport.remote_description(from, sdp); }
+                SignalMsg::IceCandidate { sdp, .. } => { log::debug!("[session] ← IceCandidate from {from:?}"); transport.remote_candidate(from, sdp); }
+                SignalMsg::Closed { .. } => { log::info!("[session] ← Closed from {from:?}"); transport.close(from); }
             }
         }
     }

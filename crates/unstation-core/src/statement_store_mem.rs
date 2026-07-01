@@ -90,6 +90,7 @@ impl StatementSignaling {
     pub fn publish_presence_now(&self, caps_upload_bps: u64) {
         let rec = PresenceRecord {
             peer_id: self.me.0,
+            publisher: self.me.0,
             caps_upload_bps,
             ttl_s: self.ttl_s,
             manifest_cid: None,
@@ -202,7 +203,7 @@ mod tests {
 
         // Peer 8 announces; peer 7 reads peer 8's discovery shard and finds it (read_presence
         // filters out the reader's own record, so peer 7 must look at peer 8's shard).
-        let pres8 = Presence { peer_id: other, caps_upload_bps: 9, ttl_s: 30, manifest_cid: None, relay: true };
+        let pres8 = Presence { peer_id: other, publisher: other.0, caps_upload_bps: 9, ttl_s: 30, manifest_cid: None, relay: true };
         pollster::block_on(b.publish_presence(pres8)).expect("publish via trait");
         let topic8 = crate::topic::discovery_topic(&StreamId([1u8; 32]), shard_for(&other, 2));
         let found = pollster::block_on(a.read_presence(topic8, 8)).expect("read via trait");

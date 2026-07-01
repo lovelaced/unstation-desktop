@@ -87,7 +87,9 @@ export function getAdapter() {
       hostMetadata: {
         hostName: "Unstation",
         hostVersion: "0.0.0",
-        platformType: "desktop",
+        // The Android shim sets window.__unstationPlatformType = "mobile"; desktop leaves it
+        // unset (so the Polkadot app shows the correct host platform, not always "desktop").
+        platformType: (typeof window !== "undefined" && window.__unstationPlatformType) || "desktop",
       },
       adapters: { lazyClient, statementStore },
     });
