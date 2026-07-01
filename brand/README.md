@@ -17,22 +17,31 @@ play triangle. Read it and it says *press play*.
   cd desktop && pnpm tauri icon ../brand/unstation-icon.svg
   ```
 
-## Palette — warm sunset on a near-black room
+## Palette — warm cinematic on a near-black room
+
+Live tokens (source of truth: `desktop/src/index.html` `:root`). Three warm roles kept
+visually distinct: **coral = brand/action**, **amber = seed/fallback**, **green = healthy**.
 
 | Token | Hex | Use |
 |---|---|---|
-| `--ground` | `#120C10` | app background (warm plum-charcoal, video-friendly dark) |
-| `--surface` | `#1C141A` | cards / panels |
-| `--text` | `#F7EFE9` | primary text (warm off-white) |
-| `--dim` | `#BCA9B1` | secondary text |
-| `--faint` | `#7E6E78` | tertiary / captions |
-| `--coral` | `#FF5C7A` | primary accent |
-| `--amber` | `#FFB347` | accent partner |
-| `--grad` | `135°, #FF5C7A → #FFB347` | the **signal gradient** — the one primary action per screen, the play-dot, live cues |
-| `--success` | `#34D399` | healthy connection |
-| `--danger` | `#F2555A` | trouble |
+| `--ground` / `--surface-0` | `#0B0B0E` | app background (warm near-black, video-friendly) |
+| `--surface-1` | `#16151A` | recessed / rail cards |
+| `--surface-2` | `#1E1C24` | raised cards / panels (entry, QR, settings) |
+| `--surface-3` | `#28252F` | highest surface |
+| `--text` | `#ECE7E4` | primary text (warm off-white) |
+| `--dim` | `#9A93A0` | secondary text |
+| `--faint` | `#635D69` | tertiary / captions |
+| `--brand` | `#FF5C7A` | primary action / brand (coral) |
+| `--brand-2` | `#FFB347` | gradient partner (amber) |
+| `--brand-grad` | `135°, #FF5C7A → #FFB347` | **signal gradient** — the one primary action per screen, the play-dot, brand moments |
+| `--ok` | `#21C9AE` | healthy / direct / verified connection (green) |
+| `--seed` | `#FFB347` | seed / fallback / relay state (amber) |
+| `--bad` | `#E54B4B` | trouble / error |
+| `--info` | `#5AA8FF` | connecting / info |
 
-The gradient is for the single action that matters on a screen; everything else stays calm.
+The gradient and coral are for the single action that matters on a screen; everything
+else stays calm. Glass/blur is reserved for floating chrome (titlebar, HUD, panels);
+content cards are solid surfaces, elevated by brightness rather than borders.
 
 ## Type
 

@@ -362,7 +362,7 @@ async fn start_watch(
                     // No candidates discovered yet — keep looking.
                     let _ = appc.emit(
                         "mesh-status",
-                        MeshStatusMsg { state: "connecting".into(), detail: "Reaching the swarm…".into() },
+                        MeshStatusMsg { state: "connecting".into(), detail: "Reaching the mesh…".into() },
                     );
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     continue;
@@ -378,7 +378,7 @@ async fn start_watch(
                     // transport accepts fresh dials, then retry other candidates.
                     let _ = appc.emit(
                         "mesh-status",
-                        MeshStatusMsg { state: "connecting".into(), detail: "Still reaching the swarm…".into() },
+                        MeshStatusMsg { state: "connecting".into(), detail: "Still reaching the mesh…".into() },
                     );
                     for pid in dialed {
                         s.close(pid);

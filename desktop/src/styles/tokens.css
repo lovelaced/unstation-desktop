@@ -1,0 +1,58 @@
+/* tokens: :root custom properties, tabular-nums utility, @font-face — extracted from index.html (do not reorder across files: cascade order = import order in index.css). */
+  :root {
+    /* ---- Warm cinematic identity (Netflix-like): near-black, video leads, one
+       rationed warm accent. Coral is the brand/CTA; amber is seed/fallback;
+       green is the healthy-status signal — three roles kept visually distinct. ---- */
+    --ground: #0B0B0E;          /* warm near-black canvas */
+    --text: #ECE7E4;            /* warm off-white */
+    --dim: #9A93A0;             /* secondary text */
+    --faint: #635D69;           /* tertiary / captions */
+
+    /* Brand — primary action & brand moments only. */
+    --brand: #FF5C7A;           /* coral, primary CTA */
+    --brand-2: #FFB347;         /* amber, gradient end */
+    --brand-grad: linear-gradient(135deg, #FF5C7A, #FFB347);
+    /* --accent / --accent-2 kept as aliases so existing generic-accent rules read
+       as brand-coral; health-specific selectors are overridden to --ok below. */
+    --accent: var(--brand);
+    --accent-2: var(--brand-2);
+
+    /* Status semantics (color + always paired with an icon/label in markup). */
+    --ok: #21C9AE;              /* healthy / direct / verified */
+    --seed: #FFB347;            /* seed / fallback / relay */
+    --bad: #E54B4B;             /* error */
+    --info: #5AA8FF;            /* connecting / info */
+    --idle: var(--faint);       /* neutral / pending */
+
+    /* Solid elevation ladder (brightness, not borders) for content surfaces.
+       Glass is reserved for floating chrome only (titlebar, HUD, net panel, dock). */
+    --surface-0: #0B0B0E;
+    --surface-1: #16151A;
+    --surface-2: #1E1C24;
+    --surface-3: #28252F;
+    --line: rgba(255, 255, 255, 0.06);
+    --line-strong: rgba(255, 255, 255, 0.12);
+    --glass: rgba(20, 18, 24, 0.62);
+    --glass-2: rgba(30, 28, 36, 0.5);
+    --well: rgba(0, 0, 0, 0.32);
+
+    /* Cinematic scrims — dark→transparent gradients over video/imagery so chrome
+       text stays legible (used instead of solid bars). */
+    --scrim-bottom: linear-gradient(transparent, rgba(0,0,0,.72));
+    --scrim-left: linear-gradient(90deg, rgba(0,0,0,.6), transparent 60%);
+
+    --ui: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Inter", system-ui, sans-serif;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+    /* Display face — a technical, slightly-condensed grotesque (bundled, no CDN) used
+       for headlines only; gives the product a distinct broadcast voice. */
+    --display: "Saira", -apple-system, "SF Pro Display", system-ui, sans-serif;
+    --r-win: 14px; --r-card: 16px; --r-pill: 980px;
+    --sp-1: 6px; --sp-2: 10px; --sp-3: 16px; --sp-4: 24px; --sp-5: 38px; --sp-6: 48px; --sp-7: 64px;
+    --spring: cubic-bezier(0.32, 0.72, 0, 1);
+    --ease: cubic-bezier(0.4, 0, 0.2, 1);
+    /* Motion duration tokens, matched to scale. */
+    --t-hover: .12s; --t-control: .18s; --t-panel: .28s; --t-scene: .36s;
+  }
+  /* All live numeric readouts align (no jitter as values tick). */
+  .mono, [class*="ttff"], .v, .pct, .peers, #peerCount, .viewers, .ph-stat .v { font-variant-numeric: tabular-nums; }
+  @font-face { font-family: "Saira"; src: url("./fonts/saira-700.woff2") format("woff2"); font-weight: 700; font-style: normal; font-display: swap; }

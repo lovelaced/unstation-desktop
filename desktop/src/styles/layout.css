@@ -1,0 +1,40 @@
+/* layout: window shell, titlebar, tabs, brand, stage — extracted from index.html (do not reorder across files: cascade order = import order in index.css). */
+  body.native .lights { display: none; }           /* OS draws the traffic lights */
+  body.native.plat-macos .titlebar { padding-left: 82px; }  /* room for the OS traffic lights */
+
+  .win { position: relative; z-index: 1; width: min(1080px, 100%); height: min(720px, calc(100vh - 56px));
+    border-radius: var(--r-win); background: linear-gradient(180deg, #16131a 0%, var(--ground) 100%);
+    border: 1px solid var(--line-strong);
+    box-shadow: 0 0 0 .5px rgba(0,0,0,.5), 0 30px 80px -20px rgba(0,0,0,.7), 0 8px 24px -8px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.06);
+    overflow: hidden; display: flex; flex-direction: column; isolation: isolate; }
+
+  /* Flex titlebar with non-overlapping zones (no shared grid columns): lights ·
+     tabs (left) · brand (pushed right) · window-controls (Win/Linux). */
+  .titlebar { height: 46px; flex: 0 0 auto; display: flex; align-items: center; gap: 14px;
+    padding: 0 12px; background: var(--glass); backdrop-filter: blur(30px) saturate(1.7); -webkit-backdrop-filter: blur(30px) saturate(1.7);
+    border-bottom: 1px solid var(--line); user-select: none; }
+  .lights { display: flex; gap: 8px; align-items: center; flex: 0 0 auto; }
+  .light { width: 12px; height: 12px; border-radius: 50%; }
+  .light.r { background: #ff5f57; } .light.y { background: #febc2e; } .light.g { background: #28c840; }
+  /* Persistent top-level tabs — always present, the current section highlighted. */
+  .tabs { display: flex; align-items: center; gap: 4px; flex: 0 0 auto; }
+  .tabs[hidden] { display: none; }
+  .tab { -webkit-app-region: no-drag; font-family: var(--ui); font-size: 13px; font-weight: 510; color: var(--dim);
+    background: transparent; border: 1px solid transparent; border-radius: 9px; padding: 6px 12px; cursor: pointer;
+    display: flex; align-items: center; gap: 7px; white-space: nowrap;
+    transition: color .15s var(--ease), background .15s var(--ease), border-color .15s var(--ease); }
+  .tab:hover { color: var(--text); background: rgba(255,255,255,.05); }
+  .tab.active { color: var(--brand); background: rgba(255,92,122,.12); border-color: rgba(255,92,122,.3); }
+  .tab .rec { width: 7px; height: 7px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 8px var(--bad); animation: pulse 1.6s var(--ease) infinite; }
+  .tab .rec[hidden] { display: none; }
+  /* Brand / current-stream title — pushed to the right edge, truncates instead of
+     colliding with the nav on narrow windows. */
+  .tb-brand { margin-left: auto; display: flex; align-items: center; gap: 9px; min-width: 0; flex: 0 1 auto;
+    font-family: var(--mono); font-size: 12.5px; letter-spacing: .2px; color: var(--dim);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: opacity .4s var(--ease); }
+  .tb-brand .verified { display: inline-flex; align-items: center; gap: 5px; color: var(--ok); flex: 0 0 auto; animation: verifyflash .9s var(--ease); }
+  @keyframes verifyflash { 0% { color: #fff; text-shadow: 0 0 14px var(--ok); } 100% { color: var(--ok); text-shadow: none; } }
+  .tb-brand .verified svg { width: 13px; height: 13px; } .tb-brand .sep { color: var(--faint); }
+  #titleText { overflow: hidden; text-overflow: ellipsis; }
+
+  .stage { position: relative; flex: 1 1 auto; min-height: 0; }

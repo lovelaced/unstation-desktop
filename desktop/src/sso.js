@@ -24,7 +24,15 @@ const APP_ID = "unstation";
 // phone enforces no allowlist (any string works); it only needs to be STABLE so
 // the cached grant (`onExisting: 'Ignore'`) is reused on later launches instead
 // of re-prompting. It's the `productId` we pass to `getStatementStoreProver`.
-const PRODUCT_ID = "unstation-mesh";
+//
+// This string ALSO derives the on-chain slot account (`//allowance//statement-store//<id>`),
+// so it's effectively this app's mesh identity seed. BUMPING it derives a fresh slot
+// account — a one-time way to recover from a clogged per-period slot pool: the new
+// account can evict the old account's now-stale slots (past the 60s cooldown) instead
+// of waiting for the 24h period to roll. Keep it stable after bumping, or every launch
+// re-allocates + re-prompts. This is the FINAL production id — change it only to recover
+// from a clogged pool, then keep the new value.
+const PRODUCT_ID = "unstation-live";
 
 // The desktop MUST subscribe to the SAME statement-store (People) chain the
 // Polkadot app posts its pairing handshake to. If they differ, the phone links
@@ -233,19 +241,28 @@ export function statementStoreSlotKey() {
  * later launches, so it only prompts the first time. Resolves `true` on grant /
  * cache-hit, `false` on rejection, no session, or error.
  */
+// Last failure reason from requestStatementStoreAllowance ('NotAvailable',
+// 'Rejected', 'NoSession', 'UnexpectedResponse', …) so the UI can explain the real
+// cause instead of guessing "network". null after a successful attempt.
+let _lastAllowanceError = null;
+export function getLastAllowanceError() { return _lastAllowanceError; }
+
 export async function requestStatementStoreAllowance() {
+  _lastAllowanceError = null;
   let res;
   try {
     const a = getAdapter();
     const sessions = a.sessions.sessions.read();
     if (!sessions || !sessions.length) {
       console.warn("[sso] requestStatementStoreAllowance: no live session");
+      _lastAllowanceError = "NoSession";
       return false;
     }
     const sessionId = sessions[0].id;
     res = await a.allowance.getStatementStoreProver(sessionId, PRODUCT_ID);
   } catch (e) {
     console.error("[sso] requestStatementStoreAllowance threw", e);
+    _lastAllowanceError = (e && (e.reason || e.message)) || "error";
     return false;
   }
   // host-papp returns a neverthrow Result (ResultAsync awaited).
@@ -253,17 +270,19 @@ export async function requestStatementStoreAllowance() {
     if (res && typeof res.match === "function") {
       return res.match(
         () => { console.log("[sso] statement-store allowance granted/cached"); return true; },
-        (err) => { console.warn("[sso] allowance request failed:", err && (err.reason || err.message)); return false; },
+        (err) => { _lastAllowanceError = (err && (err.reason || err.message)) || "failed"; console.warn("[sso] allowance request failed — reason:", err && err.reason, "| message:", err && err.message, "| cause:", err && err.cause, "| full:", err); return false; },
       );
     }
     if (res && typeof res.isOk === "function") {
       if (res.isOk()) return true;
-      console.warn("[sso] allowance request failed:", res.error && (res.error.reason || res.error.message));
+      _lastAllowanceError = (res.error && (res.error.reason || res.error.message)) || "failed";
+      console.warn("[sso] allowance request failed — reason:", res.error && res.error.reason, "| message:", res.error && res.error.message, "| cause:", res.error && res.error.cause, "| full:", res.error);
       return false;
     }
     return !!res; // best-effort if a future SDK returns a plain value
   } catch (e) {
     console.error("[sso] requestStatementStoreAllowance result-handling threw", e);
+    _lastAllowanceError = (e && (e.reason || e.message)) || "error";
     return false;
   }
 }
