@@ -28,7 +28,7 @@ use datachannel::{
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use unstation_core::transport::EngineEvent;
 use unstation_core::types::PeerId;
@@ -48,6 +48,20 @@ pub enum SignalOut {
     LocalDescription { peer: PeerId, sdp: Vec<u8> },
     LocalCandidate { peer: PeerId, cand: Vec<u8> },
 }
+
+/// Connection-lifecycle notifications for the session's connection maintainer —
+/// distinct from the node's `EngineEvent`s so the maintainer reacts to a drop the
+/// moment it happens instead of polling `peer_count()` on a timer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportEvent {
+    Connected(PeerId),
+    Disconnected(PeerId),
+}
+
+/// Default cap on concurrently-held peer connections when accepting inbound offers
+/// (outbound dials always go through). Bounds the O(n²) all-to-all tendency of a
+/// hot swarm; publishers raise it via [`LibDcTransport::set_max_inbound`].
+const MAX_INBOUND_DEFAULT: usize = 32;
 
 /// Commands processed serially on the reactor thread.
 enum Cmd {
@@ -185,6 +199,11 @@ pub struct LibDcTransport {
     /// Set once any peer connects to us inbound — i.e. we're reachable from the
     /// outside and can volunteer as a relay for NAT-restricted peers (M4).
     reachable: Arc<AtomicBool>,
+    /// Optional lifecycle sink (see [`TransportEvent`]); installed by the session's
+    /// connection maintainer via [`LibDcTransport::set_event_sink`].
+    events: Arc<Mutex<Option<UnboundedSender<TransportEvent>>>>,
+    /// Inbound-offer admission cap (see [`MAX_INBOUND_DEFAULT`]).
+    max_inbound: Arc<AtomicUsize>,
 }
 
 impl LibDcTransport {
@@ -211,6 +230,11 @@ impl LibDcTransport {
         let reactor_connected = connected.clone();
         let reachable = Arc::new(AtomicBool::new(false));
         let reactor_reachable = reachable.clone();
+        let events: Arc<Mutex<Option<UnboundedSender<TransportEvent>>>> =
+            Arc::new(Mutex::new(None));
+        let reactor_events = events.clone();
+        let max_inbound = Arc::new(AtomicUsize::new(MAX_INBOUND_DEFAULT));
+        let reactor_max_inbound = max_inbound.clone();
         std::thread::Builder::new()
             .name("libdc-reactor".into())
             .spawn(move || {
@@ -228,6 +252,7 @@ impl LibDcTransport {
                         for (peer, p) in peers.drain() {
                             if p.announced {
                                 let _ = inbox.send(EngineEvent::PeerDisconnected { peer });
+                                emit_event(&reactor_events, TransportEvent::Disconnected(peer));
                             }
                         }
                         orphan_cands.clear();
@@ -245,10 +270,24 @@ impl LibDcTransport {
                         &reactor_cmd,
                         &reactor_connected,
                         &reactor_reachable,
+                        &reactor_events,
+                        &reactor_max_inbound,
                     );
                 }
             })?;
-        Ok(Self { cmd: cmd_tx, connected, reachable })
+        Ok(Self { cmd: cmd_tx, connected, reachable, events, max_inbound })
+    }
+
+    /// Install the connection-lifecycle sink (see [`TransportEvent`]). One sink at a
+    /// time — the session's connection maintainer owns it.
+    pub fn set_event_sink(&self, tx: UnboundedSender<TransportEvent>) {
+        *self.events.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+
+    /// Raise/lower the inbound-offer admission cap (publishers serve more inbound
+    /// viewers than a plain viewer needs to).
+    pub fn set_max_inbound(&self, n: usize) {
+        self.max_inbound.store(n.max(1), Ordering::Relaxed);
     }
 
     /// Number of peers currently connected (both channels open). A real,
@@ -384,6 +423,17 @@ fn flush_candidates(p: &mut Peer) {
     }
 }
 
+/// Best-effort delivery to the (optional) lifecycle sink — see [`TransportEvent`].
+fn emit_event(
+    events: &Mutex<Option<UnboundedSender<TransportEvent>>>,
+    ev: TransportEvent,
+) {
+    if let Some(tx) = events.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        let _ = tx.send(ev);
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // reactor-local state, threaded once from `new`
 fn handle_cmd(
     cmd: Cmd,
     peers: &mut HashMap<PeerId, Peer>,
@@ -394,6 +444,8 @@ fn handle_cmd(
     reactor_cmd: &UnboundedSender<Cmd>,
     connected: &AtomicUsize,
     reachable: &AtomicBool,
+    events: &Mutex<Option<UnboundedSender<TransportEvent>>>,
+    max_inbound: &AtomicUsize,
 ) {
     match cmd {
         Cmd::Dial(peer) => {
@@ -443,6 +495,14 @@ fn handle_cmd(
             // its PeerConnection by overwriting the map entry.
             if peers.contains_key(&peer) {
                 log::debug!("[libdc] accept {peer:?}: already have a connection, ignoring duplicate offer");
+                return;
+            }
+            // Admission cap: bound our degree against a hot swarm's all-to-all
+            // tendency. The offerer simply dials someone else (relay-first ordering
+            // in discovery means it finds a reachable volunteer).
+            let cap = max_inbound.load(Ordering::Relaxed);
+            if peers.len() >= cap {
+                log::debug!("[libdc] accept {peer:?}: at capacity ({cap}) — ignoring offer");
                 return;
             }
             let conf = rtc_config(stun);
@@ -551,6 +611,7 @@ fn handle_cmd(
                     let link: Arc<dyn Link> =
                         Arc::new(LibDcLink { remote: peer, cmd: reactor_cmd.clone() });
                     let _ = inbox.send(EngineEvent::PeerConnected { peer, link });
+                    emit_event(events, TransportEvent::Connected(peer));
                 }
             }
         }
@@ -567,6 +628,7 @@ fn handle_cmd(
                     if p.announced {
                         connected.fetch_sub(1, Ordering::Relaxed);
                         let _ = inbox.send(EngineEvent::PeerDisconnected { peer });
+                        emit_event(events, TransportEvent::Disconnected(peer));
                     }
                 }
             }
@@ -579,6 +641,7 @@ fn handle_cmd(
                 if p.announced {
                     connected.fetch_sub(1, Ordering::Relaxed);
                     let _ = inbox.send(EngineEvent::PeerDisconnected { peer });
+                    emit_event(events, TransportEvent::Disconnected(peer));
                 }
             }
         }

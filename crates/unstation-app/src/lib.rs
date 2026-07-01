@@ -33,6 +33,8 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::task::JoinHandle;
 use unstation_core::config::{MeshConfig, Mode, Role};
 use unstation_core::crypto;
+use unstation_core::signaling::Presence;
+use unstation_core::BoxFuture;
 use unstation_core::manifest::{Kind, Manifest, OriginOfRecord, SignedManifest, Track};
 use unstation_core::media::MediaSink;
 use unstation_core::node::MeshNode;
@@ -190,14 +192,26 @@ fn cfg(mode: Mode, role: Role) -> MeshConfig {
 }
 
 /// ICE servers. Host candidates carry a LAN on their own; a public STUN server lets
-/// cross-subnet/NAT pairs find a route too (full relay/TURN is M4). Overridable via
-/// `UNSTATION_STUN` (comma-separated URIs; set it empty for host-candidate-only,
-/// e.g. an offline/air-gapped LAN where reaching a public STUN would only add delay).
+/// cross-subnet/NAT pairs find a route too. Overridable via `UNSTATION_STUN`
+/// (comma-separated URIs; set it empty for host-candidate-only, e.g. an offline/
+/// air-gapped LAN where reaching a public STUN would only add delay).
+///
+/// TURN escape hatch: volunteer mesh relays are the primary NAT fallback (no
+/// operator infrastructure), but symmetric-NAT pairs with no reachable volunteer
+/// can set `UNSTATION_TURN` to operator-provided relays — comma-separated
+/// `turn:user:pass@host:port[?transport=udp]` URIs, passed straight to
+/// libdatachannel (which parses embedded credentials). Off by default.
 fn stun() -> Vec<String> {
-    match std::env::var("UNSTATION_STUN") {
+    let mut servers: Vec<String> = match std::env::var("UNSTATION_STUN") {
         Ok(v) => v.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).map(String::from).collect(),
         Err(_) => vec!["stun:stun.l.google.com:19302".into()],
+    };
+    if let Ok(turn) = std::env::var("UNSTATION_TURN") {
+        servers.extend(
+            turn.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).map(String::from),
+        );
     }
+    servers
 }
 
 /// A stream's 32-byte id, derived from its human name (both sides resolve the
@@ -340,112 +354,83 @@ async fn start_watch(
     // pile up and get re-dialed.
     tasks.push(session.spawn_presence(20_000_000, false));
 
-    // Discover the publisher and dial it, then keep the connection alive: if the dial
-    // stalls (no connect within the timeout) or the peer later drops, re-discover and
-    // re-dial. (watch returns now so the UI can attach the player while this runs.)
+    // Connection upkeep now lives in the session's maintainer (dial pacing with
+    // exponential backoff, hung-dial abandonment, instant reaction to drops — no
+    // fixed reconnect lag). What stays here is the app's TRUST GATE, run for every
+    // candidate before it's dialed:
+    //
+    // M2: only the publisher announces a signed-manifest CID; verify it against its
+    // PERSONHOOD key (`publisher`, stable across the publisher's devices) and skip
+    // impostors — `peer_id` is only a per-device routing address, so it can't be the
+    // trust anchor. Resharing viewers carry no manifest; their segments are still
+    // hash-verified against the publisher-authenticated live edge. On first verify,
+    // install the CMAF init segment (ftyp+moov) into the local HLS server so it can
+    // serve /init.mp4 — hls.js needs it before ANY media fragment (EXT-X-MAP).
     {
-        let s = session.clone();
-        let appc = app.clone();
         let vtx = view_tx.clone();
+        let appc = app.clone();
         let sink_init = sink_for_init.clone();
-        tasks.push(tokio::spawn(async move {
-            let mut init_installed = false;
-            loop {
-                // Mesh-as-relay (M4): hold a few peer connections, dialing whichever
-                // discovered candidates we can reach. A NAT-restricted viewer only needs
-                // ONE reachable peer — the swarm relays the rest. No central relay required.
-                const TARGET_DEGREE: usize = 3;
-                let mut dialed = Vec::new();
-                if s.peer_count() < TARGET_DEGREE {
-                    for cand in s.discover_peers(8).await {
-                        if s.peer_count() >= TARGET_DEGREE {
-                            break;
-                        }
-                        // M2 trust gate: only the publisher announces a signed-manifest CID;
-                        // verify it against its PERSONHOOD key (`publisher`, stable across
-                        // the publisher's devices) and skip impostors. `peer_id` is only a
-                        // per-device routing address, so it can't be the trust anchor.
-                        // Resharing viewers carry no manifest — their segments are still
-                        // hash-verified against the publisher-authenticated live edge.
-                        if let Some(cid) = cand.manifest_cid.clone() {
-                            match BulletinOrigin.fetch_manifest(cid).await {
-                                Ok(m) if m.verify(&cand.publisher).is_ok() => {
-                                    // Verified publisher → its personhood key is the trust
-                                    // anchor for gossiped live-edge announcements (#17).
-                                    let _ = vtx.send(EngineEvent::SetPublisherKey {
-                                        key: cand.publisher,
-                                    });
-                                    // Install the CMAF init segment (ftyp+moov) into the local
-                                    // HLS server so it can serve /init.mp4 — hls.js needs it
-                                    // before ANY media fragment (the playlist's EXT-X-MAP), else
-                                    // it can't initialize MSE (fragLoadError). Once per watch.
-                                    if !init_installed && !m.manifest.init_segment_cid.is_empty() {
-                                        match BulletinOrigin.fetch_bytes(&m.manifest.init_segment_cid).await {
-                                            Ok(b) => {
-                                                log::info!("[watch] init segment installed ({} B)", b.len());
-                                                sink_init.push_init(b);
-                                                init_installed = true;
-                                            }
-                                            Err(e) => log::warn!("[watch] init fetch failed: {e:?}"),
-                                        }
+        let init_installed = Arc::new(AtomicBool::new(false));
+        let filter: Arc<dyn Fn(Presence) -> BoxFuture<'static, bool> + Send + Sync> =
+            Arc::new(move |cand: Presence| {
+                let vtx = vtx.clone();
+                let appc = appc.clone();
+                let sink_init = sink_init.clone();
+                let init_installed = init_installed.clone();
+                Box::pin(async move {
+                    let Some(cid) = cand.manifest_cid.clone() else {
+                        return true; // a resharing viewer — no manifest to check
+                    };
+                    match BulletinOrigin.fetch_manifest(cid).await {
+                        Ok(m) if m.verify(&cand.publisher).is_ok() => {
+                            // Verified publisher → its personhood key is the trust
+                            // anchor for gossiped live-edge announcements (#17).
+                            let _ = vtx.send(EngineEvent::SetPublisherKey { key: cand.publisher });
+                            if !init_installed.load(Ordering::Relaxed)
+                                && !m.manifest.init_segment_cid.is_empty()
+                            {
+                                match BulletinOrigin.fetch_bytes(&m.manifest.init_segment_cid).await {
+                                    Ok(b) => {
+                                        log::info!("[watch] init segment installed ({} B)", b.len());
+                                        sink_init.push_init(b);
+                                        init_installed.store(true, Ordering::Relaxed);
                                     }
+                                    Err(e) => log::warn!("[watch] init fetch failed: {e:?}"),
                                 }
-                                Ok(_) => {
-                                    let _ = appc.emit(
-                                        "mesh-status",
-                                        MeshStatusMsg { state: "error".into(), detail: "Couldn’t verify a broadcaster — skipping.".into() },
-                                    );
-                                    continue;
-                                }
-                                Err(e) => log::warn!("[watch] manifest fetch failed ({e:?}); proceeding (segments still hash-verified)"),
                             }
+                            true
                         }
-                        s.dial(cand.peer_id);
-                        dialed.push(cand.peer_id);
+                        Ok(_) => {
+                            let _ = appc.emit(
+                                "mesh-status",
+                                MeshStatusMsg { state: "error".into(), detail: "Couldn’t verify a broadcaster — skipping.".into() },
+                            );
+                            false
+                        }
+                        Err(e) => {
+                            log::warn!("[watch] manifest fetch failed ({e:?}); proceeding (segments still hash-verified)");
+                            true
+                        }
                     }
-                }
-                if s.peer_count() == 0 && dialed.is_empty() {
-                    // No candidates discovered yet — keep looking.
-                    let _ = appc.emit(
-                        "mesh-status",
-                        MeshStatusMsg { state: "connecting".into(), detail: "Reaching the mesh…".into() },
-                    );
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    continue;
-                }
-                // Give fresh dials up to ~12s to open a channel.
-                let mut waited = 0u64;
-                while s.peer_count() == 0 && waited < 12_000 {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    waited += 500;
-                }
-                if s.peer_count() == 0 {
-                    // All dials stalled (lost signal / ICE failure): abandon them so the
-                    // transport accepts fresh dials, then retry other candidates.
-                    let _ = appc.emit(
-                        "mesh-status",
-                        MeshStatusMsg { state: "connecting".into(), detail: "Still reaching the mesh…".into() },
-                    );
-                    for pid in dialed {
-                        s.close(pid);
-                    }
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    continue;
-                }
-                // Connected to at least one peer — the mesh delivers. Re-evaluate
-                // periodically to top up toward TARGET_DEGREE and replace dropped peers.
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            }
-        }));
+                })
+            });
+        tasks.push(session.spawn_maintainer(3, filter));
     }
 
-    // Stream real mesh stats to the webview (live peer count from the transport).
+    // Stream real mesh stats to the webview (live peer count from the transport),
+    // and keep the "reaching the mesh" status honest while no peer is connected.
     {
         let s = session.clone();
         let appc = app.clone();
         tasks.push(tokio::spawn(async move {
             loop {
                 let peers = s.peer_count();
+                if peers == 0 {
+                    let _ = appc.emit(
+                        "mesh-status",
+                        MeshStatusMsg { state: "connecting".into(), detail: "Reaching the mesh…".into() },
+                    );
+                }
                 let _ = appc.emit(
                     "mesh-stats",
                     MeshStatsMsg {
@@ -712,8 +697,10 @@ async fn start_publish(
     let (pub_tx, pub_rx) = unbounded_channel::<EngineEvent>();
 
     // Boot chain signaling + WebRTC, then the live publisher node (its PeerId is
-    // the statement-store account it announces under).
+    // the statement-store account it announces under). The origin serves many more
+    // inbound viewers than a plain viewer's default admission cap allows.
     let session = Session::start(stream, 1, stun(), pub_tx.clone())?;
+    session.set_max_inbound(128);
     let publisher = MeshNode::new_live_publisher(
         session.my_peer,
         cfg(Mode::Live, Role::Publisher),
@@ -897,6 +884,9 @@ async fn start_publish(
     let preview = hls.sink();
     let (pub_tx, pub_rx) = unbounded_channel::<EngineEvent>();
     let session = Session::start(stream, 1, stun(), pub_tx.clone())?;
+    // Phone uplinks fan out to fewer directly-served viewers than desktop, but the
+    // origin still shouldn't sit at the viewer default.
+    session.set_max_inbound(64);
     let publisher = MeshNode::new_live_publisher(
         session.my_peer,
         cfg(Mode::Live, Role::Publisher),

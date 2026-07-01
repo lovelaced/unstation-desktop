@@ -16,6 +16,9 @@
 //!
 //! [`Link`]: unstation_core::transport::Link
 
+mod dialer;
+pub use dialer::{Dialer, DIAL_TIMEOUT};
+
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,7 +26,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::time::{interval, sleep};
 
-use transport_libdc::{LibDcTransport, SignalOut};
+use transport_libdc::{LibDcTransport, SignalOut, TransportEvent};
 use unstation_chain::ChainSignaling;
 use unstation_core::node::EdgeSigner;
 use unstation_core::signaling::{BanList, Presence, PresenceBook, PresenceRecord, Signaling, SignalMsg};
@@ -33,6 +36,8 @@ use unstation_core::types::{PeerId, SegmentId, Seq, StreamId};
 
 const SIGNAL_POLL: Duration = Duration::from_millis(800);
 const DISCOVERY_POLL: Duration = Duration::from_secs(2);
+/// Maintainer re-evaluation cadence absent any transport event.
+const MAINTAIN_TICK: Duration = Duration::from_secs(1);
 const PRESENCE_REFRESH: Duration = Duration::from_secs(10);
 const EDGE_REFRESH: Duration = Duration::from_secs(2);
 const PRESENCE_TTL_S: u32 = 30;
@@ -292,6 +297,84 @@ impl Session {
     /// arrives at the node inbox as `PeerConnected` once both channels open.
     pub fn dial(&self, publisher: PeerId) {
         self.transport.dial(publisher);
+    }
+
+    /// Raise/lower the transport's inbound-offer admission cap (publishers serve
+    /// far more inbound viewers than a plain viewer ever holds).
+    pub fn set_max_inbound(&self, n: usize) {
+        self.transport.set_max_inbound(n);
+    }
+
+    /// Viewer: own the connection lifecycle — keep `target_degree` connections
+    /// healthy, react to a drop the moment it happens (no polling lag), pace
+    /// per-peer retries with exponential backoff + jitter, and abandon dials that
+    /// hang mid-handshake so the transport's glare guard frees up.
+    ///
+    /// `filter` is the app's async trust gate (e.g. verify a publisher's signed
+    /// manifest): a discovered candidate is dialed only if it returns true. Banned
+    /// peers never reach it (`discover_peers` already screens them).
+    pub fn spawn_maintainer(
+        &self,
+        target_degree: usize,
+        filter: Arc<dyn Fn(Presence) -> unstation_core::BoxFuture<'static, bool> + Send + Sync>,
+    ) -> tokio::task::JoinHandle<()> {
+        let transport = self.transport.clone();
+        let session = self.clone();
+        let dialer = Dialer::new();
+        let (ev_tx, mut ev_rx) = unbounded_channel::<TransportEvent>();
+        transport.set_event_sink(ev_tx);
+        tokio::spawn(async move {
+            loop {
+                // Abandon dials that hung mid-handshake (lost signaling / ICE failure):
+                // close them so a fresh dial isn't blocked by the duplicate guard, and
+                // let the backoff schedule own the retry.
+                for p in dialer.stalled() {
+                    log::info!("[session] dial to {p:?} timed out — abandoning");
+                    transport.close(p);
+                    dialer.record_failed(p);
+                }
+                // Top up toward the target degree, budgeted so one sweep never dials
+                // more candidates than the connections it's actually missing (+1 hedge).
+                let have = transport.peer_count();
+                if have < target_degree {
+                    let mut budget = target_degree - have + 1;
+                    for cand in session.discover_peers(16).await {
+                        if budget == 0 || transport.peer_count() >= target_degree {
+                            break;
+                        }
+                        if !dialer.should_dial(&cand.peer_id) {
+                            continue;
+                        }
+                        let peer = cand.peer_id;
+                        if !(filter)(cand).await {
+                            continue;
+                        }
+                        log::info!("[session] maintainer dialing {peer:?}");
+                        dialer.record_started(peer);
+                        transport.dial(peer);
+                        budget -= 1;
+                    }
+                }
+                // Sleep until something changes: a lifecycle event (a drop triggers an
+                // immediate re-evaluation — this kills the old fixed reconnect lag) or
+                // the periodic tick (ages stalled dials + retries after backoff).
+                tokio::select! {
+                    ev = ev_rx.recv() => match ev {
+                        Some(TransportEvent::Connected(p)) => dialer.record_connected(&p),
+                        Some(TransportEvent::Disconnected(p)) => dialer.record_failed(p),
+                        None => break,
+                    },
+                    _ = sleep(MAINTAIN_TICK) => {}
+                }
+                // Coalesce any burst before re-evaluating.
+                while let Ok(ev) = ev_rx.try_recv() {
+                    match ev {
+                        TransportEvent::Connected(p) => dialer.record_connected(&p),
+                        TransportEvent::Disconnected(p) => dialer.record_failed(p),
+                    }
+                }
+            }
+        })
     }
 
     /// Tear down a peer connection (e.g. to abandon a stalled dial before retrying —
