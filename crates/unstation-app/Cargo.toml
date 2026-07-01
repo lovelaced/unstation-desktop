@@ -40,6 +40,11 @@ useragent-chain = { package = "useragent-chain", path = "../../../useragent-kit/
 schnorrkel = "0.11"
 bip39 = { version = "2", features = ["rand"] }
 
+# Android camera-publish (M4): the Kotlin capture plugin pushes encoded H.264 access units
+# into Rust over JNI (see `camera.rs`). Android-only; no effect on the desktop build.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]

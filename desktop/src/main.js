@@ -229,6 +229,10 @@ import { viewerVerdict, renderViewerHealth } from './health.js';
         pubHlsUrl = info.hls_url; pubActive = true; refreshGoLiveBadge();
         document.getElementById('ingestServer').textContent = info.ingest_server;
         document.getElementById('ingestKey').textContent = info.stream_key;
+        // Android: start_publish has opened the AU intake; now start the camera capture
+        // (a no-op seam on desktop, which ingests via RTMP/OBS instead). Its error — e.g. a
+        // camera-permission prompt — surfaces in the same waiting UI below.
+        if(window.__onPublishStarted) await window.__onPublishStarted();
       } catch(err){ const w=document.getElementById('pubWaiting'); const b=w&&w.querySelector('b'); if(b) b.textContent=''+err; }
     } else {
       pubActive = true; refreshGoLiveBadge();
@@ -251,9 +255,14 @@ import { viewerVerdict, renderViewerHealth } from './health.js';
     const v = document.getElementById('pubVid');
     if(tag) tag.style.display = live ? '' : 'none';
     if(waiting) waiting.style.display = live ? 'none' : 'flex';
-    document.getElementById('pubHeadline').textContent = live ? 'You’re live.' : 'Waiting for your encoder…';
+    document.getElementById('pubHeadline').textContent = live ? 'You’re live.' : (window.__unstationPlatformType === 'mobile' ? 'Starting your camera…' : 'Waiting for your encoder…');
     if(live){
-      if(NATIVE && pubHlsUrl){ try{ if(v.canPlayType('application/vnd.apple.mpegurl')){ v.src=pubHlsUrl + (pubHlsUrl.includes('?')?'&':'?') + 't=' + Date.now(); v.style.display='block'; v.load(); v.play().catch(()=>{}); } }catch(e){} }
+      if(NATIVE && pubHlsUrl){
+        // Android's Chromium WebView has no native HLS — play the self-preview through hls.js
+        // (the same seam the watch path uses). Desktop (WKWebView) plays the m3u8 natively.
+        if(window.__hlsPlay){ window.__hlsPlay(v, pubHlsUrl, null); }
+        else { try{ if(v.canPlayType('application/vnd.apple.mpegurl')){ v.src=pubHlsUrl + (pubHlsUrl.includes('?')?'&':'?') + 't=' + Date.now(); v.style.display='block'; v.load(); v.play().catch(()=>{}); } }catch(e){} }
+      }
     } else {
       try{ v.pause(); }catch(e){} v.removeAttribute('src'); v.style.display='none';
     }
@@ -309,15 +318,19 @@ import { viewerVerdict, renderViewerHealth } from './health.js';
     if(status){ document.getElementById('mPub').textContent = status.info.publisher; go('live'); setTitle(status.info.publisher, true); startWatchWatchdog(); setVideo(status.info.hls_url); }
     else { go('entry'); }
   }
-  async function endPublish(){
+  function endPublish(){
     publishing = false; pubActive = false; pubName = ''; pubLive = false; pubLiveSince = 0; lastViewers = 0; clearInterval(pubViewersTimer);
     refreshGoLiveBadge();
-    if(NATIVE && invoke){ try{ await invoke('stop_publish'); }catch(e){} }
+    // Update the UI immediately — never block the button on the backend teardown. The camera
+    // stop (MediaCodec + Camera2 close) can take a moment on mobile; awaiting it here made
+    // "End stream" feel dead. Tear the backend + camera down in the background instead.
     titleEl.readOnly = false;
     document.getElementById('pubLive').hidden = true;
     const tag=document.getElementById('pubLiveTag'); if(tag) tag.style.display='none';
     const v=document.getElementById('pubVid'); try{ v.pause(); }catch(e){} v.removeAttribute('src'); v.style.display='none';
     go('entry');
+    if(NATIVE && invoke){ invoke('stop_publish').catch(()=>{}); }
+    if(window.__onPublishStopped){ Promise.resolve(window.__onPublishStopped()).catch(()=>{}); }
   }
   async function leaveWatch(){ if(fsOn) toggleFullscreen(); if(NATIVE && invoke){ try{ await invoke('stop_watch'); }catch(e){} } const v=document.getElementById('vid'); clearInterval(v._retry); clearWatchUi(); try{ v.pause(); }catch(e){} v.removeAttribute('src'); v.style.display='none'; go('entry'); }
   // Use the async session check (the sync one races storage hydration and wrongly

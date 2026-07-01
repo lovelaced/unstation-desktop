@@ -21,6 +21,10 @@ use std::process::{Child, Command, Stdio};
 use unstation_core::crypto::segment_id;
 use unstation_core::types::{SegmentId, Seq};
 
+/// In-memory CMAF muxer for the non-ffmpeg (Android camera) publish path — see [`fmp4`].
+mod fmp4;
+pub use fmp4::{FragmentBuilder, H264Params};
+
 /// A content-addressed CMAF segment.
 pub struct Segment {
     pub seq: Seq,

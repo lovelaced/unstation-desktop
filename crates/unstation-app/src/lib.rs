@@ -19,6 +19,10 @@
 
 use bytes::Bytes;
 use hls_server::HlsServer;
+
+// Android camera-publish (M4): encoded-AU intake from the Kotlin capture plugin over JNI.
+#[cfg(all(target_os = "android", feature = "publish"))]
+mod camera;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -588,7 +592,66 @@ fn watch_status(state: State<'_, AppState>) -> Option<WatchStatus> {
 
 /// Go Live: start the local RTMP ingest (point OBS here), run a live publisher
 /// node, announce the stream on the statement store, and serve a self-preview.
+/// Publish the signed manifest to Bulletin + announce its CID. Waits for the encoder's CMAF
+/// init segment (filled into `init_slot` by the feeder), puts it on Bulletin, references it in
+/// the manifest's `init_segment_cid`, signs, and publishes — spawned so a slow chain never
+/// blocks going live. Shared by the desktop (ffmpeg) and Android (camera) publish paths.
 #[cfg(feature = "publish")]
+fn spawn_manifest_publish(session: &Session, stream: StreamId, init_slot: Arc<Mutex<Option<Bytes>>>) {
+    let session_mc = session.clone();
+    tokio::spawn(async move {
+        let Some(publisher) = unstation_chain::identity_public() else {
+            log::warn!("[publish] no chain identity — skipping signed-manifest publish");
+            return;
+        };
+        let init_bytes = loop {
+            if let Some(b) = init_slot.lock().unwrap().clone() {
+                break b;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        let init_segment_cid = match BulletinOrigin.put_bytes(init_bytes.to_vec()).await {
+            Ok(cid) => {
+                log::info!("[publish] init segment on Bulletin: {cid}");
+                cid
+            }
+            Err(e) => {
+                log::warn!("[publish] init put to Bulletin failed: {e:?}");
+                String::new()
+            }
+        };
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let manifest = Manifest {
+            stream_id: stream,
+            kind: Kind::Live,
+            // TODO(M2.1): derive codec / track dims from the CMAF init.
+            codec: "avc1.640028,mp4a.40.2".into(),
+            init_segment_cid,
+            target_segment_ms: 2000,
+            ll_mode: false,
+            tracks: vec![Track { id: "v".into(), bitrate: 0, w: 0, h: 0 }],
+            publisher,
+            created_at,
+        };
+        let Some(sig) = unstation_chain::sign_with_identity(&manifest.signing_payload()) else {
+            log::warn!("[publish] could not sign manifest");
+            return;
+        };
+        match BulletinOrigin.put_manifest(SignedManifest { manifest, sig }).await {
+            Ok(cid) => {
+                log::info!("[publish] signed manifest on Bulletin: {cid}");
+                session_mc.set_manifest_cid(cid);
+            }
+            Err(e) => log::warn!("[publish] manifest put to Bulletin failed: {e:?}"),
+        }
+    });
+}
+
+/// Desktop publish: ffmpeg listens for an RTMP ingest (OBS) and segments it into CMAF.
+#[cfg(all(feature = "publish", not(target_os = "android")))]
 #[tauri::command]
 async fn start_publish(
     app: AppHandle,
@@ -666,71 +729,12 @@ async fn start_publish(
     // NAT-restricted viewers should prefer dialing it.
     session.spawn_presence(80_000_000, true);
 
-    // M2 — publish the SIGNED MANIFEST to the Bulletin chain (the durable trust
-    // anchor) and announce its CID in presence. Signed with this host's identity
-    // (the same key as presence), so a viewer verifies it against our PeerId before
-    // trusting the stream. Spawned, not awaited, so a slow/unavailable chain never
-    // blocks going live; the presence loop picks up the CID once it's set.
-    // The encoder's CMAF init segment (ftyp+moov), handed from the feeder (which loads it off
-    // disk) to the manifest publisher (which puts it on Bulletin so viewers can initialize MSE
-    // before any media fragment — see the viewer's init install in `start_watch`).
+    // M2 — publish the signed manifest to Bulletin + announce its CID in presence (the durable
+    // trust anchor). The feeder fills `init_slot` with the encoder's CMAF init; the shared
+    // publisher waits for it, puts it on Bulletin, and references it in the signed manifest so
+    // viewers can initialize MSE before any media fragment.
     let init_slot: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
-    {
-        let session_mc = session.clone();
-        let init_slot = init_slot.clone();
-        tokio::spawn(async move {
-            let Some(publisher) = unstation_chain::identity_public() else {
-                log::warn!("[publish] no chain identity — skipping signed-manifest publish");
-                return;
-            };
-            // Wait for the init segment, then publish it to Bulletin and reference it in the
-            // manifest (`init_segment_cid`). Viewers fetch + install it before any media
-            // fragment; without it hls.js can't initialize MSE (fragLoadError on init.mp4).
-            let init_bytes = loop {
-                if let Some(b) = init_slot.lock().unwrap().clone() {
-                    break b;
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            };
-            let init_segment_cid = match BulletinOrigin.put_bytes(init_bytes.to_vec()).await {
-                Ok(cid) => {
-                    log::info!("[publish] init segment on Bulletin: {cid}");
-                    cid
-                }
-                Err(e) => {
-                    log::warn!("[publish] init put to Bulletin failed: {e:?}");
-                    String::new()
-                }
-            };
-            let created_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let manifest = Manifest {
-                stream_id: stream,
-                kind: Kind::Live,
-                // TODO(M2.1): derive codec / track dims from the CMAF init.
-                codec: "avc1.640028,mp4a.40.2".into(),
-                init_segment_cid,
-                target_segment_ms: 2000,
-                ll_mode: false,
-                tracks: vec![Track { id: "v".into(), bitrate: 0, w: 0, h: 0 }],
-                publisher,
-                created_at,
-            };
-            let Some(sig) = unstation_chain::sign_with_identity(&manifest.signing_payload()) else {
-                log::warn!("[publish] could not sign manifest");
-                return;
-            };
-            match BulletinOrigin.put_manifest(SignedManifest { manifest, sig }).await {
-                Ok(cid) => {
-                    log::info!("[publish] signed manifest on Bulletin: {cid}");
-                    session_mc.set_manifest_cid(cid);
-                }
-                Err(e) => log::warn!("[publish] manifest put to Bulletin failed: {e:?}"),
-            }
-        });
-    }
+    spawn_manifest_publish(&session, stream, init_slot.clone());
     let (edge_tx, edge_rx) = unbounded_channel::<(Seq, SegmentId)>();
     session.spawn_edge_publisher(edge_rx);
 
@@ -845,6 +849,142 @@ async fn start_publish(
     Ok(info)
 }
 
+/// Android publish: the Kotlin camera plugin (CameraX → MediaCodec) pushes encoded H.264
+/// access units over JNI (see `camera`); the feeder muxes them into CMAF with
+/// `FragmentBuilder` and drives the SAME mesh path as the desktop's ffmpeg feeder.
+#[cfg(all(feature = "publish", target_os = "android"))]
+#[tauri::command]
+async fn start_publish(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    title: Option<String>,
+) -> Result<PublishInfo, String> {
+    if !*state.chain_ready.lock().unwrap() {
+        return Err("Sign in with the Polkadot app to go live — your stream is announced under your verified identity.".into());
+    }
+    let name = title.unwrap_or_else(|| "unstation".into());
+    let canon = canonical_stream_name(&name);
+    let stream = stream_id_from(&name);
+
+    // Re-attach: already publishing this stream → hand back its details unchanged.
+    if let Some(s) = state.publish.lock().unwrap().as_ref() {
+        if s.name == canon {
+            return Ok(s.info.clone());
+        }
+    }
+    // Replace a prior/stale session (aborting its feeder + closing the AU intake).
+    if let Some(prev) = state.publish.lock().unwrap().take() {
+        prev.feeder.abort();
+        prev.stats.abort();
+        let _ = prev.pub_tx.send(EngineEvent::Stop);
+        camera::close_stream();
+    }
+
+    // Self-preview HLS + the publisher node inbox — identical to desktop.
+    let hls = HlsServer::start(1000).map_err(|e| e.to_string())?;
+    let hls_url = hls.url();
+    let preview = hls.sink();
+    let (pub_tx, pub_rx) = unbounded_channel::<EngineEvent>();
+    let session = Session::start(stream, 1, stun(), pub_tx.clone())?;
+    let publisher = MeshNode::new_live_publisher(
+        session.my_peer,
+        cfg(Mode::Live, Role::Publisher),
+        SEG_BYTES,
+        Arc::new(NullSink),
+    )
+    .with_stream_id(stream.0)
+    .with_edge_signer(Arc::new(IdentityEdgeSigner))
+    .with_presence_book(session.presence_book());
+    tokio::spawn(async move {
+        let _ = publisher.run(pub_rx, TICK, None).await;
+    });
+    session.spawn_presence(80_000_000, true);
+
+    let init_slot: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
+    spawn_manifest_publish(&session, stream, init_slot.clone());
+
+    let (edge_tx, edge_rx) = unbounded_channel::<(Seq, SegmentId)>();
+    session.spawn_edge_publisher(edge_rx);
+
+    // Feeder: drain encoded AUs from the camera plugin → mux to CMAF → the three sinks
+    // (self-preview, mesh `Produced`, live edge), exactly like the ffmpeg feeder's tail.
+    let ptx = pub_tx.clone();
+    let appc = app.clone();
+    let live_flag = Arc::new(AtomicBool::new(false));
+    let live_w = live_flag.clone();
+    // Open the AU intake synchronously — BEFORE returning to JS (which then starts the camera
+    // plugin) — so the encoder's config/frames aren't dropped, nor its config cleared by a late
+    // open_stream racing the plugin's `nativeConfig`.
+    let mut rx = camera::open_stream();
+    let feeder = tokio::spawn(async move {
+        // Wait for the encoder's codec-specific data (SPS/PPS) before building the muxer.
+        let config = loop {
+            if let Some(c) = camera::take_config() {
+                break c;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        log::info!(
+            "[publish] camera config {}x{}, sps={}B pps={}B",
+            config.width, config.height, config.sps.len(), config.pps.len()
+        );
+        let mut fb = segmenter::FragmentBuilder::new(segmenter::H264Params {
+            sps: config.sps,
+            pps: config.pps,
+            width: config.width,
+            height: config.height,
+        });
+        // Init segment → self-preview + the manifest publisher (Bulletin, via `init_slot`).
+        let init = fb.init_segment();
+        *init_slot.lock().unwrap() = Some(init.clone());
+        preview.push_init(init);
+        live_w.store(true, Ordering::Relaxed);
+        let _ = appc.emit("publish-state", PublishStateMsg { live: true });
+
+        let mut last_pts: Option<i64> = None;
+        while let Some(au) = rx.recv().await {
+            // Sample duration in 90 kHz ticks from PTS deltas (≈constant-fps; the first AU
+            // gets a ~30fps default). Close enough for CMAF timing at low latency.
+            let dur = match last_pts {
+                Some(prev) => (((au.pts_us - prev).max(1)) as u64 * 90_000 / 1_000_000) as u32,
+                None => 3_000,
+            };
+            last_pts = Some(au.pts_us);
+            if let Some(seg) = fb.push_au(&au.data, dur.max(1), au.keyframe) {
+                log::info!("[publish] fragment seq={} ({} B)", seg.seq, seg.bytes.len());
+                preview.push_segment(seg.seq, seg.bytes.clone());
+                let _ = ptx.send(EngineEvent::Produced { seq: seg.seq, id: seg.id, bytes: seg.bytes });
+                let _ = edge_tx.send((seg.seq, seg.id));
+            }
+        }
+    });
+
+    let stats = {
+        let s = session.clone();
+        let appc = app.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = appc.emit("publish-stats", PublishStatsMsg { viewers: s.peer_count() });
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        })
+    };
+
+    // No RTMP ingest on Android — the camera is the source; the UI hides the OBS rail.
+    let info = PublishInfo { ingest_server: String::new(), stream_key: String::new(), hls_url };
+    *state.publish.lock().unwrap() = Some(PublishSession {
+        _hls: hls,
+        feeder,
+        stats,
+        pub_tx,
+        session,
+        name: canon,
+        info: info.clone(),
+        live: live_flag,
+    });
+    Ok(info)
+}
+
 #[cfg(feature = "publish")]
 #[tauri::command]
 fn stop_publish(state: State<'_, AppState>) {
@@ -853,6 +993,9 @@ fn stop_publish(state: State<'_, AppState>) {
         sess.stats.abort();
         let _ = sess.pub_tx.send(EngineEvent::Stop);
     }
+    // Android: stop accepting encoded AUs from the camera plugin.
+    #[cfg(target_os = "android")]
+    camera::close_stream();
 }
 
 /// Initialize stderr logging so chain/transport/SDK errors are visible (default: `info`;
@@ -870,6 +1013,46 @@ pub fn init_logging() {
     log::info!("Unstation starting");
 }
 
+/// Handle to the registered Android camera plugin, so the app-command wrappers below can drive
+/// it. (Plugin commands need an ACL permission our inline plugin can't define; app commands
+/// don't — so JS calls `camera_start`/`camera_stop`, and we forward to the plugin here.)
+#[cfg(all(target_os = "android", feature = "publish"))]
+static CAMERA_PLUGIN: std::sync::OnceLock<tauri::plugin::PluginHandle<tauri::Wry>> =
+    std::sync::OnceLock::new();
+
+/// Start the Android camera capture (Camera2 → MediaCodec → the Rust muxer). No-op on desktop,
+/// which ingests via RTMP/OBS. JS calls this right after `start_publish` opens the AU intake.
+#[cfg(feature = "publish")]
+#[tauri::command]
+fn camera_start() -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        return CAMERA_PLUGIN
+            .get()
+            .ok_or("camera plugin not registered")?
+            .run_mobile_plugin::<()>("startCapture", ())
+            .map_err(|e| e.to_string());
+    }
+    #[cfg(not(target_os = "android"))]
+    Ok(())
+}
+
+/// Stop the Android camera capture. No-op on desktop.
+#[cfg(feature = "publish")]
+#[tauri::command]
+fn camera_stop() -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        return CAMERA_PLUGIN
+            .get()
+            .ok_or("camera plugin not registered")?
+            .run_mobile_plugin::<()>("stopCapture", ())
+            .map_err(|e| e.to_string());
+    }
+    #[cfg(not(target_os = "android"))]
+    Ok(())
+}
+
 /// The shared Tauri builder — managed [`AppState`] + the command handlers — used by both
 /// the desktop and Android shells. Each shell supplies its own `tauri::generate_context!()`
 /// (its own `tauri.conf.json`/capabilities) and calls `.run(..)`. The publish commands are
@@ -881,6 +1064,18 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
     let b = tauri::Builder::<tauri::Wry>::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default());
+    // Android camera-publish (M4): register the Kotlin CameraPlugin (Camera2 + MediaCodec →
+    // encoded AUs into the Rust core via CameraBridge). JS drives it via `plugin:unstation-camera`.
+    #[cfg(all(target_os = "android", feature = "publish"))]
+    let b = b.plugin(
+        tauri::plugin::Builder::<tauri::Wry, ()>::new("unstation-camera")
+            .setup(|_app, api| {
+                let handle = api.register_android_plugin("io.parity.unstation.android", "CameraPlugin")?;
+                let _ = CAMERA_PLUGIN.set(handle);
+                Ok(())
+            })
+            .build(),
+    );
     #[cfg(feature = "publish")]
     let b = b.invoke_handler(tauri::generate_handler![
         platform,
@@ -896,7 +1091,9 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         watch_status,
         start_publish,
         stop_publish,
-        publish_status
+        publish_status,
+        camera_start,
+        camera_stop
     ]);
     #[cfg(not(feature = "publish"))]
     let b = b.invoke_handler(tauri::generate_handler![
