@@ -10,7 +10,7 @@ members = [
 # The Tauri app and the chain-integration crate are their own crates — kept out of
 # the engine workspace so the heavy tauri/wry and chain-SDK builds don't slow
 # `cargo test --workspace` (the deterministic simulator stays SDK-free).
-exclude = ["desktop/src-tauri", "crates/unstation-chain", "crates/unstation-session"]
+exclude = ["desktop/src-tauri", "crates/unstation-app", "crates/unstation-chain", "crates/unstation-session"]
 
 [workspace.package]
 edition = "2021"

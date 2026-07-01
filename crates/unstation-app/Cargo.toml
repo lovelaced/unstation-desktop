@@ -1,0 +1,44 @@
+[package]
+name = "unstation-app"
+version = "0.0.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Unstation — shared Tauri command/event layer (desktop + Android shells)."
+
+# NOTE: excluded from the engine workspace (see ../../Cargo.toml) alongside the shells,
+# because it pulls in tauri/wry + the chain SDK and would slow `cargo test --workspace`.
+
+[dependencies]
+# `tauri` here has NO `macos-private-api` — the desktop shell adds that feature, and
+# Cargo feature-unification turns it on only for the desktop build. Android gets plain tauri.
+tauri = { version = "2" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+log = "0.4"
+env_logger = "0.11"
+
+# The real engine.
+unstation-core = { path = "../unstation-core" }
+transport-libdc = { path = "../transport-libdc" }
+hls-server = { path = "../hls-server" }
+# ffmpeg/RTMP publish source — desktop-only; behind the `publish` feature. The Android
+# shell (watch) omits it; Android publish (M4) supplies a camera-based source instead.
+segmenter = { path = "../../infra/segmenter", optional = true }
+bytes = "1"
+
+# Real chain integration.
+unstation-session = { path = "../unstation-session" }
+unstation-chain = { path = "../unstation-chain" }
+useragent-native = { package = "useragent-native", path = "../../../useragent-kit/crates/host-native" }
+# testnet-provisioning embeds Alice's dev key → SDK forbids optimized release builds;
+# keep debug-assertions on in the consuming shells' release profile (LAN test builds).
+useragent-chain = { package = "useragent-chain", path = "../../../useragent-kit/crates/host-chain", features = ["testnet-provisioning"] }
+schnorrkel = "0.11"
+bip39 = { version = "2", features = ["rand"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+# RTMP→CMAF ffmpeg publish path. Desktop enables it; Android watch omits it.
+publish = ["dep:segmenter"]

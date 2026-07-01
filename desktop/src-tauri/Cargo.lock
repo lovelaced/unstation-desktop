@@ -7240,6 +7240,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "unstation-app"
+version = "0.0.0"
+dependencies = [
+ "bip39",
+ "bytes",
+ "env_logger",
+ "hls-server",
+ "log",
+ "schnorrkel",
+ "segmenter",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tokio",
+ "transport-libdc",
+ "unstation-chain",
+ "unstation-core",
+ "unstation-session",
+ "useragent-chain",
+ "useragent-native",
+]
+
+[[package]]
 name = "unstation-chain"
 version = "0.1.0"
 dependencies = [
@@ -7272,24 +7295,9 @@ dependencies = [
 name = "unstation-desktop"
 version = "0.0.0"
 dependencies = [
- "bip39",
- "bytes",
- "env_logger",
- "hls-server",
- "log",
- "schnorrkel",
- "segmenter",
- "serde",
- "serde_json",
  "tauri",
  "tauri-build",
- "tokio",
- "transport-libdc",
- "unstation-chain",
- "unstation-core",
- "unstation-session",
- "useragent-chain",
- "useragent-native",
+ "unstation-app",
 ]
 
 [[package]]

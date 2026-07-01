@@ -14,36 +14,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# The desktop shell is thin: it supplies the desktop tauri context (generate_context!) +
+# the macos-private-api window vibrancy, and runs the shared command/event layer from
+# `unstation-app` with the ffmpeg-based `publish` path enabled. All engine/chain deps are
+# transitive through unstation-app. (testnet-provisioning still applies via that crate,
+# hence the debug-assertions release profile below stays.)
 tauri = { version = "2", features = ["macos-private-api"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
-# Logging — the SDK + our crates log via the `log` facade; without an initialized
-# logger every chain/transport error (e.g. statement-store `noAllowance`) is silently
-# dropped. env_logger prints to stderr (visible under `pnpm tauri dev`); the UI also
-# gets a `mesh-status` event for the bundled app where there's no console.
-log = "0.4"
-env_logger = "0.11"
-
-# The real engine.
-unstation-core = { path = "../../crates/unstation-core" }
-transport-libdc = { path = "../../crates/transport-libdc" }
-hls-server = { path = "../../crates/hls-server" }
-segmenter = { path = "../../infra/segmenter" }
-bytes = "1"
-
-# Real chain integration: discovery + SDP-over-statement signaling + WebRTC
-# orchestration, and the chain SDK's wallet that signs statement-store writes.
-unstation-session = { path = "../../crates/unstation-session" }
-unstation-chain = { path = "../../crates/unstation-chain" }
-useragent-native = { package = "useragent-native", path = "../../../useragent-kit/crates/host-native" }
-# Enable the testnet allowance helper crate-wide (Cargo feature unification) so a
-# fresh statement-store key auto-provisions a metered allowance on Paseo.
-# NOTE: this embeds Alice's dev sudo key, so the SDK refuses to compile it in an
-# optimized release build — debug/dev builds only. See the LAN-test note in README.
-useragent-chain = { package = "useragent-chain", path = "../../../useragent-kit/crates/host-chain", features = ["testnet-provisioning"] }
-schnorrkel = "0.11"
-bip39 = { version = "2", features = ["rand"] }
+unstation-app = { path = "../../crates/unstation-app", features = ["publish"] }
 
 [features]
 # Enables the system webview private API needed for native macOS window vibrancy.
