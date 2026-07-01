@@ -804,7 +804,9 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
     // Pin the runtime to Wry up front so `generate_handler!` can infer its `R`: assigning
     // the macro's output to a `let` first fails type inference (E0282) — it must be inlined
     // into `.invoke_handler()` on an already-typed builder.
-    let b = tauri::Builder::<tauri::Wry>::default().manage(AppState::default());
+    let b = tauri::Builder::<tauri::Wry>::default()
+        .plugin(tauri_plugin_opener::init())
+        .manage(AppState::default());
     #[cfg(feature = "publish")]
     let b = b.invoke_handler(tauri::generate_handler![
         platform,

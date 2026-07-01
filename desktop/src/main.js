@@ -397,7 +397,7 @@ import { viewerVerdict, renderViewerHealth } from './health.js';
     showRetry(false);
     try {
       const res = await sso.signIn(
-        payload => renderQr(payload),
+        payload => { renderQr(payload); if (window.__onPairingPayload) window.__onPairingPayload(payload); },
         s => {
           console.log('[sso] pairingStatus:', s.step, s);
           if(s.step==='pairing') setStatus('Waiting for you to scan…');
