@@ -26,6 +26,9 @@
 //                                        SSO-2/host-papp with the live pairing payload.
 //   window.__unstationPlatformType     — set to "mobile" by the shim; read by sso.js (pairing
 //                                        handshake) and scenes/publish.js applyPublishState().
+//   window.__keepAwake(on)             — defined by main.js on BOTH platforms (invokes the
+//                                        set_keep_awake command; a desktop no-op). Called on
+//                                        live watch/publish enter + leave/end.
 //   window.__TAURI__                   — the Tauri bridge the shim invokes directly
 //                                        (plugin:opener|open_url, camera_start, camera_stop).
 //
@@ -65,6 +68,9 @@ export const S = {
   bulletinReady: false, // Bulletin allowance installed → durable-origin (manifest) writes sponsored
   fsOn: false,
   watchTarget: '',      // the stream name last submitted to start_watch — Rejoin/Try-again re-submit it
+  pendingWatch: '',     // invite deep-link received before sign-in finished — resumed by resumeAfterSignIn
+  ingestKbps: 0,        // publish-stats: encoder → ingest bitrate (last 2s window)
+  uplinkKbps: 0,        // publish-stats: mesh uplink to viewers (last 2s window)
 };
 
 /* ---- state machine ---- */
@@ -95,7 +101,7 @@ export function go(state){ clearSeq(); S.curState=state;
   setActiveTab(state);
   player.classList.toggle('show', isLive); hud.classList.toggle('show', isLive);
   document.getElementById('catchup').style.display = state==='catchup'?'grid':'none';
-  if(isLive){ const mode=state==='seed'?'seed':'p2p'; win.dataset.health=mode; setAmbient(false); document.getElementById('modeText').textContent=state==='seed'?STRINGS.modeLiveHelper:STRINGS.modeLiveP2p; showScene(''); if(!NATIVE){ setTitle('hardfork.dot',true); renderViewerHealth({peers: state==='seed'?6:23, playing:true, mode, publisher:'hardfork.dot'}); } return; }
+  if(isLive){ if(window.__keepAwake) window.__keepAwake(true); const mode=state==='seed'?'seed':'p2p'; win.dataset.health=mode; setAmbient(false); document.getElementById('modeText').textContent=state==='seed'?STRINGS.modeLiveHelper:STRINGS.modeLiveP2p; showScene(''); if(!NATIVE){ setTitle('hardfork.dot',true); renderViewerHealth({peers: state==='seed'?6:23, playing:true, mode, publisher:'hardfork.dot'}); } return; }
   setAmbient(state==='entry'||state==='onboarding'||state==='ended'||state==='settings'); win.dataset.net='closed'; if(state!=='finding') setTitle('Unstation',false);
   if(state==='finding'){ showScene('finding'); if(findingHook) findingHook(); return; } showScene(state); }
 

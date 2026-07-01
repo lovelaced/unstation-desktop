@@ -1300,6 +1300,11 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
     // into `.invoke_handler()` on an already-typed builder.
     let b = tauri::Builder::<tauri::Wry>::default()
         .plugin(tauri_plugin_opener::init())
+        // Inbound invite links (unstation://watch/<name>) for both shells: the JS side
+        // subscribes via `window.__TAURI__.deepLink` (onOpenUrl/getCurrent). The desktop
+        // shell additionally registers single-instance (with its `deep-link` feature) so a
+        // second launch forwards its argv URL here instead of opening a new window.
+        .plugin(tauri_plugin_deep_link::init())
         .manage(AppState::default());
     // Android camera-publish (M4): register the Kotlin CameraPlugin (Camera2 + MediaCodec →
     // encoded AUs into the Rust core via CameraBridge). JS drives it via `plugin:unstation-camera`.

@@ -61,6 +61,7 @@ function enterLiveFromFinding(){
 // is fired once here; Rejoin runs a full start_watch (which tears down first anyway).
 function endWatchToEnded(){
   if(S.fsOn) toggleFullscreen();
+  if(window.__keepAwake) window.__keepAwake(false);
   if(NATIVE && invoke){ invoke('stop_watch').catch(()=>{}); }
   cleanupVideo();
   go('ended');
@@ -159,4 +160,4 @@ export async function enterWatch(){
 // ladder timer (clearWatchUi), stop and detach the media. Does NOT stop_watch.
 function cleanupVideo(){ const v=document.getElementById('vid'); clearInterval(v._retry); clearWatchUi(); try{ v.pause(); }catch(e){} v.removeAttribute('src'); v.style.display='none'; }
 
-export async function leaveWatch(){ if(S.fsOn) toggleFullscreen(); if(NATIVE && invoke){ try{ await invoke('stop_watch'); }catch(e){} } cleanupVideo(); go('entry'); }
+export async function leaveWatch(){ if(S.fsOn) toggleFullscreen(); if(window.__keepAwake) window.__keepAwake(false); if(NATIVE && invoke){ try{ await invoke('stop_watch'); }catch(e){} } cleanupVideo(); go('entry'); }

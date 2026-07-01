@@ -38,6 +38,36 @@ export const STRINGS = {
   // Settings — the "Backup copy" row (the optional on-chain durable copy).
   backupOn: 'On — viewers can find the stream even if you briefly drop',
   backupOff: 'Off · optional backup',
+
+  // Invite links (unstation://watch/<name>) — share bar, QR overlay, entry hint.
+  inviteHint: 'Got an invite link? Just open it — or type the stream name here.',
+  showQr: 'Show QR',
+  shareSheet: 'Share…',
+  copied: 'Copied',
+  close: 'Close',
+
+  // Go-Live preflight checklist (driven by `publish-progress` from the backend).
+  stepIdentity: 'Identity',
+  stepAnnounced: 'Announced',
+  stepEncoder: 'Encoder',
+  stepCamera: 'Camera',        // the encoder step's label on mobile (phone camera, no OBS)
+
+  // Publisher health stat cells + advisories (one at a time, priority order).
+  statEncoder: 'Encoder',
+  statUplink: 'Uplink',
+  advEncoderStruggling: 'Your encoder is struggling — lower the bitrate or resolution.',
+  advNoViewers: 'No one’s connected yet — send your invite link.',
+
+  // OBS guided setup (desktop-only collapsible panel in the ingest card).
+  obsSetupTitle: 'Set up OBS',
+  obsStep1: 'OBS → Settings → Stream → Service: Custom.',
+  obsStep2: 'Paste the Server and Stream key from above.',
+  obsStep3: 'Recommended: keyframe interval 1s, CBR, B-frames 0, preset veryfast.',
+
+  // Camera-permission recovery (mobile publish).
+  camPermHelp: 'Unstation needs camera access to go live. Allow it in Settings, then try again.',
+  camStarting: 'Starting your camera…',
+  openSettings: 'Open Settings',
 };
 
 // Turn a raw pairing/allowance failure (from sso.getLastAllowanceError()) into plain,

@@ -25,6 +25,13 @@
       "csp": null
     }
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["unstation"]
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",

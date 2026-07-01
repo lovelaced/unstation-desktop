@@ -208,3 +208,35 @@
   .share-bar .share-k { font-size: 11px; letter-spacing: .5px; text-transform: uppercase; color: var(--faint); }
   .share-bar code { flex: 1 1 auto; min-width: 0; font-family: var(--mono); font-size: 14px; color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .share-bar .viewers { font-family: var(--mono); font-size: 12px; color: var(--dim); white-space: nowrap; }
+
+  /* ---- E/F: invite links, publisher preflight, OBS setup, camera recovery ---- */
+  /* Small in-bar action buttons (share-bar Copy / Show QR / Share…) — the same look
+     as the ingest fields' copy buttons. */
+  .share-bar .copy, .share-act { flex: 0 0 auto; font-family: var(--ui); font-size: 12px; font-weight: 510; color: var(--text); background: rgba(255,255,255,.06); border: 1px solid var(--line-strong); border-radius: 8px; padding: 7px 12px; cursor: pointer; white-space: nowrap; transition: all .15s var(--ease); }
+  .share-bar .copy:hover, .share-act:hover { background: rgba(255,255,255,.1); }
+  .share-bar .copy.done { color: var(--ok); border-color: rgba(33,201,174,.45); }
+  .share-act[hidden] { display: none; }
+  .invite-bar { flex-wrap: wrap; border-radius: 16px; }
+  .invite-bar code { font-size: 12.5px; }
+  /* Preflight checklist — the finding scene's .step vocabulary, laid out as a compact row. */
+  .pub-steps { flex-direction: row; flex-wrap: wrap; gap: 7px 16px; margin: 0; }
+  /* Quiet degradation (ok=false publish-progress): subdued amber, never a blocking error. */
+  .step.warn { color: var(--dim); }
+  .step.warn .dot { background: var(--seed); box-shadow: 0 0 8px rgba(255,179,71,.55); }
+  /* OBS guided setup — collapsible panel replacing the one-line ingest hint. */
+  details.obs-setup { margin: 2px 0 0; border: 1px solid var(--line); border-radius: 10px; background: rgba(255,255,255,.02); }
+  details.obs-setup > summary { cursor: pointer; list-style: none; padding: 9px 12px; font-size: 12.5px; color: var(--dim); font-weight: 510; user-select: none; }
+  details.obs-setup > summary::-webkit-details-marker { display: none; }
+  details.obs-setup > summary::before { content: '▸'; margin-right: 8px; color: var(--faint); }
+  details.obs-setup[open] > summary::before { content: '▾'; }
+  details.obs-setup > summary:hover { color: var(--text); }
+  .obs-steps { margin: 0; padding: 0 14px 12px 30px; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; color: var(--dim); line-height: 1.5; }
+  /* Invite QR overlay — dismissible, floats over the whole stage (not inside a
+     transformed .scene, which would trap a fixed/absolute child). */
+  .invite-qr { position: absolute; inset: 0; z-index: 7; display: grid; place-items: center; background: rgba(5,6,10,.6); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+  .invite-qr[hidden] { display: none; }
+  .invite-qr-card { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 24px; border-radius: var(--r-card); background: var(--surface-2); border: 1px solid var(--line-strong); box-shadow: 0 30px 80px -24px rgba(0,0,0,.85); }
+  .invite-qr-card .qr { width: 200px; height: 200px; }
+  .invite-qr-card code { font-family: var(--mono); font-size: 12.5px; color: var(--accent); max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Camera-permission recovery actions in the publish waiting box. */
+  .cam-recovery { display: flex; gap: 10px; align-items: center; justify-content: center; margin-top: 4px; }

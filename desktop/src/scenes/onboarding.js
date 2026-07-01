@@ -6,6 +6,19 @@ import * as sso from '../sso.js';
 import { invoke, NATIVE } from '../tauri.js';
 import { S, go } from '../state.js';
 import { humanizeError } from '../copy.js';
+import { startWatch } from './watch.js';
+
+// After a successful sign-in, resume what the user came here to do: a deep-linked
+// invite (S.pendingWatch, stashed by main.js's invite handler) goes straight to the
+// stream; otherwise land on entry. Every sign-in success path funnels through this.
+// Multiple success callbacks can race onto one coalesced pushChainIdentity — the first
+// consumes the stash; later ones must not yank an already-started watch back to entry.
+export function resumeAfterSignIn(){
+  const target = S.pendingWatch; S.pendingWatch = '';
+  if(target){ startWatch(target); return; }
+  if(['finding','live','seed','catchup'].includes(S.curState)) return;
+  go('entry');
+}
 
 /* QR — real, scannable (the `qrcode` lib). Encodes the SSO pairing payload;
    until host-papp provides the real payload (SSO-2) this renders a placeholder URI. */
@@ -45,7 +58,7 @@ export function ensureSignedIn(){
   go('onboarding');
   const pb=document.getElementById('pairedBtn'); if(pb) pb.style.display='none';
   let have=false; try{ have=sso.hasSession(); }catch(e){}
-  if(have){ onboardingStatus('Finishing network access on your phone…'); pushChainIdentity().then(ok=>{ if(ok){ onboardingStatus('Network access granted ✓'); setTimeout(()=>go('entry'), 700); } }); }
+  if(have){ onboardingStatus('Finishing network access on your phone…'); pushChainIdentity().then(ok=>{ if(ok){ onboardingStatus('Network access granted ✓'); setTimeout(resumeAfterSignIn, 700); } }); }
   else beginPairing();
   return false;
 }
@@ -73,7 +86,7 @@ export async function beginPairing(){
       // approval prompt flashes away before it can be acted on.
       await new Promise(r=>setTimeout(r, 1600));
       const ok = await pushChainIdentity(setStatus);
-      if(ok){ setStatus('Network access granted ✓'); setTimeout(()=>go('entry'), 800); }
+      if(ok){ setStatus('Network access granted ✓'); setTimeout(resumeAfterSignIn, 800); }
       // On failure pushChainIdentity left an explanatory status; stay on the
       // onboarding screen so the QR + "I've scanned it" remain for a retry.
     }

@@ -15,6 +15,10 @@ tauri = { version = "2" }
 # Cross-platform URL/intent opener — Android uses it to fire the polkadotapp:// pairing
 # deep-link at the on-device Polkadot app (ACTION_VIEW). Harmless/unused on desktop.
 tauri-plugin-opener = "2"
+# Inbound unstation://watch/<name> invite links, on BOTH shells: desktop scheme
+# registration lives in the desktop tauri.conf.json (`plugins.deep-link.desktop.schemes`);
+# Android delivery comes from the VIEW intent-filter in its AndroidManifest.xml.
+tauri-plugin-deep-link = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }

@@ -36,6 +36,7 @@
           <button class="btn" type="submit">Watch</button>
         </form>
         <div class="hint">No account. No server. The stream comes from <b>peers</b>, verified byte-for-byte.</div>
+        <div class="hint" id="inviteHint"></div>
       </div>
       <aside class="entry-panel">
         <div class="eyebrow">Why it's different</div>
@@ -132,7 +133,10 @@
           <div class="ingest-card">
             <div class="field"><span class="k">Server</span><code id="ingestServer">rtmp://127.0.0.1:21935/live</code><button class="copy" data-copy="ingestServer" type="button">Copy</button></div>
             <div class="field"><span class="k">Stream key</span><code id="ingestKey">unstation</code><button class="copy" data-copy="ingestKey" type="button">Copy</button></div>
-            <p class="ingest-hint">In OBS: <b>Settings → Stream → Service: Custom</b>, paste these in, then <b>Start Streaming</b>. Any encoder works — no plugins.</p>
+            <details class="obs-setup" id="obsSetup">
+              <summary id="obsSetupSummary">Set up OBS</summary>
+              <ol class="obs-steps" id="obsSteps"></ol>
+            </details>
           </div>
           <div class="share-bar">
             <span class="share-k">Share</span>
@@ -140,7 +144,19 @@
             <button class="copy" id="copyShare" data-copy="shareLink" type="button">Copy</button>
             <span class="viewers"><span id="pubViewers">0</span> watching</span>
           </div>
+          <div class="share-bar invite-bar">
+            <span class="share-k">Invite</span>
+            <code id="inviteLink">unstation://watch/…</code>
+            <button class="copy" id="copyInvite" data-copy="inviteLink" type="button">Copy</button>
+            <button class="share-act" id="showQrBtn" type="button">Show QR</button>
+            <button class="share-act" id="shareInviteBtn" type="button" hidden>Share…</button>
+          </div>
           <div class="pub-health" id="pubHealth">
+            <div class="steps pub-steps" id="pubSteps">
+              <div class="step" data-k="identity"><span class="dot"></span><span class="s-lbl">Identity</span></div>
+              <div class="step" data-k="announced"><span class="dot"></span><span class="s-lbl">Announced</span></div>
+              <div class="step" data-k="encoder"><span class="dot"></span><span class="s-lbl">Encoder</span></div>
+            </div>
             <div class="ph-row">
               <span class="ph-dot" id="phDot" data-h="wait"></span>
               <div><div class="ph-status" id="phStatus">Waiting for your encoder</div><div class="ph-note" id="phNote">Point OBS at the server above and start streaming — it goes live on its own.</div></div>
@@ -149,6 +165,8 @@
               <div class="ph-stat"><div class="k">Watching</div><div class="v" id="phViewers">0</div></div>
               <div class="ph-stat"><div class="k">Live for</div><div class="v" id="phUptime">—</div></div>
               <div class="ph-stat"><div class="k">Network</div><div class="v" id="phNet" style="font-size:13px">…</div></div>
+              <div class="ph-stat"><div class="k" id="phIngestK">Encoder</div><div class="v" id="phIngest">—</div></div>
+              <div class="ph-stat"><div class="k" id="phUplinkK">Uplink</div><div class="v" id="phUplink">—</div></div>
             </div>
             <button class="pub-preview-link" id="previewSelf" type="button">Preview as a viewer →</button>
           </div>
@@ -192,6 +210,14 @@
         <div class="vmetric"><div class="k">Sharing with you</div><div class="v" id="vPeers">0 people</div></div>
         <div class="vmetric"><div class="k">Where it comes from</div><div class="v" id="vSource">directly from peers</div></div>
         <div class="vmetric"><div class="k">Broadcaster</div><div class="v" id="mPub">—</div></div>
+      </div>
+    </div>
+
+    <div class="invite-qr" id="inviteQrBox" hidden>
+      <div class="invite-qr-card">
+        <div class="qr" id="inviteQrSvg"></div>
+        <code id="inviteQrLink">unstation://watch/…</code>
+        <button class="btn ghost" id="inviteQrClose" type="button">Close</button>
       </div>
     </div>
   </div>
