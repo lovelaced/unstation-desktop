@@ -99,6 +99,17 @@ pub fn init_statement_store_from_secret(secret: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Initialize the Bulletin allowance signer from a raw 64-byte sr25519 slot secret —
+/// the phone-granted `//allowance//bulletin//<product>` key. After this, durable
+/// manifest / init-segment writes via [`BulletinOrigin`] are signed by (and sponsored
+/// through) that allowance account instead of the SDK's unfunded Alice dev key. Safe to
+/// call without it — Bulletin then falls back to the Alice dev key (local `--dev` only).
+pub fn init_bulletin_from_secret(secret: &[u8]) -> Result<(), String> {
+    let keypair = keypair_from_secret(secret)?;
+    useragent_native::chain::bulletin::init_with_keypair(keypair);
+    Ok(())
+}
+
 /// Initialize the statement store from a BIP-39 mnemonic — the derived account must
 /// already carry a statement-store allowance on the target chain (e.g. a personhood-
 /// provisioned key). For the public-Paseo nightly smoke test.

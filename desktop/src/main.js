@@ -124,11 +124,13 @@ import { viewerVerdict, renderViewerHealth } from './health.js';
   // publish/watch and the "Signed in" status on chainReady, not on hasSession().
   let chainReady = false;
   let _identityInFlight = null; // single-flight guard so overlapping callers don't fire concurrent allocations
+  let bulletinReady = false; // Bulletin allowance installed → durable-origin (manifest) writes sponsored
   function fmtDur(ms){ const s=Math.max(0,(ms/1000)|0), h=(s/3600)|0, m=((s%3600)/60)|0, ss=s%60; return (h>0?h+':'+String(m).padStart(2,'0'):String(m))+':'+String(ss).padStart(2,'0'); }
   // Plain network status shared by the Go Live card + Settings (driven by mesh-status).
   function netLabel(){
     if(chainState==='ready') return { t:'Connected', h:'good' };
     if(chainState==='connecting') return { t:'Connecting…', h:'wait' };
+    if(chainState==='offline') return { t:'Not connected', h:'' };
     if(chainState==='error') return { t:(chainDetail||'Not connected'), h:'' };
     return { t: NATIVE?'Connecting…':'Preview', h:'wait' };
   }
@@ -148,11 +150,12 @@ import { viewerVerdict, renderViewerHealth } from './health.js';
     // Network access = the statement-store allowance that makes sign-in + mesh work.
     set('setAllow', chainReady ? 'Granted' : 'Not granted'); const ad=document.getElementById('setAllowDot'); if(ad) ad.dataset.h = chainReady ? 'good' : 'wait';
     const gb=document.getElementById('grantAccessBtn'); if(gb) gb.style.display = chainReady ? 'none' : '';
-    // Durable backup (Bulletin manifest) — currently unavailable: the SDK signs Bulletin
-    // writes with a shared, unfunded dev key and has no per-app allowance path yet. Purely
-    // a cold-start/late-joiner anchor, so live streaming is unaffected. (See docs.)
-    set('setBackup', 'Unavailable — needs SDK support · not required for live streaming'); const bd=document.getElementById('setBackupDot'); if(bd) bd.dataset.h='wait';
-    const nl=netLabel(); set('setNetwork', nl.t + ' · Paseo People'); const nd=document.getElementById('setNetDot'); if(nd) nd.dataset.h=nl.h;
+    // Durable backup = the on-chain copy that lets viewers still find the stream if the
+    // broadcaster drops out. Signed by the (optional) Bulletin allowance when granted.
+    const bd=document.getElementById('setBackupDot');
+    if(bulletinReady){ set('setBackup', 'On — viewers can still find the stream if you drop'); if(bd) bd.dataset.h='good'; }
+    else { set('setBackup', chainReady ? 'Off · optional backup' : '—'); if(bd) bd.dataset.h=''; }
+    const nl=netLabel(); set('setNetwork', nl.t); const nd=document.getElementById('setNetDot'); if(nd) nd.dataset.h=nl.h;
     let ht='Not watching or streaming right now.', hh='';
     if(publishing){ ht = pubLive ? ('Streaming live · '+lastViewers+' watching') : 'Stream open · waiting for your encoder'; hh = pubLive?'good':'wait'; }
     else if(['live','seed','catchup'].includes(curStateName)){ const v=viewerVerdict(lastPeers, isVideoPlaying('vid')); ht = v.label + ' · ' + lastPeers + ' ' + (lastPeers===1?'peer':'peers'); hh = v.dot; }
@@ -322,8 +325,12 @@ import { viewerVerdict, renderViewerHealth } from './health.js';
     go('settings');
     updateSettingsStatus();
     const el = document.getElementById('setAccount'); el.textContent = 'Checking…';
+    // Reflect the LIVE connection state — the mesh-status event is one-shot, so read the
+    // current subscription status each time Settings opens rather than trusting stale state.
+    if(NATIVE && invoke){ try{ chainState = await invoke('chain_status'); }catch(e){} }
     let signedIn = false; try { signedIn = await sso.awaitSession(); } catch(e){}
     el.textContent = chainReady ? 'Signed in' : (signedIn ? 'Paired — network access pending' : 'Not signed in');
+    updateSettingsStatus();
   }
 
   document.getElementById('tabWatch').addEventListener('click', enterWatch);
@@ -451,6 +458,15 @@ import { viewerVerdict, renderViewerHealth } from './health.js';
       if(!key){ console.warn('[chain] allowance granted but slot-key blob missing'); say('Network access granted, but the key didn’t load. Tap Try again.'); showRetry(true); return false; }
       await invoke('set_chain_identity', { slotSecret: Array.from(key) });
       console.log('[chain] paired identity sent to backend');
+      // Best-effort: also grab the Bulletin allowance so durable-origin manifest writes
+      // are sponsored. Non-fatal — the live stream + mesh work without it; this only
+      // restores the on-chain cold-start / late-joiner anchor.
+      try {
+        if(await sso.requestBulletinAllowance()){
+          const bkey = sso.bulletinSlotKey();
+          if(bkey){ await invoke('set_bulletin_identity', { slotSecret: Array.from(bkey) }); bulletinReady = true; console.log('[chain] bulletin allowance sent to backend'); }
+        }
+      } catch(e){ console.warn('[chain] bulletin allowance setup skipped', e); }
       chainReady = true; showRetry(false);
       return true;
     } catch(e){ console.error('[chain] set_chain_identity failed', e); chainReady = false; showRetry(true); return false; }

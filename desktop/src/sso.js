@@ -226,6 +226,28 @@ export function statementStoreSlotKey() {
   }
 }
 
+/** The paired Bulletin slot signing key (Uint8Array), or null. Mirrors statementStoreSlotKey. */
+export function bulletinSlotKey() {
+  try {
+    const sessions = getAdapter().sessions.sessions.read();
+    if (!sessions || !sessions.length) return null;
+    const sessionId = sessions[0].id;
+    const lsKey = `polkadot_${APP_ID}_AllowanceKeys_${sessionId}`;
+    const stored = (typeof localStorage !== "undefined") ? localStorage.getItem(lsKey) : null;
+    if (!stored) { console.warn("[sso] no allowance blob at", lsKey); return null; }
+    const aes = gcm(blake2b(strToBytes(APP_ID), { dkLen: 16 }), blake2b(strToBytes("nonce"), { dkLen: 32 }));
+    const plain = aes.decrypt(fromHex(stored));
+    const all = parseAllowances(plain).filter((e) => e.resource === "bulletin");
+    const entry = all.find((e) => e.productId === PRODUCT_ID) || all[0];
+    if (!entry) { console.warn("[sso] no bulletin allowance entry yet"); return null; }
+    console.log("[sso] bulletin slot key found:", entry.slotAccountKey.length, "bytes, product", entry.productId);
+    return entry.slotAccountKey;
+  } catch (e) {
+    console.error("[sso] bulletinSlotKey failed", e);
+    return null;
+  }
+}
+
 /**
  * Request this device's statement-store allowance from the paired phone.
  *
@@ -283,6 +305,42 @@ export async function requestStatementStoreAllowance() {
   } catch (e) {
     console.error("[sso] requestStatementStoreAllowance result-handling threw", e);
     _lastAllowanceError = (e && (e.reason || e.message)) || "error";
+    return false;
+  }
+}
+
+/**
+ * Request this device's BULLETIN allowance from the paired phone (parallel to
+ * requestStatementStoreAllowance, via `getBulletinSigner`). Enables sponsored
+ * durable-origin writes. NON-blocking for the app: a failure just means no on-chain
+ * durable manifest — the live stream is unaffected. Resolves true on grant/cache-hit.
+ */
+export async function requestBulletinAllowance() {
+  let res;
+  try {
+    const a = getAdapter();
+    const sessions = a.sessions.sessions.read();
+    if (!sessions || !sessions.length) { console.warn("[sso] requestBulletinAllowance: no live session"); return false; }
+    res = await a.allowance.getBulletinSigner(sessions[0].id, PRODUCT_ID);
+  } catch (e) {
+    console.warn("[sso] requestBulletinAllowance threw", e);
+    return false;
+  }
+  try {
+    if (res && typeof res.match === "function") {
+      return res.match(
+        () => { console.log("[sso] bulletin allowance granted/cached"); return true; },
+        (err) => { console.warn("[sso] bulletin allowance failed:", err && (err.reason || err.message)); return false; },
+      );
+    }
+    if (res && typeof res.isOk === "function") {
+      if (res.isOk()) return true;
+      console.warn("[sso] bulletin allowance failed:", res.error && (res.error.reason || res.error.message));
+      return false;
+    }
+    return !!res;
+  } catch (e) {
+    console.warn("[sso] requestBulletinAllowance result-handling threw", e);
     return false;
   }
 }

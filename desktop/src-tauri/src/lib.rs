@@ -484,6 +484,35 @@ fn set_chain_identity(
     Ok(())
 }
 
+/// Bridge the QR-paired **Bulletin** allowance to the Rust signer, so durable-origin
+/// writes (the signed manifest + init segment) are signed by — and sponsored through —
+/// the phone-granted `//allowance//bulletin//<product>` slot account instead of the
+/// SDK's unfunded Alice dev key. Independent of `set_chain_identity` and best-effort:
+/// the live stream works without it; this only restores the cold-start / late-joiner
+/// Bulletin anchor.
+#[tauri::command]
+fn set_bulletin_identity(slot_secret: Vec<u8>) -> Result<(), String> {
+    unstation_chain::init_bulletin_from_secret(&slot_secret)?;
+    log::info!("bulletin allowance signer installed");
+    Ok(())
+}
+
+/// Live network-connection status for the Settings screen: `offline` before sign-in,
+/// `connecting` while the statement-store subscription is coming up, `ready` once it's
+/// connected. Non-blocking — reads the current subscription flag (unlike the one-shot
+/// `mesh-status` event), so the Settings row reflects reality each time it's opened.
+#[tauri::command]
+fn chain_status(state: State<'_, AppState>) -> String {
+    if !*state.chain_ready.lock().unwrap() {
+        return "offline".into();
+    }
+    if unstation_chain::wait_ready(std::time::Duration::from_millis(0)) {
+        "ready".into()
+    } else {
+        "connecting".into()
+    }
+}
+
 /// Is a publish session running, and what are its details? Lets the UI rebuild the
 /// Go-Live console on tab-back/relaunch without touching the running stream.
 #[tauri::command]
@@ -765,6 +794,8 @@ pub fn run() {
             complete_signin,
             resolve_stream,
             set_chain_identity,
+            set_bulletin_identity,
+            chain_status,
             start_watch,
             stop_watch,
             watch_status,
