@@ -171,6 +171,19 @@ fn random_device_id() -> [u8; 32] {
     schnorrkel::Keypair::generate().public.to_bytes()
 }
 
+/// A FRESH per-call device routing id (new random 32 bytes) — NOT the process-stable
+/// [`local_peer_id`]. [`Session::start`] uses this so each watch/publish session dials
+/// under a distinct `PeerId`: a re-watch or publisher switch then presents as a NEW peer,
+/// which the far side accepts immediately instead of ignoring it as a still-connected
+/// duplicate of our just-torn-down session (the far side prunes the stale one on its own
+/// ICE timeout). Trust is unaffected — the personhood key ([`identity_public`]) remains the
+/// manifest/edge anchor. `PeerId` here is `unstation_core`'s type.
+///
+/// [`Session::start`]: https://docs.rs/unstation-session
+pub fn fresh_device_peer_id() -> PeerId {
+    PeerId(random_device_id())
+}
+
 /// Tear down the global statement-store client (stops the poll thread).
 pub fn shutdown() {
     ss::shutdown();

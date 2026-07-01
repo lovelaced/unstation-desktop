@@ -278,6 +278,11 @@ async fn start_watch(
     let stream = stream_id_from(&target);
     log::info!("[watch] target={target:?} → stream_id={}", crypto::hex32(&stream.0));
 
+    // Re-watch / publisher switch: fully tear down any previous watch FIRST. Otherwise its
+    // tasks keep running and its transport stays connected to the publisher under our
+    // (stable) peer id, so the publisher ignores the new connection and the re-watch hangs.
+    teardown_watch(&state);
+
     // Localhost HLS re-server → the webview <video> plays from here.
     let hls = HlsServer::start(1000).map_err(|e| e.to_string())?;
     let hls_url = hls.url();
@@ -313,15 +318,19 @@ async fn start_watch(
         let _ = viewer.run(view_rx, TICK, None).await;
     }));
 
-    // Learn the live edge (segment ids) from the publisher.
-    session.spawn_edge_poller(view_tx.clone());
+    // Learn the live edge (segment ids) from the publisher. Tracked in `tasks` so teardown
+    // aborts it (otherwise it keeps polling the chain for this stale session forever).
+    tasks.push(session.spawn_edge_poller(view_tx.clone()));
 
     // Announce ourselves so other viewers can discover + reshare from us — the mesh
     // relays through volunteer peers, so a NAT-restricted node only needs to reach
     // *someone*. relay_opt_in = false, but a viewer that proves reachable (a peer
     // connects to it inbound) auto-promotes to advertising relay-capability — emergent,
     // self-organizing volunteer relays. (Presence write moves off-chain at scale.)
-    session.spawn_presence(20_000_000, false);
+    // Tracked in `tasks` so teardown aborts it — else this session keeps refreshing its
+    // (now-stale) presence forever, and after a fresh-peer-id re-watch those old entries
+    // pile up and get re-dialed.
+    tasks.push(session.spawn_presence(20_000_000, false));
 
     // Discover the publisher and dial it, then keep the connection alive: if the dial
     // stalls (no connect within the timeout) or the peer later drops, re-discover and
@@ -465,15 +474,25 @@ async fn start_watch(
     Ok(info)
 }
 
-#[tauri::command]
-fn stop_watch(state: State<'_, AppState>) {
+/// Fully tear down the current watch (if any): stop the node, abort its tasks, and
+/// actively close its WebRTC connections. The transport reactor is kept alive by detached
+/// signaling tasks, so dropping the `WatchSession` alone never closes the connections —
+/// `session.shutdown()` does. Without it, a re-watch or publisher switch hangs because the
+/// publisher still holds our old connection (same peer id) and ignores the new offer.
+fn teardown_watch(state: &AppState) {
     if let Some(sess) = state.watch.lock().unwrap().take() {
         let _ = sess.node_tx.send(EngineEvent::Stop);
         for t in sess.tasks {
             t.abort();
         }
-        // `_hls` / `_session` drop here.
+        sess.session.shutdown();
+        // `_hls` drops here.
     }
+}
+
+#[tauri::command]
+fn stop_watch(state: State<'_, AppState>) {
+    teardown_watch(&state);
 }
 
 /// Bridge the QR-paired statement-store allowance to the Rust signer. The JS side

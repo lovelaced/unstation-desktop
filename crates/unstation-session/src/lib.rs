@@ -88,8 +88,15 @@ impl Session {
         // allowance to write presence/signaling. We must NOT (re)init here: the SDK
         // re-initializes on every init call, which would clobber the paired key with
         // a fresh, unprovisioned one.
-        let my_peer = unstation_chain::local_peer_id()
-            .ok_or("not signed in — pair the Polkadot app to publish or watch")?;
+        // Require a signed-in identity (its key carries the on-chain allowance to write
+        // presence/signaling). We do NOT reuse its value as our PeerId, though:
+        if unstation_chain::local_peer_id().is_none() {
+            return Err("not signed in — pair the Polkadot app to publish or watch".into());
+        }
+        // Fresh per-SESSION routing id: a re-watch / publisher switch then dials as a NEW
+        // peer the far side accepts at once, instead of colliding with our previous
+        // (torn-down) session under a process-stable id. Trust stays on the personhood key.
+        let my_peer = unstation_chain::fresh_device_peer_id();
 
         let (sig_tx, sig_rx) = unbounded_channel::<SignalOut>();
         let transport = LibDcTransport::new(stun, inbox, sig_tx);
@@ -117,8 +124,18 @@ impl Session {
         self.book.clone()
     }
 
-    /// Publisher: announce presence on our discovery shard, refreshed before TTL.
-    pub fn spawn_presence(&self, caps_upload_bps: u64, relay_opt_in: bool) {
+    /// Close all WebRTC connections and stop the transport reactor. Call when abandoning
+    /// this session (stop/re-watch): the reactor is kept alive by detached signaling tasks,
+    /// so dropping the `Session` alone never closes the connections — and a publisher would
+    /// keep our (stable) peer id connected and ignore a re-watch's new offer.
+    pub fn shutdown(&self) {
+        self.transport.shutdown();
+    }
+
+    /// Publisher: announce presence on our discovery shard, refreshed before TTL. Returns
+    /// the task handle so the caller can abort it on teardown — otherwise it would keep
+    /// refreshing this (now-stale) session's presence forever.
+    pub fn spawn_presence(&self, caps_upload_bps: u64, relay_opt_in: bool) -> tokio::task::JoinHandle<()> {
         let signaling = self.signaling.clone();
         let me = self.my_peer;
         let manifest_cid = self.manifest_cid.clone();
@@ -150,7 +167,7 @@ impl Session {
                     }
                 }
             }
-        });
+        })
     }
 
     /// Publisher: set the signed-manifest Bulletin CID announced in presence. Call once
@@ -265,7 +282,7 @@ impl Session {
 
     /// Viewer: poll the live-edge manifest into `LiveEdge` events so the node
     /// learns which segments exist and the hash to verify each against.
-    pub fn spawn_edge_poller(&self, inbox: UnboundedSender<EngineEvent>) {
+    pub fn spawn_edge_poller(&self, inbox: UnboundedSender<EngineEvent>) -> tokio::task::JoinHandle<()> {
         let signaling = self.signaling.clone();
         tokio::spawn(async move {
             let mut seen: HashSet<Seq> = HashSet::new();
@@ -284,7 +301,7 @@ impl Session {
                     }
                 }
             }
-        });
+        })
     }
 }
 

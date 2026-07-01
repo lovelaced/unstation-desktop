@@ -60,6 +60,11 @@ enum Cmd {
     DcOpen(PeerId, Channel),
     StateChange(PeerId, ConnectionState),
     Close(PeerId),
+    /// Close every peer connection and stop the reactor. Sent when a `Session` is torn
+    /// down (stop/re-watch): the reactor is otherwise kept alive forever by detached
+    /// signaling tasks holding clones, so without this the connections leak — and the
+    /// publisher keeps our (stable) peer id connected and ignores a re-watch's new offer.
+    Shutdown,
 }
 
 /// Per-data-channel handler: forwards inbound bytes to the node inbox and open
@@ -206,6 +211,22 @@ impl LibDcTransport {
                 let mut orphan_cands: HashMap<PeerId, Vec<Vec<u8>>> = HashMap::new();
                 // Plain blocking loop on a non-async thread (owns all !ergonomic FFI state).
                 while let Some(cmd) = cmd_rx.blocking_recv() {
+                    if matches!(cmd, Cmd::Shutdown) {
+                        // Close every peer the same way `Cmd::Close` does (drop the `Peer`
+                        // → libdatachannel closes the PC), tell the node, then exit. We
+                        // drain BEFORE returning, so the thread ends with an empty map and
+                        // no live PeerConnection is destroyed at thread-exit — the at-exit
+                        // C++ teardown is the separate FORTIFY-abort issue (#24).
+                        for (peer, p) in peers.drain() {
+                            if p.announced {
+                                let _ = inbox.send(EngineEvent::PeerDisconnected { peer });
+                            }
+                        }
+                        orphan_cands.clear();
+                        reactor_connected.store(0, Ordering::Relaxed);
+                        log::info!("[libdc] reactor shutdown — closed all peer connections");
+                        break;
+                    }
                     handle_cmd(
                         cmd,
                         &mut peers,
@@ -256,6 +277,13 @@ impl LibDcTransport {
     /// Tear down a peer connection.
     pub fn close(&self, peer: PeerId) {
         let _ = self.cmd.send(Cmd::Close(peer));
+    }
+
+    /// Close every peer connection and stop the reactor. Idempotent; safe to call even
+    /// though detached tasks still hold clones (they become no-ops once the reactor exits).
+    /// Call when abandoning a session (stop/re-watch) so the far side prunes us promptly.
+    pub fn shutdown(&self) {
+        let _ = self.cmd.send(Cmd::Shutdown);
     }
 }
 
@@ -547,5 +575,7 @@ fn handle_cmd(
                 }
             }
         }
+        // Handled by the reactor loop (drains peers + exits) before dispatch reaches here.
+        Cmd::Shutdown => {}
     }
 }

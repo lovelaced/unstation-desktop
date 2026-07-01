@@ -14,6 +14,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use unstation_core::media::MediaSink;
 
+/// Max segments retained in the local live-playback window (see `push_segment`). Enough for
+/// hls.js's back-buffer + `liveSyncDurationCount` with margin, small enough to keep playback
+/// near the live edge and memory bounded on a long stream.
+const MAX_LIVE_SEGMENTS: usize = 12;
+
 struct Shared {
     init: Option<Bytes>,
     segments: BTreeMap<u64, Bytes>,
@@ -55,7 +60,17 @@ impl MediaSink for HlsSink {
         self.shared.lock().unwrap_or_else(|e| e.into_inner()).init = Some(bytes);
     }
     fn push_segment(&self, seq: u64, bytes: Bytes) {
-        self.shared.lock().unwrap_or_else(|e| e.into_inner()).segments.insert(seq, bytes);
+        let mut g = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        g.segments.insert(seq, bytes);
+        // Keep only a small live window. This re-server exists purely for the local player;
+        // the mesh serves re-shares from its own store. Without eviction the playlist grows
+        // unbounded, so the player starts far back in it and drifts further behind live over
+        // time (memory grows too). A bounded window makes the playlist a sliding live window,
+        // so hls.js starts near the edge (its liveSyncDurationCount) and stays there.
+        while g.segments.len() > MAX_LIVE_SEGMENTS {
+            let Some(&oldest) = g.segments.keys().next() else { break };
+            g.segments.remove(&oldest);
+        }
     }
     fn on_play_head(&self) -> u64 {
         self.play_head.load(Ordering::SeqCst)

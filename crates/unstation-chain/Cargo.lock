@@ -4623,6 +4623,7 @@ dependencies = [
  "bitvec",
  "blake2",
  "bytes",
+ "log",
  "parity-scale-codec",
  "rand 0.8.6",
  "rand_chacha 0.3.1",
