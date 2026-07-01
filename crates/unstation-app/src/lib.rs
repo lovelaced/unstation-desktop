@@ -1250,6 +1250,46 @@ fn camera_stop() -> Result<(), String> {
     Ok(())
 }
 
+/// Keep the screen on while actively watching or broadcasting (a phone that dims
+/// mid-match kills the party). Android only; a no-op elsewhere — the JS side calls
+/// it unconditionally through the `__keepAwake` seam.
+#[tauri::command]
+fn set_keep_awake(on: bool) -> Result<(), String> {
+    #[cfg(all(target_os = "android", feature = "publish"))]
+    {
+        #[derive(serde::Serialize)]
+        struct Args {
+            on: bool,
+        }
+        return CAMERA_PLUGIN
+            .get()
+            .ok_or("camera plugin not registered")?
+            .run_mobile_plugin::<()>("setKeepAwake", Args { on })
+            .map_err(|e| e.to_string());
+    }
+    #[cfg(not(all(target_os = "android", feature = "publish")))]
+    {
+        let _ = on;
+        Ok(())
+    }
+}
+
+/// Open this app's system settings page — the recovery path after a "don't ask
+/// again" camera-permission denial. Android only; a no-op elsewhere.
+#[tauri::command]
+fn open_app_settings() -> Result<(), String> {
+    #[cfg(all(target_os = "android", feature = "publish"))]
+    {
+        return CAMERA_PLUGIN
+            .get()
+            .ok_or("camera plugin not registered")?
+            .run_mobile_plugin::<()>("openAppSettings", ())
+            .map_err(|e| e.to_string());
+    }
+    #[cfg(not(all(target_os = "android", feature = "publish")))]
+    Ok(())
+}
+
 /// The shared Tauri builder — managed [`AppState`] + the command handlers — used by both
 /// the desktop and Android shells. Each shell supplies its own `tauri::generate_context!()`
 /// (its own `tauri.conf.json`/capabilities) and calls `.run(..)`. The publish commands are
@@ -1290,7 +1330,9 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         stop_publish,
         publish_status,
         camera_start,
-        camera_stop
+        camera_stop,
+        set_keep_awake,
+        open_app_settings
     ]);
     #[cfg(not(feature = "publish"))]
     let b = b.invoke_handler(tauri::generate_handler![
@@ -1304,7 +1346,9 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         chain_status,
         start_watch,
         stop_watch,
-        watch_status
+        watch_status,
+        set_keep_awake,
+        open_app_settings
     ]);
     b
 }
