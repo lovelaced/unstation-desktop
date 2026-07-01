@@ -84,6 +84,7 @@ import { viewerVerdict, renderViewerHealth } from './health.js';
   // meanwhile. If it never plays, the peer count in the HUD tells the real story.
   function setVideo(url){
     const v=document.getElementById('vid'), catchup=document.getElementById('catchup'); if(!url)return;
+    if(window.__hlsPlay){ window.__hlsPlay(v, url, catchup); return; }  // Android: play via hls.js (no native HLS)
     if(!(v.canPlayType('application/vnd.apple.mpegurl'))){ if(catchup){ catchup.textContent='This device can’t play the stream format.'; catchup.style.display='grid'; } return; }
     const attempt=()=>{ if(v.readyState>=3 && !v.paused) return; try{ v.src=url+(url.includes('?')?'&':'?')+'t='+Date.now(); v.style.display='block'; v.load(); v.play().catch(()=>{}); }catch(e){} };
     attempt();
