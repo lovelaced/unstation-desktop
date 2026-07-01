@@ -79,8 +79,8 @@
     <div class="scene" data-scene="ended">
       <div class="eyebrow">Stream ended</div>
       <h1 class="display">That's a wrap.</h1>
-      <p class="sub">The publisher went offline. The recording stays on the chain — durable and content-addressed — so you can watch it back any time.</p>
-      <div class="row" style="display:flex;gap:10px;"><button class="btn" data-goto="finding" type="button">Watch the recording</button><button class="btn ghost" data-goto="entry" type="button">Back</button></div>
+      <p class="sub">The broadcast ended. If they go live again you can jump right back in.</p>
+      <div class="row" style="display:flex;gap:10px;"><button class="btn" id="rejoinBtn" type="button">Rejoin</button><button class="btn ghost" data-goto="entry" type="button">Back</button></div>
     </div>
 
     <div class="scene" data-scene="settings">
@@ -166,6 +166,7 @@
         <div class="live-tag"><span class="live-dot"></span>LIVE</div>
         <div class="scrim"></div>
         <div class="catchup" id="catchup"><span class="spin"></span>Catching up…</div>
+        <button class="sound-pill" id="soundPill" type="button" hidden>🔊 Tap for sound</button>
         <div id="vidDiag" class="diag" hidden></div>
       </div>
     </div>
@@ -176,6 +177,8 @@
         <span class="state"><span class="health-dot"></span><span><span class="mode" id="modeText">LIVE · P2P</span> <span class="sep">·</span> <span class="peers"><span id="peerCount">0</span> peers</span></span></span>
         <span class="chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 15 6-6 6 6"/></svg></span>
       </div>
+      <button class="hud-btn" id="skipLiveBtn" type="button" hidden>Skip to live</button>
+      <button class="hud-btn" id="muteBtn" type="button" title="Unmute"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4V5Z"/><path d="m16 9 5 6M21 9l-5 6"/></svg></button>
       <button class="hud-btn" id="fsBtn" type="button" title="Fullscreen"><svg id="fsIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M3 16v3a2 2 0 0 0 2 2h3"/></svg><span id="fsLabel">Fullscreen</span></button>
     </div>
 

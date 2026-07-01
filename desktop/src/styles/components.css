@@ -80,6 +80,18 @@
   .frame .catchup { position: absolute; inset: 0; display: none; place-items: center; z-index: 3; background: rgba(5,7,11,.4); backdrop-filter: blur(2px); font-family: var(--mono); font-size: 12.5px; letter-spacing: .4px; }
   .frame .catchup .spin { width: 15px; height: 15px; margin-right: 9px; border: 2px solid rgba(255,255,255,.25); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; display: inline-block; vertical-align: middle; }
   @keyframes spin { to { transform: rotate(360deg); } }
+  /* Give-up card (the stall ladder's 45s rung): honest copy + Try again / Leave. */
+  .catchup .giveup { display: flex; flex-direction: column; align-items: center; gap: 16px; max-width: 36rem; padding: 0 24px; text-align: center; line-height: 1.55; }
+  .catchup .giveup-row { display: flex; gap: 10px; }
+  /* Unmute pill — bottom-center over the video; same glass language as the HUD pill. */
+  .frame .sound-pill { position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%); z-index: 4; cursor: pointer;
+    font-family: var(--ui); font-size: 13px; font-weight: 510; color: var(--text); padding: 10px 16px; border-radius: var(--r-pill);
+    background: var(--glass); backdrop-filter: blur(26px) saturate(1.6); -webkit-backdrop-filter: blur(26px) saturate(1.6);
+    border: 1px solid var(--line-strong); box-shadow: inset 0 1px 0 rgba(255,255,255,.06), 0 14px 34px -16px rgba(0,0,0,.7); transition: background .2s var(--ease); }
+  .frame .sound-pill:hover { background: rgba(255,255,255,.12); }
+  .frame .sound-pill[hidden] { display: none; }
+  /* Native full-bleed frame: the HUD overlays the frame bottom — lift the pill above it. */
+  body.native #player .sound-pill { bottom: 88px; }
   .live-dot { width: 7px; height: 7px; border-radius: 50%; background: #ff5f57; box-shadow: 0 0 8px #ff5f57; animation: pulse 1.6s var(--ease) infinite; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
 

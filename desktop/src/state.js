@@ -17,6 +17,11 @@
 //   window.__onPairingPayload(payload) — defined by the shim; called from scenes/onboarding.js
 //                                        beginPairing() with the live pairing payload (fires
 //                                        the polkadotapp:// same-device deep-link).
+//   window.__hlsLatency()              — defined by the shim; live-edge lag in seconds from
+//                                        hls.js (null when unknown). Used guardedly by
+//                                        player.js's behind-live indicator.
+//   window.__hlsSkipToLive()           — defined by the shim; seeks hls.js to the live edge.
+//                                        Used guardedly by player.js's "Skip to live" chip.
 //   window.__renderPairingQr(payload)  — defined by scenes/onboarding.js (renderQr); called by
 //                                        SSO-2/host-papp with the live pairing payload.
 //   window.__unstationPlatformType     — set to "mobile" by the shim; read by sso.js (pairing
@@ -59,6 +64,7 @@ export const S = {
   chainReady: false,
   bulletinReady: false, // Bulletin allowance installed → durable-origin (manifest) writes sponsored
   fsOn: false,
+  watchTarget: '',      // the stream name last submitted to start_watch — Rejoin/Try-again re-submit it
 };
 
 /* ---- state machine ---- */

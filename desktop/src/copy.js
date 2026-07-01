@@ -11,11 +11,29 @@ export const STRINGS = {
   sourcePeers: 'directly from peers',
   sourceHelper: 'through a helper — another viewer passing the video along, still verified byte-for-byte',
 
-  // Viewer catchup overlay + watchdog (a silent "no video" made actionable).
+  // Viewer catchup overlay + stall ladder (a silent "no video" made actionable).
   watchConnecting: 'Connecting to the broadcaster…',
   watchNoVideoFromPeer: 'Connected to a peer, but no video is arriving — the broadcaster may have stopped streaming.',
   watchUnreachable: 'Can’t reach the broadcaster yet. Double-check the stream name and make sure they’re live. Some networks take longer to connect — hang tight.',
   formatUnsupported: 'This device can’t play the stream format.',
+  catchingUp: 'Catching up…',
+  tryAgain: 'Try again',
+  leave: 'Leave',
+
+  // Finding scene — event-driven phases (`watch-phase` from the backend).
+  joiningEyebrow: 'Almost there',
+  joiningTitle: 'Joining the mesh',
+  joiningSub: 'Connecting to people watching this stream.',
+  unreachableEyebrow: 'No luck yet',
+  unreachableTitle: 'Can’t reach anyone',
+  unreachableSub: 'Nobody carrying this stream is reachable yet. We’ll keep trying — double-check the name and that the broadcaster is live.',
+
+  // Player controls.
+  tapForSound: '🔊 Tap for sound',
+  skipToLive: 'Skip to live',
+  behindLive: n => ' · ' + n + 's behind',
+  mute: 'Mute',
+  unmute: 'Unmute',
 
   // Settings — the "Backup copy" row (the optional on-chain durable copy).
   backupOn: 'On — viewers can find the stream even if you briefly drop',
