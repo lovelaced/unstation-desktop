@@ -34,7 +34,13 @@ use unstation_core::topic::discovery_topic;
 use unstation_core::transport::EngineEvent;
 use unstation_core::types::{PeerId, SegmentId, Seq, StreamId};
 
-const SIGNAL_POLL: Duration = Duration::from_millis(800);
+/// Signaling / edge poll cadence. ACTIVE while still establishing the mesh (no peers,
+/// or a handshake in flight — SDP/ICE and the first edge must arrive fast); IDLE once
+/// connected, where a slower reconciliation poll suffices (the live edge propagates in
+/// mesh via signed gossip, so the chain read is only a fallback). Cuts steady-state
+/// chain reads ~5× — the scarce statement-store slot budget is the real constraint.
+const SIGNAL_POLL_ACTIVE: Duration = Duration::from_millis(800);
+const SIGNAL_POLL_IDLE: Duration = Duration::from_secs(4);
 const DISCOVERY_POLL: Duration = Duration::from_secs(2);
 /// Maintainer re-evaluation cadence absent any transport event.
 const MAINTAIN_TICK: Duration = Duration::from_secs(1);
@@ -392,11 +398,19 @@ impl Session {
     /// learns which segments exist and the hash to verify each against.
     pub fn spawn_edge_poller(&self, inbox: UnboundedSender<EngineEvent>) -> tokio::task::JoinHandle<()> {
         let signaling = self.signaling.clone();
+        let transport = self.transport.clone();
         tokio::spawn(async move {
             let mut seen: HashSet<Seq> = HashSet::new();
-            let mut tick = interval(SIGNAL_POLL);
             loop {
-                tick.tick().await;
+                // Adaptive: poll fast until connected (the first edge must land quickly),
+                // then back off — once in-mesh, signed edge gossip delivers new segments
+                // at mesh speed and this chain read is only reconciliation.
+                let period = if transport.peer_count() == 0 {
+                    SIGNAL_POLL_ACTIVE
+                } else {
+                    SIGNAL_POLL_IDLE
+                };
+                sleep(period).await;
                 if let Ok(edge) = signaling.read_edge().await {
                     if !edge.is_empty() {
                         log::debug!("[edge] chain poll → {} entr(ies)", edge.len());
@@ -458,9 +472,12 @@ async fn relay_inbound(
     bans: BanList,
 ) {
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
-    let mut tick = interval(SIGNAL_POLL);
     loop {
-        tick.tick().await;
+        // Adaptive: while establishing (no live peer) poll fast so SDP/ICE round-trips
+        // promptly; once connected, offers still arrive within the idle period (worst
+        // case a few seconds to add a new peer) at a fraction of the chain reads.
+        let period = if transport.peer_count() == 0 { SIGNAL_POLL_ACTIVE } else { SIGNAL_POLL_IDLE };
+        sleep(period).await;
         let mut sigs = match signaling.read_signals(me).await {
             Ok(s) => s,
             Err(e) => {
