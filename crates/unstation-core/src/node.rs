@@ -542,7 +542,6 @@ impl MeshNode {
         // Expire stale in-flight requests (a lost chunk on the unreliable bulk channel
         // never completes and never hash-fails) so the picker re-requests them.
         let now = self.now_ms;
-        let seg_bytes = self.eng.seg_bytes;
         let stale: Vec<Seq> = self
             .pending
             .iter()
@@ -550,12 +549,8 @@ impl MeshNode {
             .map(|(s, _)| *s)
             .collect();
         for seq in stale {
-            if let Some((pid, _)) = self.pending.remove(&seq) {
-                self.reasm.remove(&seq); // re-request starts fresh
-                if let Some(p) = self.eng.peers.get_mut(&pid) {
-                    p.pending_bytes = p.pending_bytes.saturating_sub(seg_bytes);
-                }
-            }
+            self.clear_pending(seq);
+            self.reasm.remove(&seq); // re-request starts fresh
         }
 
         // Evict push-ahead buffers whose seq slid below the play head: their id never
@@ -814,14 +809,15 @@ impl MeshNode {
         if total_len == 0 || total_len > MAX_SEGMENT_BYTES {
             return;
         }
-        {
+        let complete = {
             let r = self.reasm.entry(seq).or_insert_with(|| Reassembler::new(total_len));
             r.add(offset, bytes);
-            if !r.is_complete() {
-                return;
-            }
+            r.is_complete()
+        };
+        if !complete {
+            return;
         }
-        let r = self.reasm.remove(&seq).expect("present and complete");
+        let Some(r) = self.reasm.remove(&seq) else { return };
         match self.segment_ids.get(&seq).copied() {
             // We already know the authenticated id → verify against it now.
             Some(id) => match r.finish_verified(&id) {
@@ -830,7 +826,7 @@ impl MeshNode {
                     // Hash mismatch against a KNOWN id — a genuinely bad/forged chunk:
                     // discard, decay reputation, re-request elsewhere.
                     self.stats.hash_failures += 1;
-                    self.pending.remove(&seq);
+                    self.clear_pending(seq);
                     if let Some(p) = self.eng.peers.get_mut(&peer) {
                         p.reputation *= 0.5;
                     }
@@ -841,12 +837,28 @@ impl MeshNode {
             // proof of a bad peer, so we don't penalize — and it's bounded, so an early
             // (or hostile) push can't grow memory without limit.
             None => {
-                self.pending.remove(&seq);
+                self.clear_pending(seq);
                 if let Some(raw) = r.assemble() {
                     self.buffer_pending_verify(peer, seq, raw);
                 }
             }
         }
+    }
+
+    /// Remove a seq's in-flight request, releasing the **asked** peer's `pending_bytes`
+    /// budget. Every `pending` removal must go through here: the asked peer may differ
+    /// from whoever delivered the bytes (a push racing a pull), and a removal that skips
+    /// the release inflates that peer's `pending_bytes` forever, permanently poisoning
+    /// the picker's expected-delivery-time ranking for it.
+    fn clear_pending(&mut self, seq: Seq) -> Option<(PeerId, u64)> {
+        let entry = self.pending.remove(&seq);
+        if let Some((asked, _)) = entry {
+            let seg_bytes = self.eng.seg_bytes;
+            if let Some(p) = self.eng.peers.get_mut(&asked) {
+                p.pending_bytes = p.pending_bytes.saturating_sub(seg_bytes);
+            }
+        }
+        entry
     }
 
     /// Store a verified segment, feed the player, update the sender's throughput, and
@@ -861,15 +873,17 @@ impl MeshNode {
         self.sink.push_segment(seq, b);
         // Real throughput: bytes delivered / time since we asked (push deliveries have no
         // matching `pending` entry, so they just don't update the estimate — correct).
-        let sent = self.pending.remove(&seq).map(|(_, t)| t);
-        let now = self.now_ms;
-        let seg_bytes = self.eng.seg_bytes;
-        if let Some(p) = self.eng.peers.get_mut(&peer) {
-            if let Some(sent_ms) = sent {
-                let elapsed = now.saturating_sub(sent_ms).max(1);
-                p.throughput_bps.update((n as f64) * 8_000.0 / (elapsed as f64));
+        // `clear_pending` releases the ASKED peer's byte budget, which may not be the
+        // sender when a push races a pull; the throughput estimate only updates when the
+        // deliverer really is the peer we asked (otherwise the elapsed time is meaningless).
+        let asked = self.clear_pending(seq);
+        if let Some((asked_peer, sent_ms)) = asked {
+            if asked_peer == peer {
+                let elapsed = self.now_ms.saturating_sub(sent_ms).max(1);
+                if let Some(p) = self.eng.peers.get_mut(&peer) {
+                    p.throughput_bps.update((n as f64) * 8_000.0 / (elapsed as f64));
+                }
             }
-            p.pending_bytes = p.pending_bytes.saturating_sub(seg_bytes);
         }
         self.push_to_subscribers(seq);
     }
@@ -991,6 +1005,41 @@ mod tests {
     fn fewer_peers_than_slots_unchokes_all() {
         let peers = vec![(pid(1), 1.0, 10.0), (pid(2), 2.0, 10.0)];
         assert_eq!(select_unchokes(&peers, Role::Viewer, 4, 0).len(), 2);
+    }
+
+    #[test]
+    fn delivery_releases_the_asked_peers_budget_not_the_senders() {
+        // Ask peer A for seq 5, but let peer B deliver it (a push racing the pull):
+        // A's `pending_bytes` budget must be released even though B sent the bytes —
+        // otherwise A's expected-delivery-time ranking inflates permanently and the
+        // picker stops asking a perfectly good peer.
+        let a = pid(1);
+        let b = pid(2);
+        let payload = vec![0xCDu8; 64];
+        let id = crypto::segment_id(&payload);
+        let mut node = MeshNode::new_viewer(
+            pid(9),
+            MeshConfig::default(),
+            64, // seg_bytes == payload size for easy budget math
+            Arc::new(DiscardSink),
+            HashMap::from([(5u64, id)]),
+            5,
+        );
+        for p in [a, b] {
+            node.eng.peers.insert(p, PeerState::new(p));
+        }
+        // Simulate the picker having asked A for seq 5.
+        node.pending.insert(5, (a, 0));
+        node.eng.peers.get_mut(&a).unwrap().pending_bytes = 64;
+        node.now_ms = 40;
+
+        // B delivers the whole segment in one chunk.
+        node.on_segment_data(b, 5, 64, 0, &payload);
+
+        assert!(node.eng.local.has(5), "segment delivered + verified");
+        assert!(node.pending.is_empty(), "in-flight entry cleared");
+        assert_eq!(node.eng.peers[&a].pending_bytes, 0, "ASKED peer's budget released");
+        assert_eq!(node.eng.peers[&b].pending_bytes, 0, "sender's budget untouched");
     }
 
     #[test]

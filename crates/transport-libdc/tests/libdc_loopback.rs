@@ -30,8 +30,8 @@ async fn two_channel_link_roundtrips_protocol_bytes() {
     let (b_sig_tx, mut b_sig_rx) = unbounded_channel::<SignalOut>();
 
     // No STUN — host candidates over loopback suffice.
-    let a = LibDcTransport::new(vec![], a_inbox_tx, a_sig_tx);
-    let b = LibDcTransport::new(vec![], b_inbox_tx, b_sig_tx);
+    let a = LibDcTransport::new(vec![], a_inbox_tx, a_sig_tx).expect("spawn reactor");
+    let b = LibDcTransport::new(vec![], b_inbox_tx, b_sig_tx).expect("spawn reactor");
 
     // Relay A's local signaling to B (the first description is A's offer → accept).
     {

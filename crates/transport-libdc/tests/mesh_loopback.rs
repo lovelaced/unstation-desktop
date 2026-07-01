@@ -110,9 +110,9 @@ async fn three_node_mesh_relays_signed_edge_and_segments_over_real_webrtc() {
     let (a_sig_tx, a_sig_rx) = unbounded_channel::<SignalOut>();
     let (b_sig_tx, b_sig_rx) = unbounded_channel::<SignalOut>();
 
-    let tp = LibDcTransport::new(vec![], p_in_tx.clone(), p_sig_tx);
-    let ta = LibDcTransport::new(vec![], a_in_tx.clone(), a_sig_tx);
-    let tb = LibDcTransport::new(vec![], b_in_tx, b_sig_tx);
+    let tp = LibDcTransport::new(vec![], p_in_tx.clone(), p_sig_tx).expect("spawn reactor");
+    let ta = LibDcTransport::new(vec![], a_in_tx.clone(), a_sig_tx).expect("spawn reactor");
+    let tb = LibDcTransport::new(vec![], b_in_tx, b_sig_tx).expect("spawn reactor");
 
     let transports = HashMap::from([(p, tp.clone()), (a, ta.clone()), (b, tb.clone())]);
     // A dials P; B dials A. B never talks to P.

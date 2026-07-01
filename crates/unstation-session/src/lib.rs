@@ -99,7 +99,8 @@ impl Session {
         let my_peer = unstation_chain::fresh_device_peer_id();
 
         let (sig_tx, sig_rx) = unbounded_channel::<SignalOut>();
-        let transport = LibDcTransport::new(stun, inbox, sig_tx);
+        let transport = LibDcTransport::new(stun, inbox, sig_tx)
+            .map_err(|e| format!("couldn't start the connection engine: {e}"))?;
         let signaling = ChainSignaling::new(stream, n_shards);
 
         tokio::spawn(relay_outbound(sig_rx, signaling.clone(), my_peer));
@@ -145,7 +146,7 @@ impl Session {
             let mut tick = interval(PRESENCE_REFRESH);
             loop {
                 tick.tick().await;
-                let mc = manifest_cid.lock().unwrap().clone();
+                let mc = manifest_cid.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 // Advertise relay-capability if explicitly opted in OR we've proven
                 // reachable (a peer connected to us inbound) — emergent volunteer relay.
                 let relay = relay_opt_in || transport.reachable();
@@ -174,12 +175,17 @@ impl Session {
     /// the manifest has been published to Bulletin (after the encoder's init segment
     /// exists); the presence-refresh loop picks it up on its next tick.
     pub fn set_manifest_cid(&self, cid: String) {
-        *self.manifest_cid.lock().unwrap() = Some(cid);
+        *self.manifest_cid.lock().unwrap_or_else(|e| e.into_inner()) = Some(cid);
     }
 
     /// Publisher: republish the live-edge manifest as new `(seq, content-id)` pairs
-    /// are produced by the segmenter (drained from `edge_rx`).
-    pub fn spawn_edge_publisher(&self, mut edge_rx: UnboundedReceiver<(Seq, SegmentId)>) {
+    /// are produced by the segmenter (drained from `edge_rx`). Returns the task handle
+    /// so the caller can abort it on teardown — otherwise a stopped stream's edge
+    /// window would keep republishing to the chain forever.
+    pub fn spawn_edge_publisher(
+        &self,
+        mut edge_rx: UnboundedReceiver<(Seq, SegmentId)>,
+    ) -> tokio::task::JoinHandle<()> {
         let signaling = self.signaling.clone();
         tokio::spawn(async move {
             let mut window: BTreeMap<Seq, SegmentId> = BTreeMap::new();
@@ -202,7 +208,7 @@ impl Session {
                     }
                 }
             }
-        });
+        })
     }
 
     /// Viewer: poll presence across all discovery shards until a publisher (any peer

@@ -95,14 +95,20 @@ impl PresenceBook {
         Self::default()
     }
 
+    /// Poison-tolerant lock: the book is shared across the node loop and session tasks,
+    /// and a panic elsewhere must not cascade into every reader/writer of a plain map.
+    fn guard(&self) -> std::sync::MutexGuard<'_, HashMap<PeerId, PresenceRecord>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Record/refresh one peer's presence (latest write wins).
     pub fn insert(&self, rec: PresenceRecord) {
-        self.inner.lock().unwrap().insert(PeerId(rec.peer_id), rec);
+        self.guard().insert(PeerId(rec.peer_id), rec);
     }
 
     /// Merge gossiped records, skipping our own entry (`me`).
     pub fn merge(&self, recs: impl IntoIterator<Item = PresenceRecord>, me: &PeerId) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.guard();
         for rec in recs {
             if PeerId(rec.peer_id) != *me {
                 g.insert(PeerId(rec.peer_id), rec);
@@ -112,20 +118,20 @@ impl PresenceBook {
 
     /// Every known record (for the session's discovery merge).
     pub fn snapshot(&self) -> Vec<PresenceRecord> {
-        self.inner.lock().unwrap().values().cloned().collect()
+        self.guard().values().cloned().collect()
     }
 
     /// Up to `max` records to gossip onward, relay-capable peers first so reachable
     /// volunteers propagate fastest (bounds per-message size at scale).
     pub fn sample(&self, max: usize) -> Vec<PresenceRecord> {
-        let mut v: Vec<PresenceRecord> = self.inner.lock().unwrap().values().cloned().collect();
+        let mut v: Vec<PresenceRecord> = self.guard().values().cloned().collect();
         v.sort_by_key(|r| !r.relay);
         v.truncate(max);
         v
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().len()
+        self.guard().len()
     }
 
     pub fn is_empty(&self) -> bool {

@@ -75,9 +75,11 @@ struct WatchSession {
 #[cfg(feature = "publish")]
 struct PublishSession {
     _hls: HlsServer,
-    /// Owns the ffmpeg ingest listener; aborting it kills ffmpeg via `Drop`.
-    feeder: JoinHandle<()>,
-    stats: JoinHandle<()>,
+    /// Every background task this publish spawned — feeder (owns the ffmpeg ingest
+    /// listener; aborting it kills ffmpeg via `Drop`), stats, presence refresh, edge
+    /// publisher, manifest publish. Torn down together: a survivor (the presence loop
+    /// especially) would keep announcing this dead stream to the chain forever.
+    tasks: Vec<JoinHandle<()>>,
     pub_tx: UnboundedSender<EngineEvent>,
     session: Session,
     /// Canonical stream name — lets `start_publish` re-attach instead of restarting.
@@ -597,7 +599,11 @@ fn watch_status(state: State<'_, AppState>) -> Option<WatchStatus> {
 /// the manifest's `init_segment_cid`, signs, and publishes — spawned so a slow chain never
 /// blocks going live. Shared by the desktop (ffmpeg) and Android (camera) publish paths.
 #[cfg(feature = "publish")]
-fn spawn_manifest_publish(session: &Session, stream: StreamId, init_slot: Arc<Mutex<Option<Bytes>>>) {
+fn spawn_manifest_publish(
+    session: &Session,
+    stream: StreamId,
+    init_slot: Arc<Mutex<Option<Bytes>>>,
+) -> JoinHandle<()> {
     let session_mc = session.clone();
     tokio::spawn(async move {
         let Some(publisher) = unstation_chain::identity_public() else {
@@ -605,7 +611,7 @@ fn spawn_manifest_publish(session: &Session, stream: StreamId, init_slot: Arc<Mu
             return;
         };
         let init_bytes = loop {
-            if let Some(b) = init_slot.lock().unwrap().clone() {
+            if let Some(b) = init_slot.lock().unwrap_or_else(|e| e.into_inner()).clone() {
                 break b;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -647,7 +653,7 @@ fn spawn_manifest_publish(session: &Session, stream: StreamId, init_slot: Arc<Mu
             }
             Err(e) => log::warn!("[publish] manifest put to Bulletin failed: {e:?}"),
         }
-    });
+    })
 }
 
 /// Desktop publish: ffmpeg listens for an RTMP ingest (OBS) and segments it into CMAF.
@@ -682,9 +688,7 @@ async fn start_publish(
     // aborting the feeder also kills its ffmpeg ingest (Drop) so we don't fight over
     // the RTMP port.
     if let Some(prev) = state.publish.lock().unwrap().take() {
-        prev.feeder.abort();
-        prev.stats.abort();
-        let _ = prev.pub_tx.send(EngineEvent::Stop);
+        teardown_publish(prev);
     }
     let port = 21935u16;
     let key = "unstation";
@@ -726,17 +730,20 @@ async fn start_publish(
 
     // Announce presence + republish the live-edge manifest as segments are made. The
     // publisher advertises relay-capability (relay = true): it's the origin/bridge, so
-    // NAT-restricted viewers should prefer dialing it.
-    session.spawn_presence(80_000_000, true);
+    // NAT-restricted viewers should prefer dialing it. Every spawned task's handle goes
+    // into `tasks` so teardown really ends the stream (a surviving presence loop would
+    // keep announcing it to the chain forever).
+    let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+    tasks.push(session.spawn_presence(80_000_000, true));
 
     // M2 — publish the signed manifest to Bulletin + announce its CID in presence (the durable
     // trust anchor). The feeder fills `init_slot` with the encoder's CMAF init; the shared
     // publisher waits for it, puts it on Bulletin, and references it in the signed manifest so
     // viewers can initialize MSE before any media fragment.
     let init_slot: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
-    spawn_manifest_publish(&session, stream, init_slot.clone());
+    tasks.push(spawn_manifest_publish(&session, stream, init_slot.clone()));
     let (edge_tx, edge_rx) = unbounded_channel::<(Seq, SegmentId)>();
-    session.spawn_edge_publisher(edge_rx);
+    tasks.push(session.spawn_edge_publisher(edge_rx));
 
     // Feeder: tail the ingest dir → preview sink + the publisher's mesh seed +
     // the live-edge manifest. Emits `publish-state` and keeps `live_flag` current so
@@ -790,7 +797,8 @@ async fn start_publish(
                         if let Some(init) = segmenter::load_init(&dir) {
                             // Hand the init to the manifest publisher (→ Bulletin → viewers)
                             // and feed our own self-preview. (Bytes clone is cheap.)
-                            *init_slot_feeder.lock().unwrap() = Some(init.clone());
+                            *init_slot_feeder.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(init.clone());
                             preview.push_init(init);
                             init_sent = true;
                         }
@@ -830,6 +838,8 @@ async fn start_publish(
         })
     };
 
+    tasks.push(feeder);
+    tasks.push(stats);
     let info = PublishInfo {
         ingest_server: format!("rtmp://127.0.0.1:{port}/live"),
         stream_key: key.into(),
@@ -837,8 +847,7 @@ async fn start_publish(
     };
     *state.publish.lock().unwrap() = Some(PublishSession {
         _hls: hls,
-        feeder,
-        stats,
+        tasks,
         pub_tx,
         session,
         name: canon,
@@ -874,9 +883,7 @@ async fn start_publish(
     }
     // Replace a prior/stale session (aborting its feeder + closing the AU intake).
     if let Some(prev) = state.publish.lock().unwrap().take() {
-        prev.feeder.abort();
-        prev.stats.abort();
-        let _ = prev.pub_tx.send(EngineEvent::Stop);
+        teardown_publish(prev);
         camera::close_stream();
     }
 
@@ -898,13 +905,15 @@ async fn start_publish(
     tokio::spawn(async move {
         let _ = publisher.run(pub_rx, TICK, None).await;
     });
-    session.spawn_presence(80_000_000, true);
+    // Track every spawned task so teardown really ends the stream (see the desktop path).
+    let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+    tasks.push(session.spawn_presence(80_000_000, true));
 
     let init_slot: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
-    spawn_manifest_publish(&session, stream, init_slot.clone());
+    tasks.push(spawn_manifest_publish(&session, stream, init_slot.clone()));
 
     let (edge_tx, edge_rx) = unbounded_channel::<(Seq, SegmentId)>();
-    session.spawn_edge_publisher(edge_rx);
+    tasks.push(session.spawn_edge_publisher(edge_rx));
 
     // Feeder: drain encoded AUs from the camera plugin → mux to CMAF → the three sinks
     // (self-preview, mesh `Produced`, live edge), exactly like the ffmpeg feeder's tail.
@@ -936,7 +945,7 @@ async fn start_publish(
         });
         // Init segment → self-preview + the manifest publisher (Bulletin, via `init_slot`).
         let init = fb.init_segment();
-        *init_slot.lock().unwrap() = Some(init.clone());
+        *init_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(init.clone());
         preview.push_init(init);
         live_w.store(true, Ordering::Relaxed);
         let _ = appc.emit("publish-state", PublishStateMsg { live: true });
@@ -972,10 +981,11 @@ async fn start_publish(
 
     // No RTMP ingest on Android — the camera is the source; the UI hides the OBS rail.
     let info = PublishInfo { ingest_server: String::new(), stream_key: String::new(), hls_url };
+    tasks.push(feeder);
+    tasks.push(stats);
     *state.publish.lock().unwrap() = Some(PublishSession {
         _hls: hls,
-        feeder,
-        stats,
+        tasks,
         pub_tx,
         session,
         name: canon,
@@ -985,13 +995,27 @@ async fn start_publish(
     Ok(info)
 }
 
+/// Fully tear down a publish: abort every background task (feeder — which kills the
+/// ffmpeg ingest via `Drop` — stats, presence refresh, edge publisher, manifest publish),
+/// stop the node, and actively close the WebRTC connections. Mirrors `teardown_watch`:
+/// without `session.shutdown()` the transport reactor (kept alive by detached signaling
+/// tasks) holds viewer connections open, and without aborting the presence/edge tasks the
+/// stopped stream keeps announcing itself to the chain forever.
+#[cfg(feature = "publish")]
+fn teardown_publish(sess: PublishSession) {
+    for t in sess.tasks {
+        t.abort();
+    }
+    let _ = sess.pub_tx.send(EngineEvent::Stop);
+    sess.session.shutdown();
+    // `_hls` drops here.
+}
+
 #[cfg(feature = "publish")]
 #[tauri::command]
 fn stop_publish(state: State<'_, AppState>) {
     if let Some(sess) = state.publish.lock().unwrap().take() {
-        sess.feeder.abort(); // dropping the feeder kills the ffmpeg ingest (Drop)
-        sess.stats.abort();
-        let _ = sess.pub_tx.send(EngineEvent::Stop);
+        teardown_publish(sess);
     }
     // Android: stop accepting encoded AUs from the camera plugin.
     #[cfg(target_os = "android")]

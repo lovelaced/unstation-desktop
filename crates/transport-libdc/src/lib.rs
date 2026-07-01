@@ -190,11 +190,14 @@ impl LibDcTransport {
     /// * `inbox` — the `MeshNode` event inbox: receives `PeerConnected`,
     ///   `Inbound`, `PeerDisconnected`.
     /// * `signals` — locally-generated SDP/ICE the orchestrator relays to the peer.
+    ///
+    /// Errors if the OS refuses the reactor thread (resource exhaustion) — callers
+    /// surface that instead of the process aborting.
     pub fn new(
         stun: Vec<String>,
         inbox: UnboundedSender<EngineEvent>,
         signals: UnboundedSender<SignalOut>,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         // Tune SCTP globals before any PeerConnection exists (applies to new conns only).
         apply_sctp_settings();
         let (cmd_tx, mut cmd_rx) = unbounded_channel::<Cmd>();
@@ -239,9 +242,8 @@ impl LibDcTransport {
                         &reactor_reachable,
                     );
                 }
-            })
-            .expect("spawn libdc reactor");
-        Self { cmd: cmd_tx, connected, reachable }
+            })?;
+        Ok(Self { cmd: cmd_tx, connected, reachable })
     }
 
     /// Number of peers currently connected (both channels open). A real,
