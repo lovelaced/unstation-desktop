@@ -151,6 +151,11 @@ impl Link for LibDcLink {
     fn send(&self, channel: Channel, bytes: Vec<u8>) {
         let _ = self.cmd.send(Cmd::Send(self.remote, channel, bytes));
     }
+    fn close(&self) {
+        // Reactor drops the Peer → libdatachannel closes the connection; the node
+        // then receives the normal PeerDisconnected and cleans up its state.
+        let _ = self.cmd.send(Cmd::Close(self.remote));
+    }
 }
 
 /// State the reactor owns for one peer connection.

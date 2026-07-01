@@ -175,6 +175,55 @@ impl PresenceBook {
     }
 }
 
+/// Ban duration + set cap. Bans are temporal (a routing PeerId is ephemeral by design,
+/// so damnation-forever only wastes memory) and the set is capped so a Sybil churning
+/// through identities can't grow it without bound.
+const BAN_TTL: Duration = Duration::from_secs(600);
+const BAN_LIST_MAX: usize = 1024;
+
+/// Peers convicted of forgery/abuse by the `MeshNode` (which watches the bytes),
+/// shared with the `Session` (which must stop dialing them and refuse their offers).
+/// Same clone-handle pattern as [`PresenceBook`].
+#[derive(Clone, Default)]
+pub struct BanList {
+    inner: Arc<Mutex<HashMap<PeerId, Instant>>>,
+}
+
+impl BanList {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn guard(&self) -> std::sync::MutexGuard<'_, HashMap<PeerId, Instant>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn ban(&self, peer: PeerId) {
+        let mut g = self.guard();
+        if !g.contains_key(&peer) && g.len() >= BAN_LIST_MAX {
+            g.retain(|_, t| t.elapsed() < BAN_TTL);
+        }
+        if !g.contains_key(&peer) && g.len() >= BAN_LIST_MAX {
+            if let Some(oldest) = g.iter().min_by_key(|(_, t)| *t).map(|(k, _)| *k) {
+                g.remove(&oldest);
+            }
+        }
+        g.insert(peer, Instant::now());
+    }
+
+    pub fn contains(&self, peer: &PeerId) -> bool {
+        self.guard().get(peer).map_or(false, |t| t.elapsed() < BAN_TTL)
+    }
+
+    pub fn len(&self) -> usize {
+        self.guard().values().filter(|t| t.elapsed() < BAN_TTL).count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// 32-byte topic hash = `BLAKE2b-256(..)` (sharded discovery, TECH_SPEC §7.2).
 pub type TopicId = [u8; 32];
 

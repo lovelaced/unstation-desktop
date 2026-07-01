@@ -40,8 +40,15 @@ pub struct PeerState {
     pub throughput_bps: Ewma,
     pub rtt_ms: Ewma,
     pub pending_bytes: u64,
-    /// Reputation in `[0, 1]`; decays on hash mismatch / repeated choke (TECH_SPEC §8.5).
+    /// Reputation in `[0, 1]` (TECH_SPEC §8.5): decays on forged bytes, request
+    /// timeouts, and protocol abuse; heals slowly on verified deliveries. The picker
+    /// scales expected delivery time by it, and crossing the floor bans the peer.
     pub reputation: f64,
+    /// Count of accepted-then-never-served requests (buffer-map lies / dead links).
+    pub strikes: u32,
+    /// Reputation crossed the floor: choked, disconnected, and barred from re-dial
+    /// (via the session's shared `BanList`) until the ban expires.
+    pub banned: bool,
     /// Upload fairness (TECH_SPEC §8.5). `choked` = WE are withholding upload from this
     /// peer (not in one of our upload slots); `choked_by` = THEY told us they won't serve
     /// us (so the picker shouldn't waste `Want`s on them). Both default to "open".
@@ -58,6 +65,8 @@ impl PeerState {
             rtt_ms: Ewma::new(0.3),
             pending_bytes: 0,
             reputation: 1.0,
+            strikes: 0,
+            banned: false,
             choked: false,
             choked_by: false,
         }

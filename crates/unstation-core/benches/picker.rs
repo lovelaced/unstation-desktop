@@ -32,6 +32,7 @@ fn bench_picker(c: &mut Criterion) {
                 throughput_bps: 5_000_000.0,
                 rtt_ms: 80.0,
                 pending_bytes: 0,
+                reputation: 1.0,
             })
             .collect();
         let input = PickInput {

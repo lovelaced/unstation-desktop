@@ -7511,7 +7511,7 @@ dependencies = [
 
 [[package]]
 name = "useragent-balance"
-version = "0.4.35"
+version = "0.4.36"
 dependencies = [
  "futures",
  "serde",
@@ -7523,7 +7523,7 @@ dependencies = [
 
 [[package]]
 name = "useragent-call-coordinator"
-version = "0.4.35"
+version = "0.4.36"
 dependencies = [
  "getrandom 0.2.17",
  "log",
@@ -7533,7 +7533,7 @@ dependencies = [
 
 [[package]]
 name = "useragent-chain"
-version = "0.4.35"
+version = "0.4.36"
 dependencies = [
  "anyhow",
  "blake2",
@@ -7554,7 +7554,7 @@ dependencies = [
 
 [[package]]
 name = "useragent-chain-core"
-version = "0.4.35"
+version = "0.4.36"
 dependencies = [
  "futures",
  "log",
@@ -7568,7 +7568,7 @@ dependencies = [
 
 [[package]]
 name = "useragent-coinage"
-version = "0.4.35"
+version = "0.4.36"
 dependencies = [
  "anyhow",
  "bip39",
@@ -7608,7 +7608,7 @@ dependencies = [
 
 [[package]]
 name = "useragent-encoding"
-version = "0.4.35"
+version = "0.4.36"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -7626,7 +7626,7 @@ dependencies = [
 
 [[package]]
 name = "useragent-history"
-version = "0.4.35"
+version = "0.4.36"
 dependencies = [
  "async-trait",
  "frame-decode",
@@ -7641,7 +7641,7 @@ dependencies = [
 
 [[package]]
 name = "useragent-native"
-version = "0.4.35"
+version = "0.4.36"
 dependencies = [
  "useragent-balance",
  "useragent-call-coordinator",
@@ -7660,7 +7660,7 @@ dependencies = [
 
 [[package]]
 name = "useragent-product-view"
-version = "0.4.35"
+version = "0.4.36"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -7669,7 +7669,7 @@ dependencies = [
 
 [[package]]
 name = "useragent-substrate"
-version = "0.4.35"
+version = "0.4.36"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7691,7 +7691,7 @@ dependencies = [
 
 [[package]]
 name = "useragent-tx-summary"
-version = "0.4.35"
+version = "0.4.36"
 dependencies = [
  "serde",
  "serde_json",
@@ -7701,14 +7701,14 @@ dependencies = [
 
 [[package]]
 name = "useragent-vrf"
-version = "0.4.35"
+version = "0.4.36"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "useragent-vrf-native"
-version = "0.4.35"
+version = "0.4.36"
 dependencies = [
  "getrandom 0.2.17",
  "parity-scale-codec",
@@ -7718,7 +7718,7 @@ dependencies = [
 
 [[package]]
 name = "useragent-wallet"
-version = "0.4.35"
+version = "0.4.36"
 dependencies = [
  "aes-gcm",
  "anyhow",

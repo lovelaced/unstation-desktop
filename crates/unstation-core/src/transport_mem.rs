@@ -25,6 +25,10 @@ impl Link for MemLink {
     fn send(&self, channel: Channel, bytes: Vec<u8>) {
         let _ = self.out.send(EngineEvent::Inbound { peer: self.me, channel, bytes });
     }
+    fn close(&self) {
+        // The remote observes the teardown as a disconnect — deterministic in tests.
+        let _ = self.out.send(EngineEvent::PeerDisconnected { peer: self.me });
+    }
 }
 
 /// Wire nodes `a` and `b` together. Returns `(link_for_a, link_for_b)` — hand each

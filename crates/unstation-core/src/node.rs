@@ -17,7 +17,7 @@ use crate::peer::PeerState;
 use crate::picker::Source;
 use crate::protocol::{Caps, MeshMsg};
 use crate::reassembly::Reassembler;
-use crate::signaling::PresenceBook;
+use crate::signaling::{BanList, PresenceBook};
 use crate::transport::{Channel, EngineEvent, Link};
 use crate::types::{PeerId, SegmentId, Seq};
 use crate::{crypto, engine::MeshEngine};
@@ -86,6 +86,35 @@ const MAX_GOSSIP_RECORDS: usize = 64;
 const MAX_BITFIELD_BYTES: usize = 8 * 1024;
 /// `known_peers` is a stat + gossip seed, not a routing table — cap it.
 const KNOWN_PEERS_MAX: usize = 4096;
+/// Reputation floor: crossing it bans the peer (choke + disconnect + BanList).
+/// 0.05 ≈ five forged segments (0.5⁵), or a long run of timeouts/abuse.
+const REPUTATION_FLOOR: f64 = 0.05;
+/// Verified deliveries slowly heal reputation, so an honest peer on a lossy link
+/// (whose timeouts are genuine) recovers instead of drifting toward the floor.
+const REPUTATION_HEAL: f64 = 0.02;
+
+/// Why a peer is being penalized. Each maps to a decay factor commensurate with how
+/// strong the evidence of misbehavior is — forged bytes are proof, a timeout might
+/// just be loss, an oversized message is usually a hostile probe.
+#[derive(Clone, Copy, Debug)]
+enum Penalty {
+    /// Delivered bytes hash-failed against a KNOWN authenticated id.
+    HashFail,
+    /// An accepted request never completed (buffer-map lie, or a dying link).
+    Timeout,
+    /// A message violated protocol bounds (floods, oversize, unrequested spray).
+    ProtocolAbuse,
+}
+
+impl Penalty {
+    fn factor(self) -> f64 {
+        match self {
+            Penalty::HashFail => 0.5,
+            Penalty::Timeout => 0.8,
+            Penalty::ProtocolAbuse => 0.9,
+        }
+    }
+}
 
 /// Builds the exact bytes a publisher signs (and a viewer verifies) for one live-edge
 /// entry: tag ‖ stream ‖ seq ‖ content-id. A free fn so the sign + verify paths can't
@@ -208,6 +237,9 @@ pub struct MeshNode {
     /// periodically gossips a sample of it to peers and merges what it receives, so the
     /// session can dial in-mesh-discovered peers without a per-viewer chain write.
     presence_book: Option<PresenceBook>,
+    /// Shared with the session (see [`MeshNode::with_ban_list`]): convictions land
+    /// here so the dial/accept edges stay closed to a banned peer.
+    ban_list: Option<BanList>,
     last_presence_gossip_ms: u64,
     known_peers: HashSet<PeerId>,
     /// Push-pull (TECH_SPEC §6.4): peers that subscribed to our live edge. We PUSH each
@@ -340,6 +372,7 @@ impl MeshNode {
             publisher_key: None,
             edge_seen: HashSet::new(),
             presence_book: None,
+            ban_list: None,
             last_presence_gossip_ms: 0,
             known_peers: HashSet::new(),
             subscribers: HashSet::new(),
@@ -387,6 +420,14 @@ impl MeshNode {
     /// in-mesh-discovered peers instead of every viewer writing presence to the chain.
     pub fn with_presence_book(mut self, book: PresenceBook) -> Self {
         self.presence_book = Some(book);
+        self
+    }
+
+    /// Share the session's ban list: the node convicts (reputation floor), the
+    /// session enforces at the edges (no re-dial, offers refused) — without this a
+    /// banned peer just reconnects under the same id with a fresh `PeerState`.
+    pub fn with_ban_list(mut self, bans: BanList) -> Self {
+        self.ban_list = Some(bans);
         self
     }
 
@@ -469,6 +510,12 @@ impl MeshNode {
     fn on_event(&mut self, ev: EngineEvent) {
         match ev {
             EngineEvent::PeerConnected { peer, link } => {
+                // Defense in depth: the session refuses banned dials/offers, but a
+                // connection already mid-handshake when the ban landed still arrives.
+                if self.ban_list.as_ref().map_or(false, |b| b.contains(&peer)) {
+                    link.close();
+                    return;
+                }
                 self.eng.peers.entry(peer).or_insert_with(|| PeerState::new(peer));
                 self.links.insert(peer, link.clone());
                 self.send_hello(&link);
@@ -618,6 +665,9 @@ impl MeshNode {
         for seq in stale {
             if let Some((pid, _)) = self.clear_pending(seq) {
                 self.remove_reasm(&(pid, seq)); // re-request starts fresh
+                // The peer accepted a request it never served — a buffer-map lie or a
+                // dying link. Genuine loss heals back on the next verified delivery.
+                self.penalize(pid, Penalty::Timeout);
             }
         }
 
@@ -743,6 +793,10 @@ impl MeshNode {
     }
 
     fn on_inbound(&mut self, peer: PeerId, _channel: Channel, bytes: &[u8]) {
+        // A banned peer's connection is being torn down — nothing it says matters.
+        if self.eng.peers.get(&peer).map(|p| p.banned).unwrap_or(false) {
+            return;
+        }
         let msg = match MeshMsg::decode(&mut &bytes[..]) {
             Ok(m) => m,
             Err(_) => return, // hostile / malformed input is dropped, never fatal
@@ -750,7 +804,9 @@ impl MeshNode {
         match msg {
             MeshMsg::Hello { base_seq, bitfield, .. } | MeshMsg::BufferMap { base_seq, bitfield } => {
                 if bitfield.len() > MAX_BITFIELD_BYTES {
-                    return; // no honest live window is this wide — hostile allocation bait
+                    // No honest live window is this wide — hostile allocation bait.
+                    self.penalize(peer, Penalty::ProtocolAbuse);
+                    return;
                 }
                 let entry = self.eng.peers.entry(peer).or_insert_with(|| PeerState::new(peer));
                 entry.buffer = BufferMap::from_bytes(base_seq, &bitfield);
@@ -759,6 +815,7 @@ impl MeshNode {
             MeshMsg::Want { segment_seqs, .. } => {
                 // Batch cap: one Want never asks for more than the picker would issue.
                 if segment_seqs.len() > MAX_WANT_SEQS {
+                    self.penalize(peer, Penalty::ProtocolAbuse);
                     return;
                 }
                 // Upload fairness: serve only peers we've unchoked (publishers/seeds
@@ -801,6 +858,7 @@ impl MeshNode {
                 // over the data channel, never the statement store. The node holds
                 // no signaling handle, so this provably incurs zero store writes.
                 if peers.len() > MAX_GOSSIP_PEERS {
+                    self.penalize(peer, Penalty::ProtocolAbuse);
                     return;
                 }
                 for p in peers {
@@ -815,6 +873,7 @@ impl MeshNode {
                 // into the shared book (the session dials from it) and count them as
                 // discovered. Zero statement-store writes — pure in-mesh discovery.
                 if records.len() > MAX_GOSSIP_RECORDS {
+                    self.penalize(peer, Penalty::ProtocolAbuse);
                     return;
                 }
                 for r in &records {
@@ -913,6 +972,13 @@ impl MeshNode {
         let in_push_window =
             seq >= self.eng.play_seq && seq <= self.eng.head_seq.saturating_add(PUSH_AHEAD);
         if !asked_this_peer && !in_push_window {
+            // A near-miss behind the play head is just a push that lost a race and
+            // costs nothing; anything far outside every honest window is a spray.
+            if seq > self.eng.head_seq.saturating_add(PUSH_AHEAD * 4)
+                || seq.saturating_add(self.eng.cfg.window as Seq) < self.eng.play_seq
+            {
+                self.penalize(peer, Penalty::ProtocolAbuse);
+            }
             return;
         }
         // Global caps. Refusing a NEW reassembly (rather than evicting an old one) means
@@ -944,13 +1010,11 @@ impl MeshNode {
             Some(id) => match r.finish_verified(&id) {
                 Some(data) => self.accept_segment(peer, seq, id, Bytes::from(data)),
                 None => {
-                    // Hash mismatch against a KNOWN id — a genuinely bad/forged chunk:
-                    // discard, decay reputation, re-request elsewhere.
+                    // Hash mismatch against a KNOWN id — a genuinely forged segment:
+                    // discard, penalize the sender, re-request elsewhere.
                     self.stats.hash_failures += 1;
                     self.clear_pending(seq);
-                    if let Some(p) = self.eng.peers.get_mut(&peer) {
-                        p.reputation *= 0.5;
-                    }
+                    self.penalize(peer, Penalty::HashFail);
                 }
             },
             // Pushed to us before our live edge learned this segment's id (push-pull):
@@ -991,6 +1055,50 @@ impl MeshNode {
         }
     }
 
+    /// Decay a peer's reputation for observed misbehavior; crossing the floor bans
+    /// it — choked, its partial state dropped, the connection actively closed, and
+    /// (via the shared [`BanList`]) barred from re-dialing/being redialed while the
+    /// ban lasts. All misbehavior handling funnels through here so evidence
+    /// accumulates on one scale instead of each site inventing its own.
+    fn penalize(&mut self, peer: PeerId, why: Penalty) {
+        let crossed = match self.eng.peers.get_mut(&peer) {
+            Some(p) => {
+                p.reputation *= why.factor();
+                if matches!(why, Penalty::Timeout) {
+                    p.strikes += 1;
+                }
+                let crossed = p.reputation < REPUTATION_FLOOR && !p.banned;
+                if crossed {
+                    p.banned = true;
+                    log::warn!(
+                        "[mesh] peer {:?} banned ({:?}, reputation {:.3}, strikes {})",
+                        peer, why, p.reputation, p.strikes
+                    );
+                }
+                crossed
+            }
+            None => false,
+        };
+        if !crossed {
+            return;
+        }
+        self.subscribers.remove(&peer);
+        let keys: Vec<(PeerId, Seq)> =
+            self.reasm.keys().filter(|(p, _)| *p == peer).copied().collect();
+        for k in keys {
+            self.remove_reasm(&k);
+        }
+        if let Some(bans) = &self.ban_list {
+            bans.ban(peer);
+        }
+        if let Some(link) = self.links.get(&peer) {
+            link.send(Channel::Ctrl, MeshMsg::Choke.encode());
+            link.close();
+        }
+        // The rest of the local state (links / eng.peers / pending) unwinds through
+        // the PeerDisconnected the closed link produces.
+    }
+
     /// Store a verified segment, feed the player, update the sender's throughput, and
     /// (push-pull) reshare it to our own subscribers so the live edge propagates
     /// hop-by-hop without each downstream viewer paying a discovery + `Want` round-trip.
@@ -1016,6 +1124,13 @@ impl MeshNode {
                 if let Some(p) = self.eng.peers.get_mut(&peer) {
                     p.throughput_bps.update((n as f64) * 8_000.0 / (elapsed as f64));
                 }
+            }
+        }
+        // Verified bytes slowly heal reputation: honest peers on lossy links recover
+        // from genuine-loss timeouts instead of drifting toward the ban floor.
+        if let Some(p) = self.eng.peers.get_mut(&peer) {
+            if !p.banned {
+                p.reputation = (p.reputation + REPUTATION_HEAL).min(1.0);
             }
         }
         self.push_to_subscribers(seq);
@@ -1052,9 +1167,7 @@ impl MeshNode {
             self.accept_segment(peer, seq, id, raw);
         } else {
             self.stats.hash_failures += 1;
-            if let Some(p) = self.eng.peers.get_mut(&peer) {
-                p.reputation *= 0.5;
-            }
+            self.penalize(peer, Penalty::HashFail);
         }
     }
 
@@ -1255,6 +1368,62 @@ mod tests {
         assert!(node.eng.local.has(30));
         assert!(!node.segment_ids.contains_key(&0), "id map pruned");
         assert!(node.segment_ids.contains_key(&30));
+    }
+
+    #[test]
+    fn repeated_forgeries_cross_the_floor_and_ban_the_peer() {
+        let m = pid(6);
+        let payload = vec![0xAAu8; 64];
+        let id = crypto::segment_id(&payload); // authenticated id for every seq
+        let ids: HashMap<Seq, SegmentId> = (5..15u64).map(|s| (s, id)).collect();
+        let mut node = viewer_with_ids(ids, 14);
+        node.eng.peers.insert(m, PeerState::new(m));
+        let bans = BanList::new();
+        node.ban_list = Some(bans.clone());
+
+        // M keeps delivering forged bytes for segments we asked it for.
+        for seq in 5..11u64 {
+            node.pending.insert(seq, (m, 0));
+            node.on_segment_data(m, seq, 64, 0, &[0xEEu8; 64]); // wrong hash
+        }
+
+        let p = &node.eng.peers[&m];
+        assert!(p.banned, "reputation {:.3} should have crossed the floor", p.reputation);
+        assert!(bans.contains(&m), "conviction shared with the session's ban list");
+        assert!(!node.subscribers.contains(&m));
+        assert_eq!(node.stats.hash_failures, 6);
+        // The picker never asks a banned peer for anything again.
+        let reqs = node.eng.plan(1_000, &mut ChaCha8Rng::seed_from_u64(1));
+        assert!(
+            reqs.iter().all(|r| !matches!(r.source, Source::Peer(x) if x == m)),
+            "no requests routed to a banned peer"
+        );
+    }
+
+    #[test]
+    fn timeouts_strike_and_verified_delivery_heals() {
+        let a = pid(1);
+        let payload = vec![0x11u8; 64];
+        let id = crypto::segment_id(&payload);
+        let mut node = viewer_with_ids(HashMap::from([(6u64, id)]), 6);
+        node.eng.peers.insert(a, PeerState::new(a));
+
+        // A accepted a request and never served it → strike + decay.
+        node.pending.insert(5, (a, 0));
+        node.now_ms = PENDING_TIMEOUT_MS;
+        node.on_tick();
+        let (rep_after_timeout, strikes) = {
+            let p = &node.eng.peers[&a];
+            (p.reputation, p.strikes)
+        };
+        assert_eq!(strikes, 1);
+        assert!(rep_after_timeout < 1.0 && !node.eng.peers[&a].banned);
+
+        // A verified delivery heals it back toward 1.0.
+        node.pending.insert(6, (a, node.now_ms));
+        node.on_segment_data(a, 6, 64, 0, &payload);
+        assert!(node.eng.local.has(6));
+        assert!(node.eng.peers[&a].reputation > rep_after_timeout, "heal applied");
     }
 
     #[test]

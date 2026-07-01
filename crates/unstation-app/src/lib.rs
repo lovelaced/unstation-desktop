@@ -318,7 +318,9 @@ async fn start_watch(
     .with_stream_id(stream.0)
     // Discover + reshare peers in-mesh via the shared presence book (no per-viewer
     // chain write); the session dials from the same book.
-    .with_presence_book(session.presence_book());
+    .with_presence_book(session.presence_book())
+    // Convictions (forged bytes, floods) bar re-dials + offers at the session edge.
+    .with_ban_list(session.ban_list());
     let mut tasks = Vec::new();
     tasks.push(tokio::spawn(async move {
         let _ = viewer.run(view_rx, TICK, None).await;
@@ -723,7 +725,9 @@ async fn start_publish(
     .with_stream_id(stream.0)
     .with_edge_signer(Arc::new(IdentityEdgeSigner))
     // Gossip the presence book so viewers discover the swarm in-mesh.
-    .with_presence_book(session.presence_book());
+    .with_presence_book(session.presence_book())
+    // Convictions (forged bytes, floods) bar re-dials + offers at the session edge.
+    .with_ban_list(session.ban_list());
     tokio::spawn(async move {
         let _ = publisher.run(pub_rx, TICK, None).await;
     });
@@ -901,7 +905,9 @@ async fn start_publish(
     )
     .with_stream_id(stream.0)
     .with_edge_signer(Arc::new(IdentityEdgeSigner))
-    .with_presence_book(session.presence_book());
+    .with_presence_book(session.presence_book())
+    // Convictions (forged bytes, floods) bar re-dials + offers at the session edge.
+    .with_ban_list(session.ban_list());
     tokio::spawn(async move {
         let _ = publisher.run(pub_rx, TICK, None).await;
     });

@@ -26,6 +26,10 @@ pub enum Channel {
 pub trait Link: Send + Sync {
     fn remote(&self) -> PeerId;
     fn send(&self, channel: Channel, bytes: Vec<u8>);
+    /// Actively tear down the underlying connection (banning a peer). The node then
+    /// observes the usual `PeerDisconnected`. Default no-op for links with no
+    /// teardown path (simulator shims).
+    fn close(&self) {}
 }
 
 /// Events the node's single-actor loop consumes.

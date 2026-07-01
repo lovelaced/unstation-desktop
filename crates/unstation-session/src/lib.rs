@@ -26,7 +26,7 @@ use tokio::time::{interval, sleep};
 use transport_libdc::{LibDcTransport, SignalOut};
 use unstation_chain::ChainSignaling;
 use unstation_core::node::EdgeSigner;
-use unstation_core::signaling::{Presence, PresenceBook, PresenceRecord, Signaling, SignalMsg};
+use unstation_core::signaling::{BanList, Presence, PresenceBook, PresenceRecord, Signaling, SignalMsg};
 use unstation_core::topic::discovery_topic;
 use unstation_core::transport::EngineEvent;
 use unstation_core::types::{PeerId, SegmentId, Seq, StreamId};
@@ -68,6 +68,12 @@ pub struct Session {
     /// gossips it in-mesh. The session refreshes our own entry + dials from it, so plain
     /// viewers never write presence to the chain (only bootstrap anchors do).
     book: PresenceBook,
+    /// Shared with the `MeshNode` (via [`MeshNode::with_ban_list`]): the node convicts
+    /// misbehaving peers; the session enforces the ban at its edges — banned peers are
+    /// never dialed and their offers are ignored.
+    ///
+    /// [`MeshNode::with_ban_list`]: unstation_core::node::MeshNode::with_ban_list
+    bans: BanList,
 }
 
 impl Session {
@@ -103,8 +109,9 @@ impl Session {
             .map_err(|e| format!("couldn't start the connection engine: {e}"))?;
         let signaling = ChainSignaling::new(stream, n_shards);
 
+        let bans = BanList::new();
         tokio::spawn(relay_outbound(sig_rx, signaling.clone(), my_peer));
-        tokio::spawn(relay_inbound(signaling.clone(), my_peer, transport.clone()));
+        tokio::spawn(relay_inbound(signaling.clone(), my_peer, transport.clone(), bans.clone()));
 
         Ok(Self {
             stream,
@@ -114,7 +121,16 @@ impl Session {
             transport,
             manifest_cid: Arc::new(Mutex::new(None)),
             book: PresenceBook::new(),
+            bans,
         })
+    }
+
+    /// The shared ban list — hand this to the `MeshNode` (via
+    /// [`MeshNode::with_ban_list`]) so its convictions bar re-dials and offers here.
+    ///
+    /// [`MeshNode::with_ban_list`]: unstation_core::node::MeshNode::with_ban_list
+    pub fn ban_list(&self) -> BanList {
+        self.bans.clone()
     }
 
     /// The shared off-chain presence directory — hand this to the `MeshNode`
@@ -261,6 +277,9 @@ impl Session {
                 out.push(p);
             }
         }
+        // Never hand back a peer the node has convicted — a banned peer that keeps
+        // announcing presence would otherwise be redialed forever.
+        out.retain(|p| !self.bans.contains(&p.peer_id));
         // Relay-capable volunteers first: a NAT-restricted node should try the reliable
         // bridges before random peers (the decentralized stand-in for a TURN server).
         out.sort_by_key(|p| !p.relay);
@@ -349,7 +368,12 @@ async fn relay_outbound(
 /// handler works for both roles: a viewer never receives an `Offer`, a publisher
 /// never receives an `Answer`. Offers are applied before candidates so the peer
 /// connection exists first (the transport also buffers early candidates).
-async fn relay_inbound(signaling: ChainSignaling, me: PeerId, transport: LibDcTransport) {
+async fn relay_inbound(
+    signaling: ChainSignaling,
+    me: PeerId,
+    transport: LibDcTransport,
+    bans: BanList,
+) {
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     let mut tick = interval(SIGNAL_POLL);
     loop {
@@ -363,6 +387,9 @@ async fn relay_inbound(signaling: ChainSignaling, me: PeerId, transport: LibDcTr
         };
         sigs.sort_by_key(|(_, m)| sig_order(m));
         for (from, msg) in sigs {
+            if bans.contains(&from) {
+                continue; // convicted by the node — its offers/answers are refused
+            }
             if !seen.insert(dedup_key(&from, &msg)) {
                 continue;
             }

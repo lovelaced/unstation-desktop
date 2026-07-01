@@ -42,6 +42,10 @@ pub struct PeerView<'a> {
     pub throughput_bps: f64,
     pub rtt_ms: f64,
     pub pending_bytes: u64,
+    /// `[0, 1]` (TECH_SPEC §8.5): scales expected delivery time, so a peer with a
+    /// history of forgeries/timeouts is continuously deprioritized well before any
+    /// ban. Banned peers never appear in the view at all.
+    pub reputation: f64,
 }
 
 /// All inputs the picker needs for one tick.
@@ -81,10 +85,13 @@ impl PickInput<'_> {
         self.peers.iter().filter(|p| p.buffer.has(seq)).count()
     }
 
-    /// Expected delivery time in ms: `(pending + seg)/throughput + RTT` (TECH_SPEC §8.4).
+    /// Expected delivery time in ms: `(pending + seg)/throughput + RTT`, scaled up
+    /// as reputation drops (TECH_SPEC §8.4/§8.5) — an unreliable peer has to *look*
+    /// slow, or the picker keeps rewarding a fast forger with requests.
     fn expected_time_ms(&self, p: &PeerView) -> f64 {
         let bw = p.throughput_bps.max(1.0);
-        ((p.pending_bytes + self.seg_bytes) as f64 * 8.0 / bw) * 1000.0 + p.rtt_ms
+        (((p.pending_bytes + self.seg_bytes) as f64 * 8.0 / bw) * 1000.0 + p.rtt_ms)
+            / p.reputation.clamp(0.1, 1.0)
     }
 
     fn holders_by_time(&self, seq: Seq) -> Vec<(&PeerView<'_>, f64)> {

@@ -56,12 +56,14 @@ impl MeshEngine {
         let views: Vec<PeerView> = self
             .peers
             .values()
+            .filter(|p| !p.banned) // a banned peer is being disconnected — never ask it
             .map(|p| PeerView {
                 id: p.id,
                 buffer: &p.buffer,
                 throughput_bps: p.throughput_bps.or(5_000_000.0),
                 rtt_ms: p.rtt_ms.or(80.0),
                 pending_bytes: p.pending_bytes,
+                reputation: p.reputation,
             })
             .collect();
 
