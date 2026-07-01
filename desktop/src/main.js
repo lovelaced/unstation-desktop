@@ -145,6 +145,13 @@ import { viewerVerdict, renderViewerHealth } from './health.js';
   // Settings → Network + Connection health, reflecting real state.
   function updateSettingsStatus(){
     const set=(id,t)=>{ const el=document.getElementById(id); if(el) el.textContent=t; };
+    // Network access = the statement-store allowance that makes sign-in + mesh work.
+    set('setAllow', chainReady ? 'Granted' : 'Not granted'); const ad=document.getElementById('setAllowDot'); if(ad) ad.dataset.h = chainReady ? 'good' : 'wait';
+    const gb=document.getElementById('grantAccessBtn'); if(gb) gb.style.display = chainReady ? 'none' : '';
+    // Durable backup (Bulletin manifest) — currently unavailable: the SDK signs Bulletin
+    // writes with a shared, unfunded dev key and has no per-app allowance path yet. Purely
+    // a cold-start/late-joiner anchor, so live streaming is unaffected. (See docs.)
+    set('setBackup', 'Unavailable — needs SDK support · not required for live streaming'); const bd=document.getElementById('setBackupDot'); if(bd) bd.dataset.h='wait';
     const nl=netLabel(); set('setNetwork', nl.t + ' · Paseo People'); const nd=document.getElementById('setNetDot'); if(nd) nd.dataset.h=nl.h;
     let ht='Not watching or streaming right now.', hh='';
     if(publishing){ ht = pubLive ? ('Streaming live · '+lastViewers+' watching') : 'Stream open · waiting for your encoder'; hh = pubLive?'good':'wait'; }
@@ -332,6 +339,9 @@ import { viewerVerdict, renderViewerHealth } from './health.js';
   // scratch" is the nuclear option that wipes pairing state.
   { const rb=document.getElementById('retryAllowanceBtn'); if(rb) rb.addEventListener('click', async ()=>{ showRetry(false); onboardingStatus('Trying again…'); const ok=await pushChainIdentity(); if(ok){ onboardingStatus('Network access granted ✓'); setTimeout(()=>go('entry'), 700); } }); }
   { const rb2=document.getElementById('rePairBtn2'); if(rb2) rb2.addEventListener('click', ()=>{ chainReady=false; try{ sso.resetPairing(); }catch(e){} showRetry(false); const pb=document.getElementById('pairedBtn'); if(pb) pb.style.display=''; beginPairing(); }); }
+  // Settings → "Grant access": (re)request the statement-store allowance on the existing
+  // session (triggers the phone popup if not yet granted; a no-op cache hit if it is).
+  { const gb=document.getElementById('grantAccessBtn'); if(gb) gb.addEventListener('click', async ()=>{ gb.disabled=true; const prev=gb.textContent; gb.textContent='Requesting…'; try{ await pushChainIdentity(()=>{}); }catch(e){} gb.disabled=false; gb.textContent=prev; updateSettingsStatus(); }); }
   document.getElementById('cancelPublish').addEventListener('click', endPublish);
   document.getElementById('endStream').addEventListener('click', endPublish);
   document.getElementById('startStream').addEventListener('click', goLiveStart);
