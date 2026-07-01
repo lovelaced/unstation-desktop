@@ -13,6 +13,15 @@ use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// Which tier holds a segment right now (see [`SegmentStore::location`]).
+pub enum SegmentLocation {
+    Memory,
+    /// On the spill tier; `id` lets the reader hash-verify the file against the
+    /// content address before serving it (disk contents are outside our control).
+    Disk { id: SegmentId, path: PathBuf },
+    Absent,
+}
+
 pub struct SegmentStore {
     mem: BTreeMap<Seq, Bytes>,
     /// seq → content id, retained even after a segment spills to disk.
@@ -78,6 +87,24 @@ impl SegmentStore {
         let id = self.index.get(&seq)?;
         let path = self.path_for(id)?;
         std::fs::read(path).ok().map(Bytes::from)
+    }
+
+    /// Memory-tier lookup only — never touches disk (a refcounted clone, O(1)).
+    pub fn get_mem(&self, seq: Seq) -> Option<Bytes> {
+        self.mem.get(&seq).cloned()
+    }
+
+    /// Where a segment currently lives, so hot-path callers can serve memory hits
+    /// inline and push disk reads off the async loop (`spawn_blocking`) instead of
+    /// stalling every peer on a synchronous `fs::read`.
+    pub fn location(&self, seq: Seq) -> SegmentLocation {
+        if self.mem.contains_key(&seq) {
+            return SegmentLocation::Memory;
+        }
+        match self.index.get(&seq).and_then(|id| self.path_for(id).map(|p| (*id, p))) {
+            Some((id, path)) => SegmentLocation::Disk { id, path },
+            None => SegmentLocation::Absent,
+        }
     }
 
     /// Drop everything below `floor` — memory, index, and (best-effort) spilled files.

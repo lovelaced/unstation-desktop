@@ -18,6 +18,7 @@ use crate::picker::Source;
 use crate::protocol::{Caps, MeshMsg};
 use crate::reassembly::Reassembler;
 use crate::signaling::{BanList, PresenceBook};
+use crate::store::SegmentLocation;
 use crate::transport::{Channel, EngineEvent, Link};
 use crate::types::{PeerId, SegmentId, Seq};
 use crate::{crypto, engine::MeshEngine};
@@ -164,6 +165,21 @@ fn select_unchokes(
     set
 }
 
+/// Chunk + frame a whole segment onto a link's bulk channel. A free function so the
+/// off-loop disk-serve path (`spawn_blocking`) can use the exact same wire framing
+/// as the in-loop memory path — `Link::send` is a channel post, safe from any thread.
+fn send_segment_on(link: &Arc<dyn Link>, seq: Seq, bytes: &[u8]) {
+    let total = bytes.len() as u32;
+    let mut offset = 0u32;
+    for chunk in bytes.chunks(CHUNK) {
+        // Frame manually so the chunk lands in the output buffer ONCE. The naive
+        // `SegmentData { bytes: chunk.to_vec() }.encode()` copied every byte twice
+        // (into the Vec, then into the encode buffer) on the busiest path — serving.
+        link.send(Channel::Bulk, frame_segment_data(seq, total, offset, chunk));
+        offset += chunk.len() as u32;
+    }
+}
+
 /// Manually SCALE-frame a `MeshMsg::SegmentData` chunk so the payload is copied ONCE
 /// (straight into the output buffer) instead of twice (`chunk.to_vec()` then
 /// `encode()`). The `frame_segment_data_matches_derive` test pins this byte-for-byte
@@ -189,6 +205,12 @@ pub struct NodeStats {
     pub delivered: usize,
     pub peer_bytes: u64,
     pub hash_failures: u64,
+    /// Live-edge lag in seconds: `(head_seq − play_seq) × seg_ms` — how far behind
+    /// the newest known segment playback currently is. The real number the UI's
+    /// latency display and "skip to live" affordance hang off.
+    pub latency_s: f64,
+    pub head_seq: Seq,
+    pub play_seq: Seq,
     /// Leak/bound gauges, snapshotted when the loop exits: the adversarial + churn
     /// suites assert these stay inside their caps and drain to zero after churn.
     pub reasm_entries: usize,
@@ -274,6 +296,9 @@ pub struct MeshNode {
     /// The local buffer map's `count()` no longer works for this: a live viewer
     /// prunes its window as playback advances, so that count *shrinks*.
     delivered_total: usize,
+    /// Optional live stats feed (see [`MeshNode::with_stats`]).
+    stats_tx: Option<tokio::sync::watch::Sender<NodeStats>>,
+    last_stats_ms: u64,
     /// Floor of the last live-window prune, so the per-tick prune only does work
     /// (store + id map + buffer map) when the play head actually advanced.
     last_prune_floor: Seq,
@@ -394,6 +419,8 @@ impl MeshNode {
             upload_tokens,
             last_token_ms: 0,
             delivered_total: preloaded,
+            stats_tx: None,
+            last_stats_ms: 0,
             last_prune_floor: 0,
             stats: NodeStats::default(),
         }
@@ -433,6 +460,15 @@ impl MeshNode {
     /// banned peer just reconnects under the same id with a fresh `PeerState`.
     pub fn with_ban_list(mut self, bans: BanList) -> Self {
         self.ban_list = Some(bans);
+        self
+    }
+
+    /// Publish a [`NodeStats`] snapshot once a second while running (a `watch`
+    /// channel: readers always see the latest, no backpressure on the loop). This
+    /// is where the UI's REAL numbers come from — peer count, delivered segments,
+    /// live-edge lag — instead of fabricated placeholders.
+    pub fn with_stats(mut self, tx: tokio::sync::watch::Sender<NodeStats>) -> Self {
+        self.stats_tx = Some(tx);
         self
     }
 
@@ -773,6 +809,29 @@ impl MeshNode {
             self.recompute_unchokes();
         }
 
+        // Publish a live stats snapshot (1/s) for the UI — real numbers, not
+        // placeholders: peers, delivered, and the live-edge lag playback actually has.
+        if self.stats_tx.is_some()
+            && self.now_ms.saturating_sub(self.last_stats_ms) >= 1_000
+        {
+            self.last_stats_ms = self.now_ms;
+            let mut s = self.stats.clone();
+            s.delivered = self.delivered_total;
+            s.peers = self.eng.peers.len();
+            s.known_peers = self.known_peers.len();
+            s.head_seq = self.eng.head_seq;
+            s.play_seq = self.eng.play_seq;
+            s.latency_s = self.eng.head_seq.saturating_sub(self.eng.play_seq) as f64
+                * self.eng.cfg.seg_ms as f64
+                / 1000.0;
+            s.reasm_entries = self.reasm.len();
+            s.reasm_bytes = self.reasm_bytes;
+            s.pending_entries = self.pending.len();
+            if let Some(tx) = &self.stats_tx {
+                let _ = tx.send(s);
+            }
+        }
+
         // Run the picker and issue Wants to peers.
         let reqs = self.eng.plan(self.now_ms, &mut self.rng);
         for r in reqs {
@@ -832,19 +891,49 @@ impl MeshNode {
                     return;
                 }
                 for seq in segment_seqs {
-                    if let Some(b) = self.eng.store.get(seq) {
-                        // Stay within the upload budget: skip if we can't afford this
-                        // segment now (the requester re-asks; tokens refill each tick).
-                        let cost = b.len() as f64;
-                        if self.eng.cfg.upload_budget_bps > 0 {
-                            if self.upload_tokens < cost {
-                                continue;
+                    match self.eng.store.location(seq) {
+                        SegmentLocation::Memory => {
+                            let Some(b) = self.eng.store.get_mem(seq) else { continue };
+                            // Stay within the upload budget: skip if we can't afford
+                            // this segment now (the requester re-asks; tokens refill
+                            // each tick).
+                            let cost = b.len() as f64;
+                            if self.eng.cfg.upload_budget_bps > 0 {
+                                if self.upload_tokens < cost {
+                                    continue;
+                                }
+                                self.upload_tokens -= cost;
                             }
-                            self.upload_tokens -= cost;
+                            if let Some(link) = self.links.get(&peer).cloned() {
+                                self.send_segment(&link, seq, &b);
+                            }
                         }
-                        if let Some(link) = self.links.get(&peer).cloned() {
-                            self.send_segment(&link, seq, &b);
+                        // A spilled segment: the read must NOT run inline — a cold
+                        // `fs::read` on the actor loop stalls every peer and the
+                        // picker for the duration. Deduct the budget by the nominal
+                        // size now, hash-verify the file off-loop, then chunk it out
+                        // over the (thread-safe, channel-backed) link.
+                        SegmentLocation::Disk { id, path } => {
+                            if self.eng.cfg.upload_budget_bps > 0 {
+                                let cost = self.eng.seg_bytes as f64;
+                                if self.upload_tokens < cost {
+                                    continue;
+                                }
+                                self.upload_tokens -= cost;
+                            }
+                            let Some(link) = self.links.get(&peer).cloned() else { continue };
+                            tokio::task::spawn_blocking(move || {
+                                let Ok(data) = std::fs::read(&path) else { return };
+                                // Disk contents are outside our control (crash-torn
+                                // writes, other processes): never relay bytes that
+                                // no longer match their content address.
+                                if !crypto::verify_segment(&data, &id) {
+                                    return;
+                                }
+                                send_segment_on(&link, seq, &data);
+                            });
                         }
+                        SegmentLocation::Absent => {}
                     }
                 }
             }
@@ -950,15 +1039,7 @@ impl MeshNode {
     }
 
     fn send_segment(&self, link: &Arc<dyn Link>, seq: Seq, bytes: &[u8]) {
-        let total = bytes.len() as u32;
-        let mut offset = 0u32;
-        for chunk in bytes.chunks(CHUNK) {
-            // Frame manually so the chunk lands in the output buffer ONCE. The previous
-            // `SegmentData { bytes: chunk.to_vec() }.encode()` copied every byte twice
-            // (into the Vec, then into the encode buffer) on the busiest path — serving.
-            link.send(Channel::Bulk, frame_segment_data(seq, total, offset, chunk));
-            offset += chunk.len() as u32;
-        }
+        send_segment_on(link, seq, bytes);
     }
 
     fn on_segment_data(&mut self, peer: PeerId, seq: Seq, total_len: u32, offset: u32, bytes: &[u8]) {

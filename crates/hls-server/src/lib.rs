@@ -173,36 +173,49 @@ fn handle(req: tiny_http::Request, shared: &Arc<Mutex<Shared>>, play_head: &Arc<
     }
     let raw = req.url().to_string();
     let url = raw.split('?').next().unwrap_or(&raw); // tolerate cache-busting queries
-    let g = shared.lock().unwrap_or_else(|e| e.into_inner());
-    let resp = if url == "/live.m3u8" {
-        tiny_http::Response::from_data(media_playlist(g.target_ms, &g.segments).into_bytes())
-            .with_header(content_type("application/vnd.apple.mpegurl"))
-    } else if url == "/init.mp4" {
-        match &g.init {
-            Some(b) => tiny_http::Response::from_data(b.to_vec())
-                .with_header(content_type("video/mp4")),
-            None => not_found(),
-        }
-    } else if let Some(seq) = url
-        .strip_prefix("/seg/")
-        .and_then(|s| s.strip_suffix(".m4s"))
-        .and_then(|s| s.parse::<u64>().ok())
-    {
-        match g.segments.get(&seq) {
-            Some(b) => {
-                // The player's fetch is our play-head signal.
-                play_head.store(seq, Ordering::SeqCst);
-                tiny_http::Response::from_data(b.to_vec())
-                    .with_header(content_type("video/mp4"))
+
+    // Take only cheap refcounted clones under the lock; the actual body copies and
+    // response IO happen after it drops. The node's delivery path contends on this
+    // same mutex, so holding it across a `to_vec` of a full segment (or the socket
+    // write) would stall segment ingestion every time the player fetches.
+    enum Payload {
+        Playlist(String),
+        Media(Bytes),
+        Missing,
+    }
+    let payload = {
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if url == "/live.m3u8" {
+            // Playlist text is a few hundred bytes over ≤ MAX_LIVE_SEGMENTS entries.
+            Payload::Playlist(media_playlist(g.target_ms, &g.segments))
+        } else if url == "/init.mp4" {
+            g.init.clone().map(Payload::Media).unwrap_or(Payload::Missing)
+        } else if let Some(seq) = url
+            .strip_prefix("/seg/")
+            .and_then(|s| s.strip_suffix(".m4s"))
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            match g.segments.get(&seq) {
+                Some(b) => {
+                    // The player's fetch is our play-head signal.
+                    play_head.store(seq, Ordering::SeqCst);
+                    Payload::Media(b.clone())
+                }
+                None => Payload::Missing,
             }
-            None => not_found(),
+        } else {
+            Payload::Missing
         }
-    } else {
-        not_found()
     };
-    drop(g);
-    let resp = resp.with_header(cors());
-    let _ = req.respond(resp);
+    let resp = match payload {
+        Payload::Playlist(pl) => tiny_http::Response::from_data(pl.into_bytes())
+            .with_header(content_type("application/vnd.apple.mpegurl")),
+        Payload::Media(b) => {
+            tiny_http::Response::from_data(b.to_vec()).with_header(content_type("video/mp4"))
+        }
+        Payload::Missing => not_found(),
+    };
+    let _ = req.respond(resp.with_header(cors()));
 }
 
 #[cfg(test)]

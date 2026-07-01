@@ -317,6 +317,10 @@ async fn start_watch(
     // Boot chain signaling + WebRTC for this stream.
     let session = Session::start(stream, 1, stun(), view_tx.clone())?;
 
+    // Live stats feed: the node publishes real numbers (delivered, live-edge lag)
+    // once a second; the UI stats task below reads the latest.
+    let (stats_tx, stats_rx) = tokio::sync::watch::channel(unstation_core::node::NodeStats::default());
+
     // Real viewer node: starts with no known segments; the live-edge poller feeds
     // it `LiveEdge { seq, id }` so it knows what to fetch and how to verify it.
     let viewer = MeshNode::new_viewer(
@@ -334,7 +338,8 @@ async fn start_watch(
     // chain write); the session dials from the same book.
     .with_presence_book(session.presence_book())
     // Convictions (forged bytes, floods) bar re-dials + offers at the session edge.
-    .with_ban_list(session.ban_list());
+    .with_ban_list(session.ban_list())
+    .with_stats(stats_tx);
     let mut tasks = Vec::new();
     tasks.push(tokio::spawn(async move {
         let _ = viewer.run(view_rx, TICK, None).await;
@@ -417,8 +422,9 @@ async fn start_watch(
         tasks.push(session.spawn_maintainer(3, filter));
     }
 
-    // Stream real mesh stats to the webview (live peer count from the transport),
-    // and keep the "reaching the mesh" status honest while no peer is connected.
+    // Stream REAL mesh stats to the webview: live transport peer count + the node's
+    // own numbers (delivered segments, live-edge lag) from its watch channel. Also
+    // keeps the "reaching the mesh" status honest while no peer is connected.
     {
         let s = session.clone();
         let appc = app.clone();
@@ -431,17 +437,20 @@ async fn start_watch(
                         MeshStatusMsg { state: "connecting".into(), detail: "Reaching the mesh…".into() },
                     );
                 }
+                let ns = stats_rx.borrow().clone();
                 let _ = appc.emit(
                     "mesh-stats",
                     MeshStatsMsg {
                         peers,
-                        rho: if peers > 0 { 100 } else { 0 },
+                        // All delivered bytes come from peers today (seed/Bulletin
+                        // segment fallback isn't in the fetch path yet).
+                        rho: if ns.delivered > 0 { 100 } else { 0 },
                         from_seed: 0,
                         from_chain: 0,
-                        latency_s: 0.0,
+                        latency_s: ns.latency_s,
                         ice: if peers > 0 { "direct".into() } else { "connecting".into() },
                         mode: "p2p".into(),
-                        delivered: 0,
+                        delivered: ns.delivered,
                     },
                 );
                 tokio::time::sleep(Duration::from_secs(2)).await;
