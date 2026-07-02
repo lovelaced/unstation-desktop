@@ -1,0 +1,31 @@
+# WHIP ingest (RFC 9725) — the sub-2-second contribution path (TECH_SPEC D7).
+#
+# OBS 30+ speaks WHIP natively: it POSTs an SDP offer over HTTP and sends the
+# media as WebRTC RTP — no RTMP, no ffmpeg repackaging stage, sub-second
+# encoder→app latency. This crate accepts that offer on a localhost endpoint,
+# receives the H.264 RTP track, depacketizes it into access units, and hands
+# them to the same CMAF muxer the Android camera path uses.
+#
+# The RTP depacketizer (`rtp`) is pure std and always builds — it's in the
+# default engine workspace and unit-tested there. The WHIP *server* pulls a
+# media-enabled libdatachannel (a heavy vendored C rebuild with NO_MEDIA off),
+# so it lives behind the `server` feature and stays out of the fast test path.
+[package]
+name = "whip-ingest"
+version = "0.0.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[features]
+default = []
+server = ["dep:datachannel", "dep:tiny_http", "dep:serde_json"]
+
+[dependencies]
+log = "0.4"
+datachannel = { version = "0.16.0", features = ["vendored", "media"], optional = true }
+tiny_http = { version = "0.12", optional = true }
+serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+env_logger = "0.11"

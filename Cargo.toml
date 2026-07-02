@@ -5,6 +5,7 @@ members = [
     "crates/transport-libdc",
     "crates/unstation-node",
     "crates/hls-server",
+    "crates/whip-ingest",
     "infra/segmenter",
 ]
 # The Tauri app and the chain-integration crate are their own crates — kept out of
