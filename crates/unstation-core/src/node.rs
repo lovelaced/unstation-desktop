@@ -684,6 +684,12 @@ impl MeshNode {
                     self.upload_tokens = self.upload_tokens.min(burst);
                 }
             }
+            EngineEvent::SetSegMs(ms) => {
+                // The verified manifest told us the stream's real segment/part duration —
+                // retiming the picker's deadlines and the live-lag stat (see the event doc).
+                log::info!("[mesh] seg_ms → {ms} (was {})", self.eng.cfg.seg_ms);
+                self.eng.cfg.seg_ms = ms.max(1);
+            }
             EngineEvent::Tick => self.on_tick(),
             EngineEvent::Stop => {}
         }
@@ -739,6 +745,23 @@ impl MeshNode {
             let follow = self.eng.head_seq.saturating_sub(self.eng.cfg.window as Seq / 2);
             if follow > self.eng.play_seq {
                 self.eng.play_seq = follow;
+            }
+        }
+
+        // A live VIEWER whose fetch cursor is more than a full window behind the live edge
+        // can never catch up part-by-part — this is a fresh join onto a running stream (the
+        // publisher advertises from seq 0, keeping the whole history as the origin), or a
+        // stall that fell off the back of the window. Snap the cursor to the live edge so it
+        // plays live instead of grinding through the entire backlog from seq 0. Within a
+        // window of the edge we leave it alone and follow the player's real play head (above).
+        if matches!(self.eng.cfg.role, Role::Viewer) && matches!(self.eng.cfg.mode, Mode::Live) {
+            let edge = self.eng.head_seq.saturating_sub(self.eng.cfg.window as Seq / 2);
+            if edge > self.eng.play_seq + self.eng.cfg.window as Seq {
+                log::info!(
+                    "[mesh] snapping to live edge: play_seq {} → {} (head {})",
+                    self.eng.play_seq, edge, self.eng.head_seq
+                );
+                self.eng.play_seq = edge;
             }
         }
 

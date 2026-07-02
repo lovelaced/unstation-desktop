@@ -232,7 +232,10 @@ pub fn fragment_info(fragment: &[u8]) -> Option<FragmentInfo> {
     let trun = find_box(traf, b"trun")?;
     if trun.len() < 8 { return None; }
     let f = u32::from_be_bytes([0, trun[1], trun[2], trun[3]]);
-    let count = u32::from_be_bytes([trun[4], trun[5], trun[6], trun[7]]);
+    // Hostile-input bound: a forged trun can claim up to 2^32 samples; with no per-sample
+    // fields (rec == 0) the loop below would spin on all of them. No honest part holds more
+    // than a few hundred samples, so clamp instead of trusting the wire.
+    let count = u32::from_be_bytes([trun[4], trun[5], trun[6], trun[7]]).min(8_192);
     let mut p = 8;
     if f & 0x000001 != 0 { p += 4; } // data-offset
     let first_sample_flags = if f & 0x000004 != 0 { // first-sample-flags overrides sample 1

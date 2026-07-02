@@ -63,27 +63,34 @@ impl MediaEgress {
         )
         .map_err(|e| format!("pc create: {e}"))?;
 
+        // cname/msid/track-id are REQUIRED for browser interop: without them libdatachannel
+        // emits a bare `a=ssrc:<id>` line (no `cname:`), which Chrome's SDP parser rejects —
+        // setRemoteDescription throws and the viewer falls back to the mesh. (RFC 5576 §4.1:
+        // the ssrc attribute takes `attribute:value`.) ffmpeg and libdatachannel itself are
+        // lenient, which is why the WHIP ingest and the loopback test never caught it.
         let track_init = TrackInit {
             direction: datachannel::Direction::SendOnly,
             codec: datachannel::Codec::H264,
             payload_type: pt,
             ssrc: EGRESS_SSRC,
             mid: CString::new(mid).map_err(|e| format!("mid: {e}"))?,
-            name: None,
-            msid: None,
-            track_id: None,
+            name: Some(CString::new("unstation-video").expect("static cname")),
+            msid: Some(CString::new("unstation").expect("static msid")),
+            track_id: Some(CString::new("unstation-video-0").expect("static track id")),
             profile: None,
         };
         let track = pc
             .add_track_ex(&track_init, SendTrack)
             .map_err(|e| format!("add_track: {e}"))?;
 
+        log::debug!("[egress] OFFER from viewer:\n{offer}");
         // Setting the remote offer makes libdatachannel generate the answer + start ICE.
         pc.set_remote_description(&offer_desc).map_err(|e| format!("set offer: {e}"))?;
         let _ = gathered_rx.recv_timeout(Duration::from_secs(3));
         let answer = pc
             .local_description()
             .ok_or_else(|| "no local answer generated".to_string())?;
+        log::debug!("[egress] ANSWER generated:\n{}", answer.sdp);
 
         Ok(Self {
             track,

@@ -38,7 +38,18 @@ pub struct IngestAu {
 /// A running WHIP endpoint. Drop it to stop the HTTP server + tear down the session.
 pub struct WhipServer {
     addr: std::net::SocketAddr,
+    /// Kept to `unblock()` the accept loop on drop — without it the reactor thread (and
+    /// the bound port, and any live PeerConnection it holds) leaks past the publish session.
+    server: Arc<tiny_http::Server>,
     _reactor: thread::JoinHandle<()>,
+}
+
+impl Drop for WhipServer {
+    fn drop(&mut self) {
+        // Wakes `incoming_requests()` with `None`; the reactor loop exits, dropping its
+        // `pc_slot` clone and with it the active WHIP PeerConnection.
+        self.server.unblock();
+    }
 }
 
 impl WhipServer {
@@ -95,8 +106,9 @@ impl PeerConnectionHandler for Conn {
 /// Start a WHIP endpoint on an ephemeral localhost port. Access units (with codec
 /// config on change) arrive on `out`. `stun` mirrors the mesh transport's ICE config.
 pub fn start(out: Sender<IngestAu>, stun: Vec<String>) -> std::io::Result<WhipServer> {
-    let server = tiny_http::Server::http("127.0.0.1:0")
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let server = Arc::new(
+        tiny_http::Server::http("127.0.0.1:0").map_err(|e| std::io::Error::other(e.to_string()))?,
+    );
     let addr = server
         .server_addr()
         .to_ip()
@@ -106,8 +118,9 @@ pub fn start(out: Sender<IngestAu>, stun: Vec<String>) -> std::io::Result<WhipSe
     // offer, DELETE, or the endpoint closing) tears the session down. One at a time.
     let pc_slot: Arc<Mutex<Option<Box<RtcPeerConnection<Conn>>>>> = Arc::new(Mutex::new(None));
 
+    let server_cl = server.clone();
     let reactor = thread::Builder::new().name("whip-http".into()).spawn(move || {
-        for req in server.incoming_requests() {
+        for req in server_cl.incoming_requests() {
             match (req.method(), req.url()) {
                 (tiny_http::Method::Post, "/whip") => handle_offer(req, &out, &stun, &pc_slot),
                 (tiny_http::Method::Delete, _) => {
@@ -123,7 +136,7 @@ pub fn start(out: Sender<IngestAu>, stun: Vec<String>) -> std::io::Result<WhipSe
             }
         }
     })?;
-    Ok(WhipServer { addr, _reactor: reactor })
+    Ok(WhipServer { addr, server, _reactor: reactor })
 }
 
 fn handle_offer(
@@ -208,20 +221,22 @@ fn negotiate(
 }
 
 /// Extract `(mid, payload_type)` of the offer's H.264 video m-line by scanning the raw
-/// SDP: find the `m=video` section, its `a=mid:`, and the payload type of the
-/// `a=rtpmap:<pt> H264/90000` line. Text-scanning keeps this independent of the SDP
-/// object model.
+/// SDP: find the `m=video` section, its `a=mid:`, and an `a=rtpmap:<pt> H264/90000`
+/// payload type. Browsers offer several H.264 PTs differing only in their `a=fmtp`
+/// (`packetization-mode`, profile); we send FU-A fragments, which `packetization-mode=0`
+/// forbids — so prefer a PT whose fmtp says `packetization-mode=1`, falling back to the
+/// first H.264 PT. Text-scanning keeps this independent of the SDP object model.
 pub(crate) fn video_mline(sdp: &str) -> Option<(String, i32)> {
     let mut in_video = false;
     let mut mid: Option<String> = None;
-    let mut pt: Option<i32> = None;
+    let mut h264_pts: Vec<i32> = Vec::new();
+    let mut mode1_pts: Vec<i32> = Vec::new();
     for line in sdp.lines() {
         if let Some(rest) = line.strip_prefix("m=") {
-            in_video = rest.starts_with("video");
             if in_video {
-                mid = None;
-                pt = None;
+                break; // end of the (first) video section — we have everything
             }
+            in_video = rest.starts_with("video");
             continue;
         }
         if !in_video {
@@ -234,16 +249,27 @@ pub(crate) fn video_mline(sdp: &str) -> Option<(String, i32)> {
             if let Some((p, codec)) = r.split_once(' ') {
                 if codec.to_ascii_uppercase().starts_with("H264") {
                     if let Ok(n) = p.trim().parse::<i32>() {
-                        pt = Some(n);
+                        h264_pts.push(n);
+                    }
+                }
+            }
+        } else if let Some(r) = line.strip_prefix("a=fmtp:") {
+            // "<pt> key=val;key=val" — note which H264 PTs allow non-interleaved FU-A.
+            if let Some((p, params)) = r.split_once(' ') {
+                if let Ok(n) = p.trim().parse::<i32>() {
+                    if params.contains("packetization-mode=1") {
+                        mode1_pts.push(n);
                     }
                 }
             }
         }
-        if let (Some(m), Some(p)) = (&mid, pt) {
-            return Some((m.clone(), p));
-        }
     }
-    None
+    let pt = h264_pts
+        .iter()
+        .copied()
+        .find(|p| mode1_pts.contains(p))
+        .or_else(|| h264_pts.first().copied())?;
+    Some((mid?, pt))
 }
 
 fn header(k: &str, v: &str) -> tiny_http::Header {

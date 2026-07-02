@@ -74,10 +74,11 @@ async function enableFastTier() {
 export async function applyFastAnswer(sdp) {
   if (!active || !pc || !sdp) return;
   try {
+    console.log('[fast] answer SDP:\n' + sdp);
     await pc.setRemoteDescription({ type: 'answer', sdp });
     console.log('[fast] answer applied; awaiting media');
   } catch (err) {
-    console.error('[fast] setRemoteDescription failed', err);
+    console.error('[fast] setRemoteDescription failed: ' + (err && err.name) + ' — ' + (err && err.message));
     fallback('bad-answer');
   }
 }

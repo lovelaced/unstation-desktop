@@ -249,10 +249,19 @@ fn ll_playlist(sh: &Shared) -> String {
     s
 }
 
-/// A running localhost HLS server. Serves until the process exits.
+/// A running localhost HLS server. Drop it to stop serving (each watch/publish session
+/// owns one; without the drop hook every re-watch would leak a thread + port).
 pub struct HlsServer {
     addr: SocketAddr,
     sink: HlsSink,
+    /// Kept to `unblock()` the accept loop on drop so the reactor thread + port are freed.
+    server: Arc<tiny_http::Server>,
+}
+
+impl Drop for HlsServer {
+    fn drop(&mut self) {
+        self.server.unblock();
+    }
 }
 
 impl HlsServer {
@@ -275,18 +284,19 @@ impl HlsServer {
             .ok_or_else(|| std::io::Error::other("no ip addr"))?;
         let sink = HlsSink::new(target_ms, ll, part_ms);
         let server = Arc::new(server);
+        let server_cl = server.clone();
         let shared = sink.shared.clone();
         let cv = sink.cv.clone();
         let play_head = sink.play_head.clone();
         thread::spawn(move || {
-            for request in server.incoming_requests() {
+            for request in server_cl.incoming_requests() {
                 // One thread per request: a blocking-reload playlist GET parks on the condvar
                 // until its part is ready, and must not stall concurrent part/segment fetches.
                 let (shared, cv, play_head) = (shared.clone(), cv.clone(), play_head.clone());
                 thread::spawn(move || handle(request, &shared, &cv, &play_head));
             }
         });
-        Ok(Self { addr, sink })
+        Ok(Self { addr, sink, server })
     }
 
     pub fn addr(&self) -> SocketAddr {

@@ -18,9 +18,19 @@
 use unstation_core::signaling::SignalMsg;
 use unstation_core::types::PeerId;
 
-/// A synthetic offer id on answers/closes. The fast tier is one-offer-per-viewer, so the
-/// viewer applies the first answer addressed to it regardless — this only aids logging.
+/// Offer id on a viewer-initiated `Closed` (leaving the tier) — the publisher drops the
+/// viewer regardless of which offer it came from, so a constant is fine there.
 pub const FAST_OFFER_ID: &str = "fast";
+
+/// Bind answers (and declines) to the exact offer they answer: statements linger on their
+/// ~30s TTL, so without this a viewer that toggles the fast tier off and on can read the
+/// PREVIOUS attempt's answer and apply it to the NEW RTCPeerConnection — wrong ICE
+/// credentials, wrong fingerprint, dead session. The tag is content-derived so both sides
+/// compute it independently from the offer SDP.
+pub fn offer_tag(offer_sdp: &[u8]) -> String {
+    let h = unstation_core::crypto::blake2b256(offer_sdp);
+    h[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
 
 /// SDP is carried as UTF-8 bytes inside [`SignalMsg`]'s `sdp: Vec<u8>`.
 fn sdp_bytes(s: &str) -> Vec<u8> {
@@ -48,6 +58,9 @@ pub fn spawn_answer_reader(
 ) -> tokio::task::JoinHandle<()> {
     use tauri::Emitter;
     tokio::spawn(async move {
+        // The id our answer/decline must carry — binds replies to THIS offer, so a previous
+        // attempt's still-live answer statement can't be applied to the new peer connection.
+        let want_id = offer_tag(offer_sdp.as_bytes());
         // Push wakeups for fast-tier signals addressed to us; also poll as a backstop.
         let mut push = signaling.subscribe_fast_signals_push(my_peer);
         if let Err(e) = signaling
@@ -58,7 +71,7 @@ pub fn spawn_answer_reader(
             let _ = app.emit("fast-closed", ());
             return;
         }
-        log::info!("[fast] offer sent to publisher; awaiting answer");
+        log::info!("[fast] offer sent to publisher; awaiting answer (tag {want_id})");
         loop {
             // Read whatever's addressed to us; act on the publisher's answer/close.
             if let Ok(sigs) = signaling.read_fast_signals(my_peer).await {
@@ -67,17 +80,17 @@ pub fn spawn_answer_reader(
                         continue;
                     }
                     match msg {
-                        SignalMsg::Answer { sdp, .. } => {
+                        SignalMsg::Answer { offer_id, sdp } if offer_id == want_id => {
                             log::info!("[fast] answer received; handing to the webview");
                             let _ = app.emit("fast-answer", sdp_str(&sdp));
                             return;
                         }
-                        SignalMsg::Closed { .. } => {
+                        SignalMsg::Closed { offer_id } if offer_id == want_id => {
                             log::info!("[fast] publisher declined (cap/again) — falling back to mesh");
                             let _ = app.emit("fast-closed", ());
                             return;
                         }
-                        _ => {}
+                        _ => {} // a reply to some other (stale) offer — ignore
                     }
                 }
             }
@@ -127,11 +140,41 @@ mod publisher {
         viewers: Mutex<HashMap<[u8; 32], Sender<FastFrame>>>,
         cap: usize,
         stun: Vec<String>,
+        /// Latest codec config (SPS, PPS). Prepended to keyframe AUs that don't carry their
+        /// own, so a viewer that joins mid-stream can initialize its decoder — encoders
+        /// aren't guaranteed to repeat parameter sets in-band on every IDR.
+        config: Mutex<Option<(Vec<u8>, Vec<u8>)>>,
+    }
+
+    /// Does this Annex-B access unit already carry an SPS (NAL type 7)?
+    fn annexb_has_sps(data: &[u8]) -> bool {
+        let mut i = 0;
+        while i + 3 < data.len() {
+            if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+                if data[i + 3] & 0x1F == 7 {
+                    return true;
+                }
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        false
     }
 
     impl FastTier {
         pub fn new(cap: usize, stun: Vec<String>) -> Arc<Self> {
-            Arc::new(Self { viewers: Mutex::new(HashMap::new()), cap, stun })
+            Arc::new(Self {
+                viewers: Mutex::new(HashMap::new()),
+                cap,
+                stun,
+                config: Mutex::new(None),
+            })
+        }
+
+        /// Record the stream's latest SPS/PPS (from the ingest's config events).
+        pub fn set_config(&self, sps: Vec<u8>, pps: Vec<u8>) {
+            *self.config.lock().unwrap_or_else(|e| e.into_inner()) = Some((sps, pps));
         }
 
         /// Live fast-tier viewer count (for the publisher dashboard / cap checks).
@@ -143,12 +186,31 @@ mod publisher {
         /// Fan one access unit out to every fast-tier viewer. Dead connections (their thread
         /// exited, dropping the receiver) are pruned here — a send that errors removes the
         /// viewer. Called on the ingest AU path, so it must stay cheap: one alloc + Arc clones.
-        pub fn broadcast(&self, au: &[u8], ts_90k: u32) {
+        pub fn broadcast(&self, au: &[u8], ts_90k: u32, keyframe: bool) {
             let mut v = self.viewers.lock().unwrap_or_else(|e| e.into_inner());
             if v.is_empty() {
                 return;
             }
-            let frame = Arc::new(au.to_vec());
+            // Late-joiner decodability: make sure every keyframe AU carries SPS/PPS. A viewer
+            // whose track came up mid-stream starts decoding at the next IDR — which is useless
+            // without the parameter sets in-band.
+            let frame = if keyframe && !annexb_has_sps(au) {
+                match &*self.config.lock().unwrap_or_else(|e| e.into_inner()) {
+                    Some((sps, pps)) => {
+                        let mut with_cfg =
+                            Vec::with_capacity(8 + sps.len() + pps.len() + au.len());
+                        with_cfg.extend_from_slice(&[0, 0, 0, 1]);
+                        with_cfg.extend_from_slice(sps);
+                        with_cfg.extend_from_slice(&[0, 0, 0, 1]);
+                        with_cfg.extend_from_slice(pps);
+                        with_cfg.extend_from_slice(au);
+                        Arc::new(with_cfg)
+                    }
+                    None => Arc::new(au.to_vec()),
+                }
+            } else {
+                Arc::new(au.to_vec())
+            };
             v.retain(|_, tx| tx.send(FastFrame::Au(frame.clone(), ts_90k)).is_ok());
         }
 
@@ -259,6 +321,14 @@ pub fn spawn_accept_loop(
                             if !answered.insert(key) {
                                 continue; // already handled this exact offer
                             }
+                            // Bounded dedup memory: TTL expiry may resurface an old offer after
+                            // a clear; accept_offer simply replaces that viewer's session.
+                            if answered.len() > 512 {
+                                answered.clear();
+                            }
+                            // Replies carry the offer's content tag so the viewer can match
+                            // them to its CURRENT attempt (stale statements linger ~30s).
+                            let tag = offer_tag(&sdp);
                             let offer = sdp_str(&sdp);
                             match fast.accept_offer(viewer.0, offer).await {
                                 Some(answer) => {
@@ -266,7 +336,7 @@ pub fn spawn_accept_loop(
                                         .publish_fast_signal(
                                             my_peer,
                                             viewer,
-                                            SignalMsg::Answer { offer_id: FAST_OFFER_ID.into(), sdp: sdp_bytes(&answer) },
+                                            SignalMsg::Answer { offer_id: tag, sdp: sdp_bytes(&answer) },
                                         )
                                         .await;
                                 }
@@ -276,7 +346,7 @@ pub fn spawn_accept_loop(
                                         .publish_fast_signal(
                                             my_peer,
                                             viewer,
-                                            SignalMsg::Closed { offer_id: FAST_OFFER_ID.into() },
+                                            SignalMsg::Closed { offer_id: tag },
                                         )
                                         .await;
                                 }

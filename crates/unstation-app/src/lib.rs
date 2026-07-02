@@ -607,6 +607,15 @@ async fn start_watch(
                             let _ = vtx.send(EngineEvent::SetPublisherKey { key: cand.publisher });
                             // Its routing peer is where the opt-in fast tier sends its offer.
                             *pub_peer.lock().unwrap_or_else(|e| e.into_inner()) = Some(cand.peer_id);
+                            // Retime the node to the stream's REAL segment/part duration.
+                            // The cfg default assumes ~1s segments; an LL stream ships
+                            // ~250ms parts, and deadline math scaled 4x too lax is exactly
+                            // a starve-at-the-live-edge stall (plus a nonsense lag stat).
+                            if m.manifest.target_segment_ms > 0 {
+                                let _ = vtx.send(EngineEvent::SetSegMs(
+                                    m.manifest.target_segment_ms as u64,
+                                ));
+                            }
                             // Match the local re-server to the publisher's tier: LL-HLS parts
                             // if advertised (`target_segment_ms` = part duration), else standard.
                             // Idempotent + runs before the first fragment (init install follows).
@@ -1304,9 +1313,16 @@ async fn start_publish(
     // Uplink metering: the node reports sent_bytes on its stats channel.
     let (pub_stats_tx, pub_stats_rx) =
         tokio::sync::watch::channel(unstation_core::node::NodeStats::default());
+    // The node's seg_ms must match what the ingest actually produces: WHIP muxes ~250ms LL
+    // parts in-process; RTMP/ffmpeg emits ~1s segments (the cfg default). Deadline math and
+    // the lag stat both scale by it.
+    let mut pub_cfg = cfg(Mode::Live, Role::Publisher);
+    if whip {
+        pub_cfg.seg_ms = LL_PART_MS as u64;
+    }
     let publisher = MeshNode::new_live_publisher(
         session.my_peer,
-        cfg(Mode::Live, Role::Publisher),
+        pub_cfg,
         SEG_BYTES,
         Arc::new(NullSink),
     )
@@ -1415,6 +1431,11 @@ async fn start_publish(
                         continue;
                     }
                 };
+                // Keep the fast tier's codec config fresh — it's prepended to keyframe AUs
+                // so a viewer whose track comes up mid-stream can initialize its decoder.
+                if let Some((sps, pps)) = &iu.config {
+                    fast_feed.set_config(sps.clone(), pps.clone());
+                }
                 // Build the muxer once the codec config (SPS/PPS) arrives, deriving the
                 // frame dimensions from the SPS (WHIP carries no explicit size).
                 if fb.is_none() {
@@ -1444,7 +1465,11 @@ async fn start_publish(
                 last_pts = Some(iu.au.pts_us);
                 // Fan the raw access unit onto any fast-tier viewers' WebRTC tracks (before
                 // muxing — the fast tier is the un-segmented, sub-second path).
-                fast_feed.broadcast(&iu.au.data, fasttier::pts_us_to_rtp90k(iu.au.pts_us));
+                fast_feed.broadcast(
+                    &iu.au.data,
+                    fasttier::pts_us_to_rtp90k(iu.au.pts_us),
+                    iu.au.keyframe,
+                );
                 if let Some(seg) = builder.push_au(&iu.au.data, dur.max(1), iu.au.keyframe) {
                     ingest_w.fetch_add(seg.bytes.len() as u64, Ordering::Relaxed);
                     preview.push_segment(seg.seq, seg.bytes.clone());
@@ -1631,9 +1656,12 @@ async fn start_publish(
     );
     let (pub_stats_tx, pub_stats_rx) =
         tokio::sync::watch::channel(unstation_core::node::NodeStats::default());
+    // Camera publish muxes ~250ms LL parts in-process — retime the node to match.
+    let mut pub_cfg = cfg(Mode::Live, Role::Publisher);
+    pub_cfg.seg_ms = LL_PART_MS as u64;
     let publisher = MeshNode::new_live_publisher(
         session.my_peer,
-        cfg(Mode::Live, Role::Publisher),
+        pub_cfg,
         SEG_BYTES,
         Arc::new(NullSink),
     )

@@ -3044,6 +3044,7 @@ name = "hls-server"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "segmenter",
  "tiny_http",
  "unstation-core",
 ]
@@ -7507,6 +7508,7 @@ dependencies = [
  "unstation-session",
  "useragent-chain",
  "useragent-native",
+ "whip-ingest",
 ]
 
 [[package]]
@@ -8530,6 +8532,16 @@ dependencies = [
  "thiserror 2.0.18",
  "windows",
  "windows-core 0.61.2",
+]
+
+[[package]]
+name = "whip-ingest"
+version = "0.0.0"
+dependencies = [
+ "datachannel",
+ "log",
+ "serde_json",
+ "tiny_http",
 ]
 
 [[package]]

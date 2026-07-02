@@ -55,6 +55,12 @@ pub enum EngineEvent {
     /// The health monitor lowers it on an unstable/slow link and restores it when the
     /// link proves itself again.
     SetUploadBudget(u64),
+    /// Locally injected once the verified manifest is in hand: the stream's REAL segment
+    /// (or LL part) duration in ms. The picker's deadline math and the live-lag stat both
+    /// multiply seq distance by this, so leaving the config default (1000ms) while the
+    /// stream ships ~250ms LL parts makes every deadline ~4x too lax — the picker fetches
+    /// too lazily, the player starves at the live edge, and "behind live" reads nonsense.
+    SetSegMs(u64),
     /// Scheduler tick (also emitted by a timer in production).
     Tick,
     Stop,
