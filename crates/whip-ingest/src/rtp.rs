@@ -125,9 +125,14 @@ impl H264Depacketizer {
         // Unwrap the 90 kHz timestamp into a monotonic tick count.
         if let Some(last) = self.last_ts {
             let delta = ts.wrapping_sub(last);
-            // Deltas ≥ 2^31 mean the clock went "backwards" (reordering across a
-            // wrap); treat as zero advance rather than a huge jump.
-            if delta < 1 << 31 {
+            // Deltas ≥ 2^31 mean the clock went "backwards" (reordering across a wrap);
+            // and a "forward" jump beyond any real inter-packet gap is a discontinuity —
+            // an encoder reconnect starts a new random RTP timebase (RFC 3550 §5.1), and
+            // swallowing that jump once produced a part claiming a ~6h duration, which
+            // poisons EXTINF/TARGETDURATION for every viewer. Both cases: zero advance
+            // (playback continuity resumes at the next keyframe anyway).
+            const MAX_TS_JUMP: u32 = 10 * 90_000; // 10s
+            if delta < 1 << 31 && delta <= MAX_TS_JUMP {
                 self.ts_unwrapped += delta as u64;
             }
         }
@@ -449,6 +454,25 @@ mod tests {
         // …and the next IDR resumes playback.
         let au = d.push(&rtp(7, 12_000, true, &[0x65, 3])).expect("IDR resumes");
         assert!(au.keyframe);
+    }
+
+    #[test]
+    fn a_timebase_discontinuity_does_not_explode_pts() {
+        // An encoder reconnect restarts RTP with a new random timestamp base; a huge
+        // "forward" delta must not be swallowed into pts (it once became a ~6h EXTINF).
+        let mut d = H264Depacketizer::new();
+        for p in idr_packets(1, 1000) {
+            d.push(&p);
+        }
+        let jumped = d
+            .push(&rtp(4, 1000 + 1_956_000_000, true, &[0x65, 1]))
+            .expect("keyframe after the discontinuity still plays");
+        assert_eq!(jumped.pts_us, 0, "absurd jump = zero advance, not hours of pts");
+        // Normal cadence resumes from there.
+        let next = d
+            .push(&rtp(5, 1000 + 1_956_000_000 + 3000, true, &[0x65, 2]))
+            .expect("next keyframe");
+        assert_eq!(next.pts_us, 3000 * 1000 / 90);
     }
 
     #[test]

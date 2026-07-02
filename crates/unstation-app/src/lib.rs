@@ -1457,9 +1457,13 @@ async fn start_publish(
                     }
                 }
                 let builder = fb.as_mut().unwrap();
-                // Sample duration in 90 kHz ticks from PTS deltas (first AU ≈30 fps).
+                // Sample duration in 90 kHz ticks from PTS deltas (first AU ≈30 fps). Clamped
+                // to ≤1s: a PTS discontinuity (ingest reconnect / timebase jump) must never
+                // become a segment claiming hours in its trun — that poisons every viewer's
+                // EXTINF/TARGETDURATION. The depacketizer guards this too; belt and braces.
                 let dur = match last_pts {
-                    Some(prev) => (((iu.au.pts_us - prev).max(1)) as u64 * 90_000 / 1_000_000) as u32,
+                    Some(prev) => (((iu.au.pts_us - prev).max(1)) as u64 * 90_000 / 1_000_000)
+                        .clamp(1, 90_000) as u32,
                     None => 3_000,
                 };
                 last_pts = Some(iu.au.pts_us);
