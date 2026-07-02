@@ -160,10 +160,29 @@ impl MediaSink for HlsSink {
                 .unwrap_or(0);
             g.parts.insert(seq, Part { bytes, independent, dur_ticks, parent_msn, wall_ms });
 
+            // Evict WHOLE parents, oldest first — never part-by-part. A parent that loses
+            // its leading parts would keep its msn but shrink its EXTINF and serve fewer
+            // bytes at seg/<msn> across reloads; native players (AVPlayer) validate the
+            // timeline and stop dead on that. Atomic parent eviction keeps every listed
+            // segment byte- and duration-stable for its whole life. The parent currently
+            // being filled is never evicted (it's the live edge).
             let cap = if g.ll { MAX_LIVE_PARTS } else { MAX_LIVE_SEGMENTS };
             while g.parts.len() > cap {
-                let Some(&oldest) = g.parts.keys().next() else { break };
-                g.parts.remove(&oldest);
+                let Some(oldest_msn) = g.parts.values().next().map(|p| p.parent_msn) else {
+                    break;
+                };
+                if oldest_msn == g.cur_parent_msn {
+                    break; // only the open parent remains — never evict the live edge
+                }
+                let doomed: Vec<u64> = g
+                    .parts
+                    .iter()
+                    .filter(|(_, p)| p.parent_msn == oldest_msn)
+                    .map(|(s, _)| *s)
+                    .collect();
+                for s in doomed {
+                    g.parts.remove(&s);
+                }
             }
         }
         // Wake any blocking-reload requests waiting for this part.
@@ -657,6 +676,32 @@ mod tests {
         assert_eq!(pl.matches("#EXTINF:").count(), 1, "only completed parents: {pl}");
         // The LL playlist itself now carries the mandatory date tag too.
         assert!(ll_playlist(&g).contains("#EXT-X-PROGRAM-DATE-TIME:"), "LL playlist dated");
+    }
+
+    /// Eviction must drop whole parents, never a parent's leading parts: a shrinking
+    /// EXTINF / mutating seg/<msn> across reloads stops native players (AVPlayer) dead.
+    #[test]
+    fn eviction_keeps_parents_atomic() {
+        let mut fb = segmenter::FragmentBuilder::new_ll(ll_params(), 100);
+        let sink = shared(1000, true, 100);
+        // ~40 GOPs of 2 parts = ~80 parts, blowing past MAX_LIVE_PARTS (60).
+        for _ in 0..40 {
+            feed(&mut fb, &sink, true);
+            for _ in 0..5 { feed(&mut fb, &sink, false); }
+        }
+        let g = sink.shared.lock().unwrap();
+        assert!(g.parts.len() <= MAX_LIVE_PARTS, "window bounded: {}", g.parts.len());
+        // The oldest retained part must open its parent (independent = a keyframe part):
+        // a non-independent head means a parent lost its leading parts to eviction.
+        let first = g.parts.values().next().expect("window non-empty");
+        assert!(first.independent, "oldest retained parent must be complete from its start");
+        // Every retained parent's first part is independent (complete parents only).
+        let mut seen = std::collections::HashSet::new();
+        for p in g.parts.values() {
+            if seen.insert(p.parent_msn) {
+                assert!(p.independent, "parent {} lost its head to eviction", p.parent_msn);
+            }
+        }
     }
 
     #[test]
