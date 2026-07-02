@@ -56,8 +56,15 @@ async function enableFastTier() {
     pc.ontrack = (e) => onTrack(e.streams[0] || new MediaStream([e.track]));
     pc.oniceconnectionstatechange = () => {
       const st = pc && pc.iceConnectionState;
-      if (active && !connected && (st === 'failed' || st === 'disconnected' || st === 'closed')) {
+      if (!active) return;
+      // Pre-media: any dead state aborts the attempt. Post-media: a broken connection
+      // must ALSO fall back — otherwise the fast video silently freezes while the mesh
+      // player sits warm underneath. ('disconnected' pre-media is fatal; post-media it
+      // can be transient, so only 'failed'/'closed' end an established session.)
+      if (!connected && (st === 'failed' || st === 'disconnected' || st === 'closed')) {
         fallback('ice ' + st);
+      } else if (connected && (st === 'failed' || st === 'closed')) {
+        fallback('ice dropped mid-stream');
       }
     };
     const offer = await pc.createOffer();
