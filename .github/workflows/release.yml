@@ -1,0 +1,80 @@
+name: Release (draft + notes)
+
+# Cut a DRAFT GitHub Release whenever a version tag is pushed: gate on the
+# SDK-free engine suite, generate user-facing notes with git-cliff (cliff.toml),
+# and open the draft for artifacts.
+#
+# CI cannot build the desktop app itself — it links the private chain SDK — so
+# the .dmg is built on a trusted machine and uploaded to the draft before
+# publishing (scripts/release-macos.sh builds it; `gh release upload` attaches
+# it). If CI *does* have SDK credentials configured, the separate
+# "Release macOS DMG" workflow (release-macos.yml) can build and publish
+# end-to-end instead — don't run both for the same tag.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)draft a release for (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: engine suite (release gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake pkg-config libssl-dev clang
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test (engine workspace)
+        run: cargo test --workspace
+
+  draft:
+    name: draft release + notes
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git-cliff walks the tag history
+      - name: Resolve tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          git rev-parse "refs/tags/$TAG" >/dev/null # fail fast on a bad dispatch input
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+      - name: Generate notes (cliff.toml)
+        run: |
+          git cliff --config cliff.toml --tag "${{ steps.tag.outputs.tag }}" --latest --strip header -o notes.md
+          cat >> notes.md <<'EOF'
+
+          ---
+          _Artifacts are built on a maintainer machine (the app links a private chain SDK, so CI can't build it) and attached here with a `SHA256SUMS` file — verify downloads against it._
+          EOF
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG exists — refreshing notes only"
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --draft --title "Unstation $TAG" --notes-file notes.md
+          fi
