@@ -90,7 +90,12 @@ pub fn spawn_answer_reader(
                             let _ = app.emit("fast-closed", ());
                             return;
                         }
-                        _ => {} // a reply to some other (stale) offer — ignore
+                        SignalMsg::Answer { offer_id, .. } | SignalMsg::Closed { offer_id } => {
+                            // A reply bound to some other (stale) offer. Logged so a tag
+                            // mismatch is diagnosable instead of looking like silence.
+                            log::info!("[fast] ignoring reply for stale offer {offer_id} (want {want_id})");
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -332,13 +337,17 @@ pub fn spawn_accept_loop(
                             let offer = sdp_str(&sdp);
                             match fast.accept_offer(viewer.0, offer).await {
                                 Some(answer) => {
-                                    let _ = signaling
+                                    match signaling
                                         .publish_fast_signal(
                                             my_peer,
                                             viewer,
-                                            SignalMsg::Answer { offer_id: tag, sdp: sdp_bytes(&answer) },
+                                            SignalMsg::Answer { offer_id: tag.clone(), sdp: sdp_bytes(&answer) },
                                         )
-                                        .await;
+                                        .await
+                                    {
+                                        Ok(()) => log::info!("[fast] answer published (tag {tag})"),
+                                        Err(e) => log::warn!("[fast] answer publish failed: {e:?}"),
+                                    }
                                 }
                                 None => {
                                     // Capped or failed → tell the viewer to fall back to the mesh.

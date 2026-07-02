@@ -19,7 +19,10 @@ import { STRINGS } from './copy.js';
 // candidates connect directly and this is never consulted.
 const ICE = [{ urls: 'stun:stun.l.google.com:19302' }];
 // If no media track arrives this long after the offer goes out, give up and fall back.
-const CONNECT_TIMEOUT_MS = 8000;
+// Generous: the offer/answer ride the statement store (seconds each way), then ICE + DTLS
+// + the first keyframe. The verified mesh player keeps playing underneath the whole time,
+// so a longer wait costs the viewer nothing visible.
+const CONNECT_TIMEOUT_MS = 20000;
 
 let pc = null;
 let active = false;      // the user has opted in and we're attempting / holding the fast tier
