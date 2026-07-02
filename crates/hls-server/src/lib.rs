@@ -48,6 +48,10 @@ struct Part {
     dur_ticks: u64,
     /// HLS media-sequence number of the parent segment this part belongs to.
     parent_msn: u64,
+    /// Wall-clock arrival (ms since the UNIX epoch) — playlists with partial segments MUST
+    /// carry `EXT-X-PROGRAM-DATE-TIME` (RFC 8216bis §4.4.4.6); arrival time is honest enough
+    /// for a live stream.
+    wall_ms: u64,
 }
 
 struct Shared {
@@ -150,7 +154,11 @@ impl MediaSink for HlsSink {
             }
             g.have_any = true;
             let parent_msn = g.cur_parent_msn;
-            g.parts.insert(seq, Part { bytes, independent, dur_ticks, parent_msn });
+            let wall_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            g.parts.insert(seq, Part { bytes, independent, dur_ticks, parent_msn, wall_ms });
 
             let cap = if g.ll { MAX_LIVE_PARTS } else { MAX_LIVE_SEGMENTS };
             while g.parts.len() > cap {
@@ -172,6 +180,30 @@ fn live_edge(parts: &BTreeMap<u64, Part>) -> Option<(u64, u64)> {
     let (_, last) = parts.iter().next_back()?;
     let idx = parts.values().filter(|p| p.parent_msn == last.parent_msn).count() as u64 - 1;
     Some((last.parent_msn, idx))
+}
+
+/// UTC RFC3339 with milliseconds from UNIX-epoch ms (Howard Hinnant's civil-date algorithm)
+/// — `EXT-X-PROGRAM-DATE-TIME` needs it and pulling in chrono for one tag is overkill.
+fn rfc3339_utc(ms: u64) -> String {
+    let (secs, msec) = (ms / 1000, ms % 1000);
+    let days = (secs / 86_400) as i64;
+    let (mut s, z) = (secs % 86_400, days + 719_468);
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let (hh, rem) = (s / 3600, s % 3600);
+    s = rem;
+    format!(
+        "{y:04}-{m:02}-{d:02}T{hh:02}:{:02}:{:02}.{msec:03}Z",
+        s / 60,
+        s % 60
+    )
 }
 
 /// Standard HLS media playlist — one `#EXTINF` per full-GOP segment.
@@ -230,6 +262,11 @@ fn ll_playlist(sh: &Shared) -> String {
 
     let last_parent = parents.len().saturating_sub(1);
     for (i, (msn, list)) in parents.iter().enumerate() {
+        // Playlists with Partial Segments MUST carry EXT-X-PROGRAM-DATE-TIME
+        // (RFC 8216bis §4.4.4.6) — native players reject them without it.
+        if let Some((_, first)) = list.first() {
+            s.push_str(&format!("#EXT-X-PROGRAM-DATE-TIME:{}\n", rfc3339_utc(first.wall_ms)));
+        }
         for (seq, p) in list {
             let indep = if p.independent { ",INDEPENDENT=YES" } else { "" };
             s.push_str(&format!(
@@ -245,6 +282,52 @@ fn ll_playlist(sh: &Shared) -> String {
     }
     if !sh.parts.is_empty() {
         s.push_str(&format!("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part/{next_seq}.m4s\"\n"));
+    }
+    s
+}
+
+/// Standard (no-parts) playlist over the SAME LL window: completed parents only, real
+/// durations. Served at `/std.m3u8` for native players — WKWebView/AVPlayer hard-rejects
+/// our LL playlist (partial segments have delivery requirements a localhost HTTP/1.1
+/// re-server can't meet), so the desktop publisher preview and desktop native viewers play
+/// this instead; hls.js (Android) keeps the LL playlist. In standard mode `/std.m3u8` just
+/// serves the standard playlist, so clients can pick the path unconditionally.
+fn std_playlist(sh: &Shared) -> String {
+    let ticks_to_s = |t: u64| t as f64 / segmenter::TIMESCALE as f64;
+    let part_nominal = ticks_to_s((sh.part_ms as u64 * segmenter::TIMESCALE as u64) / 1000);
+    let dur_of = |p: &Part| if p.dur_ticks > 0 { ticks_to_s(p.dur_ticks) } else { part_nominal };
+
+    // Group into parents (seq order), drop the still-filling last parent.
+    let mut parents: Vec<(u64, Vec<&Part>)> = Vec::new();
+    for p in sh.parts.values() {
+        match parents.last_mut() {
+            Some((msn, list)) if *msn == p.parent_msn => list.push(p),
+            _ => parents.push((p.parent_msn, vec![p])),
+        }
+    }
+    parents.pop(); // the open parent isn't a complete segment yet
+
+    let durs: Vec<f64> = parents
+        .iter()
+        .map(|(_, list)| list.iter().map(|p| dur_of(p)).sum::<f64>())
+        .collect();
+    let target_s = durs
+        .iter()
+        .fold(sh.target_ms as f64 / 1000.0, |a, d| a.max(*d))
+        .ceil()
+        .max(1.0);
+    let media_seq = parents.first().map(|(m, _)| *m).unwrap_or(0);
+
+    let mut s = String::new();
+    s.push_str("#EXTM3U\n#EXT-X-VERSION:7\n");
+    s.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", target_s as u32));
+    s.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{media_seq}\n"));
+    s.push_str("#EXT-X-MAP:URI=\"init.mp4\"\n");
+    for ((msn, list), d) in parents.iter().zip(&durs) {
+        if let Some(first) = list.first() {
+            s.push_str(&format!("#EXT-X-PROGRAM-DATE-TIME:{}\n", rfc3339_utc(first.wall_ms)));
+        }
+        s.push_str(&format!("#EXTINF:{d:.3},\nseg/{msn}.m4s\n"));
     }
     s
 }
@@ -405,6 +488,11 @@ fn handle(
         }
         let pl = if g.ll { ll_playlist(&g) } else { standard_playlist(g.target_ms, &g.parts) };
         Payload::Playlist(pl)
+    } else if url == "/std.m3u8" {
+        // Parts-free view of the same window, for native players (see std_playlist).
+        let g = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let pl = if g.ll { std_playlist(&g) } else { standard_playlist(g.target_ms, &g.parts) };
+        Payload::Playlist(pl)
     } else if url == "/init.mp4" {
         shared
             .lock()
@@ -545,6 +633,37 @@ mod tests {
         assert!(pl.contains("URI=\"part/0.m4s\""), "{pl}");
         // The last (open) parent must NOT have an EXTINF yet — count them: 1 complete parent.
         assert_eq!(pl.matches("#EXTINF:").count(), 1, "only the completed parent gets EXTINF: {pl}");
+    }
+
+    /// Native players get a parts-free view: EXTINFs for completed parents only, dated,
+    /// no EXT-X-PART/PRELOAD-HINT anywhere (AVPlayer rejects those from this server).
+    #[test]
+    fn std_playlist_is_parts_free_and_dated() {
+        let mut fb = segmenter::FragmentBuilder::new_ll(ll_params(), 100);
+        let sink = shared(1000, true, 100);
+        feed(&mut fb, &sink, true);
+        for _ in 0..5 { feed(&mut fb, &sink, false); }
+        feed(&mut fb, &sink, true);
+        for _ in 0..5 { feed(&mut fb, &sink, false); }
+
+        let g = sink.shared.lock().unwrap();
+        let pl = std_playlist(&g);
+        assert!(!pl.contains("#EXT-X-PART"), "no parts for native players: {pl}");
+        assert!(!pl.contains("PRELOAD-HINT"), "{pl}");
+        assert!(pl.contains("#EXT-X-MAP:URI=\"init.mp4\""), "{pl}");
+        assert!(pl.contains("#EXT-X-PROGRAM-DATE-TIME:"), "{pl}");
+        assert!(pl.contains("seg/0.m4s"), "completed parent listed: {pl}");
+        // The open (last) parent is not a complete segment yet.
+        assert_eq!(pl.matches("#EXTINF:").count(), 1, "only completed parents: {pl}");
+        // The LL playlist itself now carries the mandatory date tag too.
+        assert!(ll_playlist(&g).contains("#EXT-X-PROGRAM-DATE-TIME:"), "LL playlist dated");
+    }
+
+    #[test]
+    fn rfc3339_formats_correctly() {
+        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00.000Z");
+        // Cross-checked against `date -u -r 1782840419`.
+        assert_eq!(rfc3339_utc(1_782_840_419_123), "2026-06-30T17:26:59.123Z");
     }
 
     fn http_get(addr: SocketAddr, path: &str) -> String {

@@ -5,6 +5,7 @@ import { invoke, NATIVE } from '../tauri.js';
 import { S, go, refreshGoLiveBadge, netLabel } from '../state.js';
 import { STRINGS } from '../copy.js';
 import { makeInviteLink } from '../invite.js';
+import { nativeUrl } from '../player.js';
 import { updateSettingsStatus } from './settings.js';
 import { ensureSignedIn } from './onboarding.js';
 
@@ -293,9 +294,10 @@ export function applyPublishState(live){
   if(live){
     if(NATIVE && S.pubHlsUrl){
       // Android's Chromium WebView has no native HLS — play the self-preview through hls.js
-      // (the same seam the watch path uses). Desktop (WKWebView) plays the m3u8 natively.
+      // (the same seam the watch path uses). Desktop (WKWebView) plays natively — via the
+      // parts-free /std.m3u8 view (AVPlayer rejects the LL playlist; see player.js nativeUrl).
       if(window.__hlsPlay){ window.__hlsPlay(v, S.pubHlsUrl, null); }
-      else { try{ if(v.canPlayType('application/vnd.apple.mpegurl')){ v.src=S.pubHlsUrl + (S.pubHlsUrl.includes('?')?'&':'?') + 't=' + Date.now(); v.style.display='block'; v.load(); v.play().catch(()=>{}); } }catch(e){} }
+      else { try{ if(v.canPlayType('application/vnd.apple.mpegurl')){ const u=nativeUrl(S.pubHlsUrl); v.src=u + (u.includes('?')?'&':'?') + 't=' + Date.now(); v.style.display='block'; v.load(); v.play().catch(()=>{}); } }catch(e){} }
     }
   } else {
     try{ v.pause(); }catch(e){} v.removeAttribute('src'); v.style.display='none';

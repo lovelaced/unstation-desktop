@@ -40,6 +40,11 @@ export function startWatchWatchdog(){
 // "error 4 / source unsupported". So we keep re-loading (cache-busted, to re-read
 // the now-growing playlist) until media actually plays; the stall ladder narrates
 // meanwhile. If it never plays, the peer count in the HUD tells the real story.
+// Native HLS (WKWebView/AVPlayer) hard-rejects our LL-HLS playlist (partial segments have
+// delivery requirements a localhost HTTP/1.1 re-server can't meet — "error 4"), so native
+// players fetch the parts-free /std.m3u8 view of the same window. hls.js keeps /live.m3u8.
+export function nativeUrl(url){ return url ? url.replace('live.m3u8','std.m3u8') : url; }
+
 export function setVideo(url){
   const v=document.getElementById('vid'), catchup=document.getElementById('catchup'); if(!url)return;
   soundHandled=false; // a fresh attach = a fresh watch for the sound-pref logic
@@ -48,6 +53,7 @@ export function setVideo(url){
   // is restored on the first `playing` (handleSoundOnPlaying).
   try{ v.muted=true; }catch(e){}
   if(window.__hlsPlay){ window.__hlsPlay(v, url, catchup); return; }  // Android: play via hls.js (no native HLS)
+  url = nativeUrl(url);
   if(!(v.canPlayType('application/vnd.apple.mpegurl'))){ if(catchup){ catchup.textContent=STRINGS.formatUnsupported; catchup.style.display='grid'; } return; }
   const attempt=()=>{ if(v.readyState>=3 && !v.paused) return; try{ v.src=url+(url.includes('?')?'&':'?')+'t='+Date.now(); v.style.display='block'; v.load(); v.play().catch(()=>{}); }catch(e){} };
   attempt();
