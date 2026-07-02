@@ -23,6 +23,8 @@ use hls_server::HlsServer;
 // Android camera-publish (M4): encoded-AU intake from the Kotlin capture plugin over JNI.
 #[cfg(all(target_os = "android", feature = "publish"))]
 mod camera;
+// The opt-in WebRTC media fast tier (W3): publisher-direct sub-second egress + its signaling.
+mod fasttier;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -39,7 +41,7 @@ use unstation_core::manifest::{Kind, Manifest, OriginOfRecord, SignedManifest, T
 use unstation_core::media::MediaSink;
 use unstation_core::node::MeshNode;
 use unstation_core::transport::EngineEvent;
-use unstation_core::types::{SegmentId, Seq, StreamId};
+use unstation_core::types::{PeerId, SegmentId, Seq, StreamId};
 use unstation_chain::BulletinOrigin;
 use unstation_session::{IdentityEdgeSigner, Session};
 
@@ -81,6 +83,11 @@ struct WatchSession {
     /// `stop_watch` only converts to a background seed at level 0 — an unstable
     /// link makes a bad helper.
     health: Arc<std::sync::atomic::AtomicU8>,
+    /// The publisher's routing `PeerId`, captured once a candidate's manifest verifies. The
+    /// opt-in fast tier addresses its WebRTC media offer to this peer's fast-signaling topic.
+    publisher_peer: Arc<Mutex<Option<PeerId>>>,
+    /// The viewer-side fast-tier answer-reader task, while a fast-tier attempt is in flight.
+    fast_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// A watch converted into a background seed: same node/session, Role::Seed, the
@@ -569,6 +576,7 @@ async fn start_watch(
     // hash-verified against the publisher-authenticated live edge. On first verify,
     // install the CMAF init segment (ftyp+moov) into the local HLS server so it can
     // serve /init.mp4 — hls.js needs it before ANY media fragment (EXT-X-MAP).
+    let publisher_peer: Arc<Mutex<Option<PeerId>>> = Arc::new(Mutex::new(None));
     {
         let vtx = view_tx.clone();
         let appc = app.clone();
@@ -577,6 +585,7 @@ async fn start_watch(
         let init_installed = Arc::new(AtomicBool::new(false));
         let phase = emit_phase.clone();
         let started = watch_started;
+        let pub_peer = publisher_peer.clone();
         let filter: Arc<dyn Fn(Presence) -> BoxFuture<'static, bool> + Send + Sync> =
             Arc::new(move |cand: Presence| {
                 let vtx = vtx.clone();
@@ -585,6 +594,7 @@ async fn start_watch(
                 let sink_cfg = sink_cfg.clone();
                 let init_installed = init_installed.clone();
                 let phase = phase.clone();
+                let pub_peer = pub_peer.clone();
                 Box::pin(async move {
                     let Some(cid) = cand.manifest_cid.clone() else {
                         return true; // a resharing viewer — no manifest to check
@@ -595,6 +605,8 @@ async fn start_watch(
                             // Verified publisher → its personhood key is the trust
                             // anchor for gossiped live-edge announcements (#17).
                             let _ = vtx.send(EngineEvent::SetPublisherKey { key: cand.publisher });
+                            // Its routing peer is where the opt-in fast tier sends its offer.
+                            *pub_peer.lock().unwrap_or_else(|e| e.into_inner()) = Some(cand.peer_id);
                             // Match the local re-server to the publisher's tier: LL-HLS parts
                             // if advertised (`target_segment_ms` = part duration), else standard.
                             // Idempotent + runs before the first fragment (init install follows).
@@ -757,6 +769,8 @@ async fn start_watch(
         name: canonical_stream_name(&target),
         stats: watch_stats,
         health,
+        publisher_peer,
+        fast_task: Mutex::new(None),
     });
 
     Ok(info)
@@ -770,6 +784,9 @@ async fn start_watch(
 fn teardown_watch(state: &AppState) {
     if let Some(sess) = state.watch.lock().unwrap().take() {
         let _ = sess.node_tx.send(EngineEvent::Stop);
+        if let Some(t) = sess.fast_task.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            t.abort(); // stop any in-flight fast-tier answer reader
+        }
         for t in sess.tasks {
             t.abort();
         }
@@ -990,6 +1007,63 @@ fn watch_status(state: State<'_, AppState>) -> Option<WatchStatus> {
     })
 }
 
+/// Fast tier (opt-in, unverified, sub-second): the webview built a recvonly `RTCPeerConnection`
+/// and gathered `offer_sdp`. Relay it to the publisher over the fast-tier signaling topic and
+/// pump the answer back to the webview (`fast-answer`), or `fast-closed` if the publisher
+/// declines / isn't reachable — in which case the webview stays on the verified mesh player.
+/// Requires an active watch whose publisher has been resolved.
+#[tauri::command]
+async fn fast_watch_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    offer_sdp: String,
+) -> Result<(), String> {
+    let (signaling, my_peer, publisher) = {
+        let g = state.watch.lock().unwrap();
+        let sess = g.as_ref().ok_or("not watching")?;
+        let publisher = (*sess.publisher_peer.lock().unwrap_or_else(|e| e.into_inner()))
+            .ok_or("publisher not resolved yet — try again in a moment")?;
+        (sess.session.signaling(), sess.session.my_peer, publisher)
+    };
+    let handle = fasttier::spawn_answer_reader(app, signaling, my_peer, publisher, offer_sdp);
+    // Store the reader on the session, replacing any prior attempt.
+    let g = state.watch.lock().unwrap();
+    match g.as_ref() {
+        Some(sess) => {
+            if let Some(old) =
+                sess.fast_task.lock().unwrap_or_else(|e| e.into_inner()).replace(handle)
+            {
+                old.abort();
+            }
+        }
+        None => handle.abort(), // watch ended while we were setting up
+    }
+    Ok(())
+}
+
+/// Leave the fast tier: stop the answer reader and tell the publisher to free the slot. The
+/// webview falls back to the verified mesh player (which stayed warm underneath).
+#[tauri::command]
+async fn fast_watch_stop(state: State<'_, AppState>) -> Result<(), String> {
+    let close = {
+        let g = state.watch.lock().unwrap();
+        match g.as_ref() {
+            Some(sess) => {
+                if let Some(t) = sess.fast_task.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    t.abort();
+                }
+                (*sess.publisher_peer.lock().unwrap_or_else(|e| e.into_inner()))
+                    .map(|p| (sess.session.signaling(), sess.session.my_peer, p))
+            }
+            None => None,
+        }
+    };
+    if let Some((sig, me, publisher)) = close {
+        fasttier::send_fast_close(&sig, me, publisher).await;
+    }
+    Ok(())
+}
+
 /// Go Live: start the local RTMP ingest (point OBS here), run a live publisher
 /// node, announce the stream on the statement store, and serve a self-preview.
 /// Publish the signed manifest to Bulletin + announce its CID. Waits for the encoder's CMAF
@@ -1079,6 +1153,12 @@ fn spawn_publish_stats(
 /// smaller addressable units) for the ~1.5s glass-to-glass the LL path targets.
 #[cfg(feature = "publish")]
 const LL_PART_MS: u32 = 250;
+
+/// Max concurrent opt-in fast-tier viewers a publisher serves directly (uplink-bound: the
+/// publisher sends full RTP to each). Beyond this, a viewer's fast-tier offer is declined and
+/// it stays on the verified mesh — which scales to the crowd. A handful of friends.
+#[cfg(all(feature = "publish", not(target_os = "android")))]
+const FAST_TIER_CAP: usize = 5;
 
 #[cfg(feature = "publish")]
 fn spawn_manifest_publish(
@@ -1288,6 +1368,13 @@ async fn start_publish(
         let init_slot_feeder = init_slot.clone();
         let live_w = live_flag.clone();
         let ingest_w = ingest_bytes.clone();
+        // Fast tier: publisher-direct sub-second WebRTC media to opt-in viewers. WHIP exposes
+        // raw access units to packetize; the accept loop answers fast-tier offers and the
+        // feeder fans each AU onto the connected viewers' tracks. (RTMP has no raw AUs, so it
+        // offers no fast tier — those viewers stay on the mesh.)
+        let fast = fasttier::FastTier::new(FAST_TIER_CAP, stun());
+        tasks.push(fasttier::spawn_accept_loop(session.signaling(), session.my_peer, fast.clone()));
+        let fast_feed = fast;
         let (whip_tx, whip_rx) = std::sync::mpsc::channel::<whip_ingest::server::IngestAu>();
         let server = whip_ingest::server::start(whip_tx, stun())
             .map_err(|e| format!("couldn't start the WHIP endpoint: {e}"))?;
@@ -1355,6 +1442,9 @@ async fn start_publish(
                     None => 3_000,
                 };
                 last_pts = Some(iu.au.pts_us);
+                // Fan the raw access unit onto any fast-tier viewers' WebRTC tracks (before
+                // muxing — the fast tier is the un-segmented, sub-second path).
+                fast_feed.broadcast(&iu.au.data, fasttier::pts_us_to_rtp90k(iu.au.pts_us));
                 if let Some(seg) = builder.push_au(&iu.au.data, dur.max(1), iu.au.keyframe) {
                     ingest_w.fetch_add(seg.bytes.len() as u64, Ordering::Relaxed);
                     preview.push_segment(seg.seq, seg.bytes.clone());
@@ -1825,6 +1915,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         stop_watch,
         stop_seed,
         watch_status,
+        fast_watch_start,
+        fast_watch_stop,
         start_publish,
         stop_publish,
         publish_status,
@@ -1847,6 +1939,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         stop_watch,
         stop_seed,
         watch_status,
+        fast_watch_start,
+        fast_watch_stop,
         set_keep_awake,
         open_app_settings
     ]);

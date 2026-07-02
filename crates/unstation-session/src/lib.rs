@@ -144,6 +144,13 @@ impl Session {
         self.bans.clone()
     }
 
+    /// A clone of the chain signaling handle — for the opt-in WebRTC media fast tier (W3),
+    /// which drives its own `fast_signal` offer/answer over the statement store beside the
+    /// mesh's data-channel negotiation. The mesh path is untouched.
+    pub fn signaling(&self) -> ChainSignaling {
+        self.signaling.clone()
+    }
+
     /// The shared off-chain presence directory — hand this to the `MeshNode`
     /// (via [`MeshNode::with_presence_book`]) so node + session see the same peers.
     ///

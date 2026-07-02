@@ -24,7 +24,9 @@ use unstation_core::chat_codec;
 use unstation_core::signaling::{
     LiveEdge, Presence, PresenceRecord, SignalMsg, Signaling, Subscription, TopicId,
 };
-use unstation_core::topic::{discovery_topic, durable_topic, edge_topic, shard_for, signaling_topic};
+use unstation_core::topic::{
+    discovery_topic, durable_topic, edge_topic, fast_signaling_topic, shard_for, signaling_topic,
+};
 use unstation_core::types::{PeerId, SegmentId, Seq, StreamId};
 use unstation_core::BoxFuture;
 
@@ -420,6 +422,57 @@ impl ChainSignaling {
         let mut out = Vec::new();
         for st in statements {
             // Each statement is a bundle of envelopes (see `publish_signal`).
+            for env in decode_bundle(&st.data) {
+                if let Some(pair) = decode_envelope(&env) {
+                    out.push(pair);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Push wakeups for fast-tier (WebRTC media) SDP/ICE addressed to `me`.
+    pub fn subscribe_fast_signals_push(
+        &self,
+        me: PeerId,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
+        subscribe_topic(fast_signaling_topic(&self.stream, &me))
+    }
+
+    /// Post a fast-tier signaling message to `to` on the fast-tier topic. Unlike the mesh
+    /// path, the fast tier is non-trickle — one offer, one answer per viewer — so each
+    /// (sender, recipient) has a single message and no accumulate-and-rewrite bundle is
+    /// needed; the envelope is still wrapped as a one-element bundle so [`read_fast_signals`]
+    /// shares the mesh decoder. Distinct senders write distinct statements (keyed by their
+    /// own account), so many viewers offering to one publisher don't evict one another.
+    pub async fn publish_fast_signal(
+        &self,
+        from: PeerId,
+        to: PeerId,
+        msg: SignalMsg,
+    ) -> unstation_core::Result<()> {
+        let topic = fast_signaling_topic(&self.stream, &to);
+        let data = encode_bundle(&[encode_envelope(from, &msg)]);
+        let prio = self.prio.fetch_add(1, Ordering::SeqCst);
+        tokio::task::spawn_blocking(move || ss::submit_fixed_topic(topic, &[topic], &data, prio))
+            .await
+            .map_err(err)?
+            .map_err(err)
+    }
+
+    /// Read and decode all fast-tier signaling envelopes currently addressed to `me`.
+    /// (The caller dedups by `(from, msg)`; statements have a ~30s TTL.)
+    pub async fn read_fast_signals(
+        &self,
+        me: PeerId,
+    ) -> unstation_core::Result<Vec<(PeerId, SignalMsg)>> {
+        let topic = fast_signaling_topic(&self.stream, &me);
+        let statements = tokio::task::spawn_blocking(move || ss::rpc_get_broadcasts(&[topic]))
+            .await
+            .map_err(err)?
+            .map_err(err)?;
+        let mut out = Vec::new();
+        for st in statements {
             for env in decode_bundle(&st.data) {
                 if let Some(pair) = decode_envelope(&env) {
                     out.push(pair);

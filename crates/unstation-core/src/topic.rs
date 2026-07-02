@@ -26,6 +26,18 @@ pub fn signaling_topic(stream: &StreamId, peer: &PeerId) -> TopicId {
     blake2b256(&buf)
 }
 
+/// Fast-tier (WebRTC media) SDP/ICE delivery topic: `BLAKE2b-256("fastsig" ‖ stream ‖ peer)`.
+/// Domain-separated from [`signaling_topic`] so the opt-in media fast tier's offer/answer
+/// never mix with the mesh's data-channel negotiation — they share the `SignalMsg` envelope
+/// but are read on independent topics, so neither transport ever sees the other's messages.
+pub fn fast_signaling_topic(stream: &StreamId, peer: &PeerId) -> TopicId {
+    let mut buf = Vec::with_capacity(7 + 32 + 32);
+    buf.extend_from_slice(b"fastsig");
+    buf.extend_from_slice(&stream.0);
+    buf.extend_from_slice(&peer.0);
+    blake2b256(&buf)
+}
+
 /// Signed current-segment announcements topic: `BLAKE2b-256("edge" ‖ stream_id)`.
 pub fn edge_topic(stream: &StreamId) -> TopicId {
     let mut buf = Vec::with_capacity(4 + 32);
@@ -68,6 +80,9 @@ mod tests {
         assert_ne!(discovery_topic(&s, 0), edge_topic(&s));
         assert_ne!(signaling_topic(&s, &p), edge_topic(&s));
         assert_ne!(discovery_topic(&s, 0), signaling_topic(&s, &p));
+        // The fast tier's per-peer topic is distinct from the mesh signaling topic.
+        assert_ne!(fast_signaling_topic(&s, &p), signaling_topic(&s, &p));
+        assert_eq!(fast_signaling_topic(&s, &p), fast_signaling_topic(&s, &p));
     }
 
     #[test]
