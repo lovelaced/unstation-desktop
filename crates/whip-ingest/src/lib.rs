@@ -13,4 +13,4 @@ pub mod rtp;
 #[cfg(feature = "server")]
 pub mod server;
 
-pub use rtp::{AccessUnit, H264Depacketizer};
+pub use rtp::{AccessUnit, H264Depacketizer, H264Packetizer, DEFAULT_MTU};

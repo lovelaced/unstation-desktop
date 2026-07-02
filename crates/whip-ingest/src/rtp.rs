@@ -244,6 +244,117 @@ impl H264Depacketizer {
     }
 }
 
+/// H.264 RTP packetization (RFC 6184) — the inverse of [`H264Depacketizer`]. Turns one
+/// Annex-B access unit into RTP packets for the WebRTC media fast tier (W3): the publisher
+/// writes these onto a sendonly track that browser viewers hardware-decode directly. Emits
+/// single-NAL packets, FU-A fragmenting any NAL that won't fit the MTU. The marker bit is set
+/// on the last packet of the access unit (the depacketizer keys AU completion off it).
+pub struct H264Packetizer {
+    ssrc: u32,
+    payload_type: u8,
+    seq: u16,
+}
+
+/// Default RTP packet ceiling: keeps the whole packet (incl. IP/UDP/SRTP overhead) under a
+/// 1500-byte Ethernet MTU, so DTLS/SRTP never has to IP-fragment.
+pub const DEFAULT_MTU: usize = 1200;
+/// RTP header we emit: 12 bytes, no CSRC/extension/padding.
+const RTP_HEADER: usize = 12;
+
+impl H264Packetizer {
+    /// `payload_type` must be the dynamic PT negotiated for H.264 in the SDP answer;
+    /// `ssrc` identifies this track's stream. `seq` starts at 0 and rolls over naturally.
+    pub fn new(ssrc: u32, payload_type: u8) -> Self {
+        Self { ssrc, payload_type, seq: 0 }
+    }
+
+    /// Packetize one Annex-B access unit at 90kHz `ts`, bounding each packet to `mtu` bytes.
+    /// Returns the packets in send order; the last carries the marker bit. An access unit
+    /// with no NALs yields no packets.
+    pub fn packetize(&mut self, au: &[u8], ts: u32, mtu: usize) -> Vec<Vec<u8>> {
+        let nals = iter_annexb_nals(au);
+        if nals.is_empty() {
+            return Vec::new();
+        }
+        // Room for a NAL (or FU-A payload chunk) after the RTP header.
+        let max_payload = mtu.saturating_sub(RTP_HEADER).max(2);
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for nal in &nals {
+            if nal.is_empty() {
+                continue;
+            }
+            if nal.len() <= max_payload {
+                out.push(self.rtp_packet(false, ts, nal)); // single NAL unit
+            } else {
+                // FU-A: fragment the NAL body (after its 1-byte header) into chunks that
+                // leave 2 bytes for the FU indicator + FU header.
+                let hdr = nal[0];
+                let indicator = (hdr & 0xE0) | 28; // keep F/NRI, type 28
+                let body = &nal[1..];
+                let chunk = max_payload.saturating_sub(2).max(1);
+                let mut i = 0;
+                while i < body.len() {
+                    let end = (i + chunk).min(body.len());
+                    let start_bit = (i == 0) as u8;
+                    let end_bit = (end == body.len()) as u8;
+                    let fu_header = (start_bit << 7) | (end_bit << 6) | (hdr & 0x1F);
+                    let mut payload = Vec::with_capacity(2 + (end - i));
+                    payload.push(indicator);
+                    payload.push(fu_header);
+                    payload.extend_from_slice(&body[i..end]);
+                    out.push(self.rtp_packet(false, ts, &payload));
+                    i = end;
+                }
+            }
+        }
+        // Mark the final packet as the access unit's end.
+        if let Some(last) = out.last_mut() {
+            last[1] |= 0x80;
+        }
+        out
+    }
+
+    fn rtp_packet(&mut self, marker: bool, ts: u32, payload: &[u8]) -> Vec<u8> {
+        let mut p = Vec::with_capacity(RTP_HEADER + payload.len());
+        p.push(0x80); // v2, no padding/extension/CSRC
+        p.push((self.payload_type & 0x7F) | if marker { 0x80 } else { 0 });
+        p.extend_from_slice(&self.seq.to_be_bytes());
+        p.extend_from_slice(&ts.to_be_bytes());
+        p.extend_from_slice(&self.ssrc.to_be_bytes());
+        p.extend_from_slice(payload);
+        self.seq = self.seq.wrapping_add(1);
+        p
+    }
+}
+
+/// Split an Annex-B buffer into NAL units (payload between start codes, start code removed).
+/// Mirrors what the depacketizer emits: a `00 00 00 01` (or `00 00 01`) prefix per NAL.
+fn iter_annexb_nals(data: &[u8]) -> Vec<&[u8]> {
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            starts.push(i + 3);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let mut nals = Vec::with_capacity(starts.len());
+    for (idx, &payload_start) in starts.iter().enumerate() {
+        let end = if idx + 1 < starts.len() {
+            let next = starts[idx + 1] - 3; // back up over that start code
+            if next > 0 && data[next - 1] == 0 { next - 1 } else { next } // trim 4-byte code's extra 0
+        } else {
+            data.len()
+        };
+        if payload_start < end {
+            nals.push(&data[payload_start..end]);
+        }
+    }
+    nals
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +462,91 @@ mod tests {
             .push(&rtp(4, near_wrap.wrapping_add(90_000), true, &[0x65, 1]))
             .expect("keyframe after the wrap");
         assert_eq!(au.pts_us, 1_000_000, "one second later despite the u32 wrap");
+    }
+
+    /// Annex-B helper: prefix each NAL with a 4-byte start code and concatenate.
+    fn annexb(nals: &[&[u8]]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for n in nals {
+            v.extend_from_slice(&[0, 0, 0, 1]);
+            v.extend_from_slice(n);
+        }
+        v
+    }
+
+    /// Feed a packet stream through the depacketizer and collect the AUs it emits.
+    fn depacketize(pkts: &[Vec<u8>]) -> Vec<AccessUnit> {
+        let mut d = H264Depacketizer::new();
+        let mut aus = Vec::new();
+        for p in pkts {
+            if let Some(au) = d.push(p) {
+                aus.push(au);
+            }
+        }
+        aus
+    }
+
+    #[test]
+    fn packetize_single_nal_round_trips() {
+        // A keyframe AU (SPS+PPS+IDR), each NAL small enough for a single-NAL packet.
+        let au = annexb(&[&[0x67, 1, 2, 3], &[0x68, 9], &[0x65, 4, 5, 6]]);
+        let mut p = H264Packetizer::new(0xDEAD_BEEF, 96);
+        let pkts = p.packetize(&au, 90_000, DEFAULT_MTU);
+        assert_eq!(pkts.len(), 3, "one packet per NAL");
+        assert!(pkts.last().unwrap()[1] & 0x80 != 0, "marker on the last packet");
+        assert!(pkts[..2].iter().all(|p| p[1] & 0x80 == 0), "no marker before the end");
+
+        let aus = depacketize(&pkts);
+        assert_eq!(aus.len(), 1);
+        assert!(aus[0].keyframe);
+        assert_eq!(aus[0].data, au, "depacketized bytes match the original AU");
+    }
+
+    #[test]
+    fn packetize_large_nal_fu_a_round_trips() {
+        // A big IDR slice that must FU-A fragment across several packets at a small MTU.
+        let mut slice = vec![0x65]; // IDR NAL header
+        slice.extend((0..4000u32).map(|i| (i & 0xFF) as u8));
+        let au = annexb(&[&[0x67, 1, 2, 3], &[0x68, 9], &slice]);
+        let mut p = H264Packetizer::new(1, 96);
+        let pkts = p.packetize(&au, 12_345, 300);
+        // SPS + PPS single-NAL, then many FU-A fragments for the slice.
+        assert!(pkts.len() > 4, "the slice fragmented: {} packets", pkts.len());
+        assert!(pkts.last().unwrap()[1] & 0x80 != 0, "marker on the last fragment");
+        assert!(pkts.iter().all(|p| p.len() <= 300), "every packet within MTU");
+
+        let aus = depacketize(&pkts);
+        assert_eq!(aus.len(), 1, "reassembles into exactly one AU");
+        assert!(aus[0].keyframe);
+        assert_eq!(aus[0].data, au, "FU-A reassembly is byte-exact");
+    }
+
+    #[test]
+    fn packetize_multi_au_stream_round_trips() {
+        let mut p = H264Packetizer::new(7, 102);
+        let idr = annexb(&[&[0x67, 1, 2, 3], &[0x68, 9], &[0x65, 4, 5, 6]]);
+        // A P-frame big enough to fragment, to mix single-NAL + FU-A across AUs.
+        let mut pslice = vec![0x41];
+        pslice.extend((0..900u32).map(|i| (i & 0xFF) as u8));
+        let pframe = annexb(&[&pslice]);
+
+        let mut pkts = Vec::new();
+        pkts.extend(p.packetize(&idr, 0, 400));
+        pkts.extend(p.packetize(&pframe, 3000, 400));
+
+        let aus = depacketize(&pkts);
+        assert_eq!(aus.len(), 2);
+        assert!(aus[0].keyframe && !aus[1].keyframe);
+        assert_eq!(aus[0].data, idr);
+        assert_eq!(aus[1].data, pframe);
+        assert_eq!(aus[1].pts_us, 3000 * 1000 / 90);
+    }
+
+    #[test]
+    fn packetize_empty_au_yields_nothing() {
+        let mut p = H264Packetizer::new(1, 96);
+        assert!(p.packetize(&[], 0, DEFAULT_MTU).is_empty());
+        assert!(p.packetize(&[0, 0, 0, 1], 0, DEFAULT_MTU).is_empty(), "start code, no NAL body");
     }
 
     #[test]
