@@ -17,6 +17,11 @@
 //   window.__onPairingPayload(payload) — defined by the shim; called from scenes/onboarding.js
 //                                        beginPairing() with the live pairing payload (fires
 //                                        the polkadotapp:// same-device deep-link).
+//   window.__onSceneChange(state)      — defined by the shim; called at the top of go() on
+//                                        every scene change. Drives the Android hardware-back
+//                                        history (pushState/replaceState bookkeeping).
+//   window.__go(state)                 — defined HERE (exposes go()); called by the shim's
+//                                        popstate handler to route a hardware back press.
 //   window.__hlsLatency()              — defined by the shim; live-edge lag in seconds from
 //                                        hls.js (null when unknown). Used guardedly by
 //                                        player.js's behind-live indicator.
@@ -33,9 +38,13 @@
 //                                        (plugin:opener|open_url, camera_start, camera_stop).
 //
 // DOM the shim touches (do not rename/remove — see also index.html):
-//   ids:       #pubWaiting (incl. its <b> and direct child <div>), #phStatus, #phNote
+//   ids:       #pubWaiting (incl. its <b> and direct child <div>), #phStatus, #phNote,
+//              #goLiveRec (moved onto the Go Live nav icon), #leaveWatchBtn (moved into
+//              #net for a thumb-reachable Leave; also .click()ed by the back handler),
+//              #net, #win (data-net), #inviteQrBox / #inviteQrClose (back handler)
 //   selectors: [data-scene="onboarding"] .qr-copy p (onboarding copy rewrite),
-//              .ingest-card, .pub-rail (+ its .eyebrow children) — hidden on mobile.
+//              .ingest-card, .pub-rail (+ its .eyebrow children) — hidden on mobile,
+//              .titlebar .tab buttons (rebuilt as icon+label bottom-nav items).
 
 import { initAmbient } from './ambient.js';
 import { NATIVE } from './tauri.js';
@@ -96,6 +105,9 @@ let findingHook=null;
 export function registerFindingHook(fn){ findingHook=fn; }
 
 export function go(state){ clearSeq(); S.curState=state;
+  // Neutral scene-change hook (no-op on desktop): the Android shim keeps the SPA
+  // history in step with the scene so the hardware back button behaves natively.
+  if(window.__onSceneChange){ try{ window.__onSceneChange(state); }catch(e){} }
   document.querySelectorAll('.dock button').forEach(b=>b.classList.toggle('on', b.dataset.state===state));
   const isLive=['live','seed','catchup'].includes(state);
   setActiveTab(state);
@@ -104,6 +116,10 @@ export function go(state){ clearSeq(); S.curState=state;
   if(isLive){ if(window.__keepAwake) window.__keepAwake(true); const mode=state==='seed'?'seed':'p2p'; win.dataset.health=mode; setAmbient(false); document.getElementById('modeText').textContent=state==='seed'?STRINGS.modeLiveHelper:STRINGS.modeLiveP2p; showScene(''); if(!NATIVE){ setTitle('hardfork.dot',true); renderViewerHealth({peers: state==='seed'?6:23, playing:true, mode, publisher:'hardfork.dot'}); } return; }
   setAmbient(state==='entry'||state==='onboarding'||state==='ended'||state==='settings'); win.dataset.net='closed'; if(state!=='finding') setTitle('Unstation',false);
   if(state==='finding'){ showScene('finding'); if(findingHook) findingHook(); return; } showScene(state); }
+
+// Expose the state machine as a neutral seam (see the contract header): the Android
+// shim's back handler routes popstate through it. Unused on desktop.
+window.__go = go;
 
 // Plain network status shared by the Go Live card + Settings (driven by mesh-status).
 export function netLabel(){
