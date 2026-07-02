@@ -7,7 +7,7 @@ import { wireVideoDiag } from './player.js';
 import { applyStats, applyWatchPhase, enterWatch, leaveWatch, selfWatch, startWatch } from './scenes/watch.js';
 import { enterGoLive, goLiveStart, endPublish, applyPublishState, updatePubHealth, applyPublishStats, applyPublishProgress } from './scenes/publish.js';
 import { beginPairing, pushChainIdentity, onboardingStatus, showRetry, resumeAfterSignIn, ensureSignedIn } from './scenes/onboarding.js';
-import { openSettings, updateSettingsStatus } from './scenes/settings.js';
+import { openSettings, updateSettingsStatus , applySeedStats } from './scenes/settings.js';
 import { parseInviteLink } from './invite.js';
 
 // G: keep the screen awake while something live is on screen (watch or publish).
@@ -68,7 +68,8 @@ document.getElementById('fsBtn').addEventListener('click', toggleFullscreen);
 // watch form (a full start_watch). No target (e.g. preview dock) → back to entry.
 { const rj=document.getElementById('rejoinBtn'); if(rj) rj.addEventListener('click', ()=>{ if(S.watchTarget) startWatch(S.watchTarget); else go('entry'); }); }
 { const pv=document.getElementById('previewSelf'); if(pv) pv.addEventListener('click', ()=>{ if(S.pubName) selfWatch(S.pubName); }); }
-document.getElementById('rePairBtn').addEventListener('click', ()=>{ S.chainReady=false; try{ sso.resetPairing(); }catch(e){} const pb=document.getElementById('pairedBtn'); if(pb) pb.style.display=''; go('onboarding'); beginPairing(); });
+{ const sb=document.getElementById('stopSeedBtn'); if(sb) sb.addEventListener('click', ()=>{ if(NATIVE && invoke) invoke('stop_seed').catch(()=>{}); sb.style.display='none'; const l=document.getElementById('setLend'); if(l) l.textContent='Off \u2014 not watching anything right now.'; }); }
+  document.getElementById('rePairBtn').addEventListener('click', ()=>{ S.chainReady=false; try{ sso.resetPairing(); }catch(e){} const pb=document.getElementById('pairedBtn'); if(pb) pb.style.display=''; go('onboarding'); beginPairing(); });
 // Onboarding failure affordances: "Try again" re-requests the allowance on the EXISTING
 // session (no resetPairing → reuses the cached grant, no slot churn); "Re-pair from
 // scratch" is the nuclear option that wipes pairing state.
@@ -107,7 +108,8 @@ async function boot(){
       await listen('publish-progress', e=>applyPublishProgress(e.payload));
       await listen('publish-stats', e=>{ if(e.payload){ applyPublishStats(e.payload); const el=document.getElementById('pubViewers'); if(el) el.textContent=S.lastViewers; if(S.curState==='settings') updateSettingsStatus(); } });
       await listen('publish-hint', e=>{ const w=document.getElementById('pubWaiting'); const b=w&&w.querySelector('b'); if(b && e.payload && e.payload.message){ b.textContent=e.payload.message; } });
-      await listen('mesh-status', e=>{ const p=e&&e.payload; if(!p) return; console.log('[mesh-status]', p.state, p.detail); S.chainState=p.state; S.chainDetail=p.detail||''; updatePubHealth(); if(S.curState==='settings') updateSettingsStatus(); if(p.state==='error'){ const b=document.querySelector('#pubWaiting b'); if(b && !document.getElementById('pubLive').hidden) b.textContent=p.detail; } });
+      await listen('seed-stats', e=>applySeedStats(e.payload));
+        await listen('mesh-status', e=>{ const p=e&&e.payload; if(!p) return; console.log('[mesh-status]', p.state, p.detail); S.chainState=p.state; S.chainDetail=p.detail||''; updatePubHealth(); if(S.curState==='settings') updateSettingsStatus(); if(p.state==='error'){ const b=document.querySelector('#pubWaiting b'); if(b && !document.getElementById('pubLive').hidden) b.textContent=p.detail; } });
     }catch(e){} }
     // Re-attach: if a publish session is still running in the backend (a webview
     // reload, or relaunch while the process lived), light the Go-Live tab badge so

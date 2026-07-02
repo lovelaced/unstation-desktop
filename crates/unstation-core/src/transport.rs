@@ -47,6 +47,14 @@ pub enum EngineEvent {
     /// manifest verifies: the publisher pubkey to authenticate gossiped live-edge
     /// announcements against (off-chain signaling, TECH_SPEC §6.4).
     SetPublisherKey { key: [u8; 32] },
+    /// Locally injected: switch the node's role at runtime — a viewer whose player
+    /// left converts to a background seed (keeps caching + resharing the live window,
+    /// no playback) instead of tearing down. Seeding-by-default keeps the mesh healthy.
+    SetRole(crate::config::Role),
+    /// Locally injected: retune the upload budget at runtime (bits/sec; 0 = unmetered).
+    /// The health monitor lowers it on an unstable/slow link and restores it when the
+    /// link proves itself again.
+    SetUploadBudget(u64),
     /// Scheduler tick (also emitted by a timer in production).
     Tick,
     Stop,

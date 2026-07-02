@@ -163,7 +163,17 @@ impl Session {
     /// Publisher: announce presence on our discovery shard, refreshed before TTL. Returns
     /// the task handle so the caller can abort it on teardown — otherwise it would keep
     /// refreshing this (now-stale) session's presence forever.
-    pub fn spawn_presence(&self, caps_upload_bps: u64, relay_opt_in: bool) -> tokio::task::JoinHandle<()> {
+    ///
+    /// `relay_gate` is the live health switch (seed-by-default): when the app's health
+    /// monitor detects an unstable/slow link it flips the gate off, and this node stops
+    /// advertising relay capability regardless of opt-in or proven reachability — an
+    /// unhealthy relay hurts the mesh more than no relay.
+    pub fn spawn_presence(
+        &self,
+        caps_upload_bps: u64,
+        relay_opt_in: bool,
+        relay_gate: Arc<std::sync::atomic::AtomicBool>,
+    ) -> tokio::task::JoinHandle<()> {
         let signaling = self.signaling.clone();
         let me = self.my_peer;
         let manifest_cid = self.manifest_cid.clone();
@@ -174,9 +184,10 @@ impl Session {
             loop {
                 tick.tick().await;
                 let mc = manifest_cid.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                // Advertise relay-capability if explicitly opted in OR we've proven
-                // reachable (a peer connected to us inbound) — emergent volunteer relay.
-                let relay = relay_opt_in || transport.reachable();
+                // Advertise relay-capability if healthy AND (explicitly opted in OR
+                // we've proven reachable — a peer connected to us inbound).
+                let relay = relay_gate.load(std::sync::atomic::Ordering::Relaxed)
+                    && (relay_opt_in || transport.reachable());
                 // `peer_id` is our per-device routing id; `publisher` is our stable
                 // personhood key — the trust anchor viewers verify the manifest/edge
                 // against. Splitting them lets two devices of the same person coexist in

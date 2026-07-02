@@ -26,6 +26,31 @@ export function updateSettingsStatus(){
   set('setHealth', ht); const hd=document.getElementById('setHealthDot'); if(hd) hd.dataset.h=hh;
 }
 
+// Lending bandwidth (seed-by-default, health-gated) — driven by the `seed-stats`
+// event: contribution level while watching, and the background-seed meter after
+// leaving a stream (with its Stop control).
+export function applySeedStats(p){
+  if(!p) return;
+  const set=(id,t)=>{ const el=document.getElementById(id); if(el) el.textContent=t; };
+  const dot=document.getElementById('setLendDot');
+  const stop=document.getElementById('stopSeedBtn');
+  if(stop) stop.style.display = p.seeding ? '' : 'none';
+  const up = p.uplink_kbps>=1000 ? (p.uplink_kbps/1000).toFixed(1)+' Mbps' : p.uplink_kbps+' kbps';
+  if(p.seeding){
+    set('setLend', 'Helping carry '+p.stream+' \u00b7 '+up+' up \u00b7 '+p.peers+' '+(p.peers===1?'peer':'peers'));
+    if(dot) dot.dataset.h='good';
+  } else if(p.level==='paused'){
+    set('setLend', STRINGS.lendPaused);
+    if(dot) dot.dataset.h='wait';
+  } else if(p.level==='off'){
+    set('setLend', STRINGS.lendOff);
+    if(dot) dot.dataset.h='';
+  } else {
+    set('setLend', (p.level==='reduced' ? 'On (reduced \u2014 your connection is busy)' : 'On while you watch')+' \u00b7 '+up+' up');
+    if(dot) dot.dataset.h='good';
+  }
+}
+
 // Use the async session check (the sync one races storage hydration and wrongly
 // shows "Not signed in" right after pairing). Show a transient "Checking…" first.
 export async function openSettings(){

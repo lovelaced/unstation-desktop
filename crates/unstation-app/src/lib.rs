@@ -52,6 +52,9 @@ const TICK: Duration = Duration::from_millis(100);
 struct AppState {
     signed_in: Mutex<bool>,
     watch: Mutex<Option<WatchSession>>,
+    /// A background seed (seed-by-default): the converted remains of a watch whose
+    /// player left — still caching + resharing the live window for the mesh.
+    seed: Mutex<Option<SeedSession>>,
     #[cfg(feature = "publish")]
     publish: Mutex<Option<PublishSession>>,
     /// True once the statement store has been initialized with the paired
@@ -70,6 +73,24 @@ struct WatchSession {
     tasks: Vec<JoinHandle<()>>,
     /// Retained so the UI can rebuild the player when navigating back to it.
     info: WatchInfo,
+    /// Canonical stream name (for the lending-bandwidth status once converted).
+    name: String,
+    /// Live node-stats receiver, retained so a seed conversion can keep observing.
+    stats: tokio::sync::watch::Receiver<unstation_core::node::NodeStats>,
+    /// Contribution level from the health monitor: 0=full, 1=reduced, 2=paused.
+    /// `stop_watch` only converts to a background seed at level 0 — an unstable
+    /// link makes a bad helper.
+    health: Arc<std::sync::atomic::AtomicU8>,
+}
+
+/// A watch converted into a background seed: same node/session, Role::Seed, the
+/// cursor following the live edge, plus a status task that reports the contribution
+/// and stops the whole thing when the stream ends.
+struct SeedSession {
+    _hls: HlsServer,
+    node_tx: UnboundedSender<EngineEvent>,
+    session: Session,
+    tasks: Vec<JoinHandle<()>>,
 }
 
 /// An active publish: RTMP ingest, the self-preview HLS, the feeder task, the
@@ -168,6 +189,19 @@ struct PublishStateMsg {
 struct MeshStatusMsg {
     state: String,
     detail: String,
+}
+
+/// Lending-bandwidth status (seed-by-default, health-gated). Emitted by the watch
+/// health monitor (`seeding: false` — contribution while watching) and by a
+/// background seed's status task (`seeding: true`). `level` ∈ {"full","reduced",
+/// "paused"}; "paused" means the link looked unstable/slow and contribution is off.
+#[derive(Serialize, Clone)]
+struct SeedStatsMsg {
+    seeding: bool,
+    stream: String,
+    level: String,
+    uplink_kbps: u32,
+    peers: usize,
 }
 
 /// The viewer journey's honest state machine (IMPLEMENTATION_SPEC §10.3), emitted as
@@ -328,7 +362,9 @@ async fn start_watch(
     // Re-watch / publisher switch: fully tear down any previous watch FIRST. Otherwise its
     // tasks keep running and its transport stays connected to the publisher under our
     // (stable) peer id, so the publisher ignores the new connection and the re-watch hangs.
+    // A background seed also yields — the thing you're actually watching wins bandwidth.
     teardown_watch(&state);
+    teardown_seed(&state);
 
     // The honest viewer state machine starts NOW (name→id is instant, but the phase
     // still renders so the journey is legible).
@@ -442,11 +478,78 @@ async fn start_watch(
     // relays through volunteer peers, so a NAT-restricted node only needs to reach
     // *someone*. relay_opt_in = false, but a viewer that proves reachable (a peer
     // connects to it inbound) auto-promotes to advertising relay-capability — emergent,
-    // self-organizing volunteer relays. (Presence write moves off-chain at scale.)
-    // Tracked in `tasks` so teardown aborts it — else this session keeps refreshing its
-    // (now-stale) presence forever, and after a fresh-peer-id re-watch those old entries
-    // pile up and get re-dialed.
-    tasks.push(session.spawn_presence(20_000_000, false));
+    // self-organizing volunteer relays, gated by the health monitor below (an unstable
+    // link makes a bad relay). Tracked in `tasks` so teardown aborts it — else this
+    // session keeps refreshing its (now-stale) presence forever, and after a
+    // fresh-peer-id re-watch those old entries pile up and get re-dialed.
+    let relay_gate = Arc::new(AtomicBool::new(true));
+    tasks.push(session.spawn_presence(20_000_000, false, relay_gate.clone()));
+
+    // Health-gated contribution (seed-by-default): everyone lends bandwidth unless the
+    // link proves unstable or slow. Signals, sampled every 5s from the node's real
+    // stats: our own live-edge lag growing while the uplink is busy (serving is
+    // hurting playback), or deliveries stalling with peers connected (a struggling
+    // link). Each strike steps contribution down (full 20 Mbps → reduced 4 Mbps →
+    // paused) and drops the relay advertisement; 30s of clean samples steps back up.
+    let health = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    {
+        const BUDGETS: [u64; 3] = [20_000_000, 4_000_000, 0];
+        let s = session.clone();
+        let vtx = view_tx.clone();
+        let appc = app.clone();
+        let mut rx = stats_rx.clone();
+        let relay_gate = relay_gate.clone();
+        let health = health.clone();
+        let stream_name = canonical_stream_name(&target);
+        tasks.push(tokio::spawn(async move {
+            let mut last = rx.borrow().clone();
+            let mut healthy_streak = 0u32;
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let ns = rx.borrow_and_update().clone();
+                let uplink_kbps =
+                    (ns.sent_bytes.saturating_sub(last.sent_bytes) * 8 / 5 / 1000) as u32;
+                let contended = ns.latency_s > 10.0 && uplink_kbps > 100;
+                let stalled = ns.delivered == last.delivered
+                    && ns.head_seq > ns.play_seq
+                    && s.peer_count() > 0;
+                last = ns;
+                let cur = health.load(Ordering::Relaxed);
+                let next = if contended || stalled {
+                    healthy_streak = 0;
+                    (cur + 1).min(2)
+                } else {
+                    healthy_streak += 1;
+                    if healthy_streak >= 6 && cur > 0 {
+                        healthy_streak = 0;
+                        cur - 1
+                    } else {
+                        cur
+                    }
+                };
+                if next != cur {
+                    health.store(next, Ordering::Relaxed);
+                    relay_gate.store(next == 0, Ordering::Relaxed);
+                    let _ = vtx.send(EngineEvent::SetUploadBudget(BUDGETS[next as usize]));
+                    log::info!(
+                        "[lend] contribution → {} ({})",
+                        ["full", "reduced", "paused"][next as usize],
+                        if contended { "uplink contention" } else if stalled { "delivery stalled" } else { "link recovered" }
+                    );
+                }
+                let _ = appc.emit(
+                    "seed-stats",
+                    SeedStatsMsg {
+                        seeding: false,
+                        stream: stream_name.clone(),
+                        level: ["full", "reduced", "paused"][next as usize].into(),
+                        uplink_kbps,
+                        peers: s.peer_count(),
+                    },
+                );
+            }
+        }));
+    }
 
     // Connection upkeep now lives in the session's maintainer (dial pacing with
     // exponential backoff, hung-dial abandonment, instant reaction to drops — no
@@ -573,6 +676,11 @@ async fn start_watch(
         }));
     }
 
+    // A second stats receiver, retained on the session struct so a seed conversion
+    // (stop_watch) can keep observing the node after the UI stats task below owns
+    // the original.
+    let watch_stats = stats_rx.clone();
+
     // Stream REAL mesh stats to the webview: live transport peer count + the node's
     // own numbers (delivered segments, live-edge lag) from its watch channel. Also
     // keeps the "reaching the mesh" status honest while no peer is connected.
@@ -620,7 +728,7 @@ async fn start_watch(
     let info = WatchInfo {
         hls_url,
         stream_id: resolve_stream(target.clone()),
-        publisher: target,
+        publisher: target.clone(),
         peers: 0,
         rho: 0,
     };
@@ -630,6 +738,9 @@ async fn start_watch(
         session,
         tasks,
         info: info.clone(),
+        name: canonical_stream_name(&target),
+        stats: watch_stats,
+        health,
     });
 
     Ok(info)
@@ -651,9 +762,125 @@ fn teardown_watch(state: &AppState) {
     }
 }
 
+/// Stop a background seed (if any): abort its tasks, stop the node, close connections.
+fn teardown_seed(state: &AppState) {
+    if let Some(sess) = state.seed.lock().unwrap().take() {
+        let _ = sess.node_tx.send(EngineEvent::Stop);
+        for t in sess.tasks {
+            t.abort();
+        }
+        sess.session.shutdown();
+    }
+}
+
+/// Seed-by-default: lending bandwidth is on unless explicitly disabled.
+fn seed_by_default() -> bool {
+    std::env::var("UNSTATION_SEED").map(|v| v != "0").unwrap_or(true)
+}
+
+/// Background-seed contribution ceiling (bits/sec) once the player is gone.
+const SEED_BUDGET_BPS: u64 = 10_000_000;
+
+/// The background seed's status heartbeat: report the contribution every 5s and stop
+/// the whole seed when the stream ends (live edge stale >30s — a dead stream needs
+/// no helpers) so it never lingers as a zombie.
+fn spawn_seed_status(
+    app: AppHandle,
+    session: Session,
+    node_tx: UnboundedSender<EngineEvent>,
+    mut stats: tokio::sync::watch::Receiver<unstation_core::node::NodeStats>,
+    name: String,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut last = stats.borrow().clone();
+        let mut last_head_change = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let ns = stats.borrow_and_update().clone();
+            if ns.head_seq > last.head_seq {
+                last_head_change = std::time::Instant::now();
+            }
+            let uplink_kbps =
+                (ns.sent_bytes.saturating_sub(last.sent_bytes) * 8 / 5 / 1000) as u32;
+            last = ns;
+            if last_head_change.elapsed() > Duration::from_secs(30) {
+                log::info!("[lend] stream over — stopping the background seed for {name}");
+                let _ = node_tx.send(EngineEvent::Stop);
+                session.shutdown();
+                let _ = app.emit(
+                    "seed-stats",
+                    SeedStatsMsg {
+                        seeding: false,
+                        stream: name.clone(),
+                        level: "off".into(),
+                        uplink_kbps: 0,
+                        peers: 0,
+                    },
+                );
+                return; // the inert SeedSession husk is cleared on the next teardown_seed
+            }
+            let _ = app.emit(
+                "seed-stats",
+                SeedStatsMsg {
+                    seeding: true,
+                    stream: name.clone(),
+                    level: "full".into(),
+                    uplink_kbps,
+                    peers: session.peer_count(),
+                },
+            );
+        }
+    })
+}
+
 #[tauri::command]
-fn stop_watch(state: State<'_, AppState>) {
-    teardown_watch(&state);
+fn stop_watch(app: AppHandle, state: State<'_, AppState>) {
+    // Seed-by-default: leaving a stream converts the session into a background seed
+    // (same node + connections, Role::Seed, cursor pinned to the live edge) so the
+    // mesh keeps a helper — but only on a link the health monitor rates FULL. An
+    // unstable or slow connection tears down like before; so does opting out
+    // (UNSTATION_SEED=0).
+    let Some(sess) = state.watch.lock().unwrap().take() else { return };
+    let healthy = sess.health.load(Ordering::Relaxed) == 0;
+    if !(seed_by_default() && healthy) {
+        let _ = sess.node_tx.send(EngineEvent::Stop);
+        for t in sess.tasks {
+            t.abort();
+        }
+        sess.session.shutdown();
+        return;
+    }
+    let _ = sess.node_tx.send(EngineEvent::SetRole(Role::Seed));
+    let _ = sess.node_tx.send(EngineEvent::SetUploadBudget(SEED_BUDGET_BPS));
+    log::info!("[lend] watch of {} converted to a background seed", sess.name);
+    let mut tasks = sess.tasks;
+    tasks.push(spawn_seed_status(
+        app,
+        sess.session.clone(),
+        sess.node_tx.clone(),
+        sess.stats.clone(),
+        sess.name.clone(),
+    ));
+    let seed = SeedSession {
+        _hls: sess._hls,
+        node_tx: sess.node_tx,
+        session: sess.session,
+        tasks,
+    };
+    if let Some(prev) = state.seed.lock().unwrap().replace(seed) {
+        // Only one background seed at a time — retire the previous one.
+        let _ = prev.node_tx.send(EngineEvent::Stop);
+        for t in prev.tasks {
+            t.abort();
+        }
+        prev.session.shutdown();
+    }
+}
+
+/// Stop lending bandwidth (the Settings control).
+#[tauri::command]
+fn stop_seed(state: State<'_, AppState>) {
+    teardown_seed(&state);
 }
 
 /// Bridge the QR-paired statement-store allowance to the Rust signer. The JS side
@@ -937,6 +1164,8 @@ async fn start_publish(
     if let Some(prev) = state.publish.lock().unwrap().take() {
         teardown_publish(prev);
     }
+    // Broadcasting owns the uplink — retire any background seed.
+    teardown_seed(&state);
     let port = 21935u16;
     let key = "unstation";
     let url = segmenter::rtmp_url(port, key);
@@ -994,7 +1223,7 @@ async fn start_publish(
     // into `tasks` so teardown really ends the stream (a surviving presence loop would
     // keep announcing it to the chain forever).
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
-    tasks.push(session.spawn_presence(80_000_000, true));
+    tasks.push(session.spawn_presence(80_000_000, true, Arc::new(AtomicBool::new(true))));
 
     // M2 — publish the signed manifest to Bulletin + announce its CID in presence (the durable
     // trust anchor). The feeder fills `init_slot` with the encoder's CMAF init; the shared
@@ -1153,6 +1382,8 @@ async fn start_publish(
         teardown_publish(prev);
         camera::close_stream();
     }
+    // Broadcasting owns the uplink — retire any background seed.
+    teardown_seed(&state);
 
     // Self-preview HLS + the publisher node inbox — identical to desktop.
     let hls = HlsServer::start(1000).map_err(|e| e.to_string())?;
@@ -1186,7 +1417,7 @@ async fn start_publish(
     });
     // Track every spawned task so teardown really ends the stream (see the desktop path).
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
-    tasks.push(session.spawn_presence(80_000_000, true));
+    tasks.push(session.spawn_presence(80_000_000, true, Arc::new(AtomicBool::new(true))));
 
     let init_slot: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
     tasks.push(spawn_manifest_publish(app.clone(), &session, stream, init_slot.clone()));
@@ -1441,6 +1672,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         chain_status,
         start_watch,
         stop_watch,
+        stop_seed,
         watch_status,
         start_publish,
         stop_publish,
@@ -1462,6 +1694,7 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         chain_status,
         start_watch,
         stop_watch,
+        stop_seed,
         watch_status,
         set_keep_awake,
         open_app_settings

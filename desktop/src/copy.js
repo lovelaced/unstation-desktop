@@ -3,6 +3,9 @@
 // viewer or streamer can act on. Prefer adding strings here over inlining them.
 
 export const STRINGS = {
+  // Lending bandwidth (seed-by-default)
+  lendPaused: 'Paused \u2014 your connection looked unstable, so lending is off until it recovers.',
+  lendOff: 'Off \u2014 not watching anything right now.',
   // HUD pill mode text ("helper" = a seed/relay peer passing the video along).
   modeLiveP2p: 'LIVE · P2P',
   modeLiveHelper: 'LIVE · via a helper',

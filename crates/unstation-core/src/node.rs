@@ -666,6 +666,24 @@ impl MeshNode {
                 // Trust anchor learned at runtime — gossiped edges now get verified.
                 self.publisher_key = Some(key);
             }
+            EngineEvent::SetRole(role) => {
+                // A viewer whose player left converts to a background seed (or back).
+                // The role drives the unchoke policy and, for Live seeds, the
+                // edge-following cursor in on_tick.
+                log::info!("[mesh] role → {:?}", role);
+                self.eng.cfg.role = role;
+            }
+            EngineEvent::SetUploadBudget(bps) => {
+                // Health-tuned contribution: clamp the token bucket into the new
+                // budget's burst immediately so a cut takes effect this tick.
+                log::info!("[mesh] upload budget → {bps} bps");
+                self.eng.cfg.upload_budget_bps = bps;
+                if bps > 0 {
+                    let burst =
+                        (bps as f64 / 8.0 * 0.5).max(2.0 * self.eng.seg_bytes as f64);
+                    self.upload_tokens = self.upload_tokens.min(burst);
+                }
+            }
             EngineEvent::Tick => self.on_tick(),
             EngineEvent::Stop => {}
         }
@@ -712,6 +730,16 @@ impl MeshNode {
         let head = self.sink.on_play_head();
         if head > self.eng.play_seq {
             self.eng.play_seq = head;
+        }
+
+        // A live SEED has no player advancing the cursor — pin it near the live edge
+        // so the picker keeps fetching the fresh window (a stale cache serves nobody)
+        // and the prune below keeps memory bounded as the stream runs on.
+        if matches!(self.eng.cfg.role, Role::Seed) && matches!(self.eng.cfg.mode, Mode::Live) {
+            let follow = self.eng.head_seq.saturating_sub(self.eng.cfg.window as Seq / 2);
+            if follow > self.eng.play_seq {
+                self.eng.play_seq = follow;
+            }
         }
 
         // Live viewers slide their retention window with playback: prune the store
