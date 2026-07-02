@@ -12,6 +12,7 @@ import { updateSettingsStatus } from './settings.js';
 import { ensureSignedIn } from './onboarding.js';
 import { shareName } from './publish.js';
 import { toggleFullscreen } from '../main.js';
+import { refreshFastAvailability, stopFastTier } from '../fasttier.js';
 
 function materialize(){}   /* retained as a no-op — runFinding() still calls it */
 
@@ -55,6 +56,7 @@ function enterLiveFromFinding(){
   ttffFrozen=true; // freeze at the real time-to-first-frame; go() cancels the rAF
   go('live');
   if(S.watchTarget) setTitle(S.watchTarget,true);
+  refreshFastAvailability(); // the opt-in low-latency toggle becomes available
 }
 // The broadcast is over (terminal from the backend): tear the player down WITHOUT
 // leaveWatch (which also navigates to entry) and land on the ended scene. stop_watch
@@ -123,6 +125,8 @@ export function selfWatch(name){
   const vd=document.getElementById('vHealthDot'); if(vd) vd.dataset.h='good';
   set('peerCount','0'); const pd=document.querySelector('#pill .health-dot'); if(pd) pd.dataset.h='good';
   const mt=document.getElementById('modeText'); if(mt) mt.textContent='PREVIEW · you';
+  // No remote publisher to reach in a self-watch — the fast tier doesn't apply.
+  const fb=document.getElementById('fastBtn'); if(fb) fb.hidden=true;
   setVideo(S.pubHlsUrl);
 }
 
@@ -157,12 +161,12 @@ export async function enterWatch(){
   if(!ensureSignedIn()) return;
   let status = null;
   if(NATIVE && invoke){ try{ status = await invoke('watch_status'); }catch(e){} }
-  if(status){ document.getElementById('mPub').textContent = status.info.publisher; go('live'); setTitle(status.info.publisher, true); startWatchWatchdog(); setVideo(status.info.hls_url); }
+  if(status){ document.getElementById('mPub').textContent = status.info.publisher; go('live'); setTitle(status.info.publisher, true); startWatchWatchdog(); setVideo(status.info.hls_url); refreshFastAvailability(); }
   else { go('entry'); }
 }
 
 // Player teardown shared by Leave and the ended phase: kill the retry loop + every
 // ladder timer (clearWatchUi), stop and detach the media. Does NOT stop_watch.
-function cleanupVideo(){ const v=document.getElementById('vid'); clearInterval(v._retry); clearWatchUi(); try{ v.pause(); }catch(e){} v.removeAttribute('src'); v.style.display='none'; }
+function cleanupVideo(){ stopFastTier(); const fb=document.getElementById('fastBtn'); if(fb) fb.hidden=true; const v=document.getElementById('vid'); clearInterval(v._retry); clearWatchUi(); try{ v.pause(); }catch(e){} v.removeAttribute('src'); v.style.display='none'; }
 
 export async function leaveWatch(){ if(S.fsOn) toggleFullscreen(); if(window.__keepAwake) window.__keepAwake(false); if(NATIVE && invoke){ try{ await invoke('stop_watch'); }catch(e){} } cleanupVideo(); go('entry'); }

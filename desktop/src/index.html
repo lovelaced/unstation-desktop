@@ -189,8 +189,12 @@
       <div class="frame">
         <div class="video"></div>
         <video id="vid" muted playsinline></video>
+        <!-- Fast tier (opt-in, unverified): the publisher-direct WebRTC stream plays here,
+             on top of the verified mesh player, which keeps running warm underneath. -->
+        <video id="fastVid" muted playsinline hidden></video>
         <div class="grain"></div>
         <div class="live-tag"><span class="live-dot"></span>LIVE</div>
+        <div class="fast-badge" id="fastBadge" hidden>⚡ low-latency · unverified · direct</div>
         <div class="scrim"></div>
         <div class="catchup" id="catchup"><span class="spin"></span>Catching up…</div>
         <button class="sound-pill" id="soundPill" type="button" hidden>🔊 Tap for sound</button>
@@ -205,6 +209,7 @@
         <span class="chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 15 6-6 6 6"/></svg></span>
       </div>
       <button class="hud-btn" id="skipLiveBtn" type="button" hidden>Skip to live</button>
+      <button class="hud-btn fast-btn" id="fastBtn" type="button" title="Low-latency mode" aria-pressed="false" hidden><span class="fast-ico">⚡</span><span id="fastLabel">Low-latency</span></button>
       <button class="hud-btn" id="muteBtn" type="button" title="Unmute"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4V5Z"/><path d="m16 9 5 6M21 9l-5 6"/></svg></button>
       <button class="hud-btn" id="fsBtn" type="button" title="Fullscreen"><svg id="fsIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M21 16v3a2 2 0 0 1-2 2h-3M3 16v3a2 2 0 0 0 2 2h3"/></svg><span id="fsLabel">Fullscreen</span></button>
     </div>

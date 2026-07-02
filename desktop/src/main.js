@@ -8,6 +8,7 @@ import { applyStats, applyWatchPhase, enterWatch, leaveWatch, selfWatch, startWa
 import { enterGoLive, goLiveStart, endPublish, applyPublishState, updatePubHealth, applyPublishStats, applyPublishProgress } from './scenes/publish.js';
 import { beginPairing, pushChainIdentity, onboardingStatus, showRetry, resumeAfterSignIn, ensureSignedIn } from './scenes/onboarding.js';
 import { openSettings, updateSettingsStatus , applySeedStats } from './scenes/settings.js';
+import { applyFastAnswer, applyFastClosed } from './fasttier.js';
 import { parseInviteLink } from './invite.js';
 
 // G: keep the screen awake while something live is on screen (watch or publish).
@@ -109,6 +110,8 @@ async function boot(){
       await listen('publish-stats', e=>{ if(e.payload){ applyPublishStats(e.payload); const el=document.getElementById('pubViewers'); if(el) el.textContent=S.lastViewers; if(S.curState==='settings') updateSettingsStatus(); } });
       await listen('publish-hint', e=>{ const w=document.getElementById('pubWaiting'); const b=w&&w.querySelector('b'); if(b && e.payload && e.payload.message){ b.textContent=e.payload.message; } });
       await listen('seed-stats', e=>applySeedStats(e.payload));
+      await listen('fast-answer', e=>applyFastAnswer(e.payload));
+      await listen('fast-closed', ()=>applyFastClosed());
         await listen('mesh-status', e=>{ const p=e&&e.payload; if(!p) return; console.log('[mesh-status]', p.state, p.detail); S.chainState=p.state; S.chainDetail=p.detail||''; updatePubHealth(); if(S.curState==='settings') updateSettingsStatus(); if(p.state==='error'){ const b=document.querySelector('#pubWaiting b'); if(b && !document.getElementById('pubLive').hidden) b.textContent=p.detail; } });
     }catch(e){} }
     // Re-attach: if a publish session is still running in the backend (a webview

@@ -73,6 +73,13 @@ export const STRINGS = {
   whipStep3: 'Recommended: keyframe interval 1s, CBR, B-frames 0, preset veryfast.',
   whipWaitingHint: 'In OBS 30+, set Service to WHIP and paste the URL above — or run scripts/mock-whip.sh. It goes live on its own.',
 
+  // Fast tier (opt-in, unverified, sub-second WebRTC media, direct from the broadcaster).
+  fastOff: 'Low-latency',
+  fastConnecting: 'Connecting…',
+  fastOn: 'Low-latency · on',
+  fastBadge: '⚡ low-latency · unverified · direct',
+  fastUnavailable: 'Low-latency unavailable — on the verified stream',
+
   // Camera-permission recovery (mobile publish).
   camPermHelp: 'Unstation needs camera access to go live. Allow it in Settings, then try again.',
   camStarting: 'Starting your camera…',
