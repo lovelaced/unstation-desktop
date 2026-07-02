@@ -24,7 +24,7 @@ use unstation_core::chat_codec;
 use unstation_core::signaling::{
     LiveEdge, Presence, PresenceRecord, SignalMsg, Signaling, Subscription, TopicId,
 };
-use unstation_core::topic::{discovery_topic, edge_topic, shard_for, signaling_topic};
+use unstation_core::topic::{discovery_topic, durable_topic, edge_topic, shard_for, signaling_topic};
 use unstation_core::types::{PeerId, SegmentId, Seq, StreamId};
 use unstation_core::BoxFuture;
 
@@ -393,6 +393,45 @@ impl ChainSignaling {
 
     /// Read the live-edge manifest, merging every published statement on the edge
     /// topic into one `(seq → content-id)` view.
+    /// Publisher: post the rolling durable-copy map — `(seq → Bulletin CID)` for the
+    /// sparse segments uploaded to the durable floor (TECH_SPEC §8.6) — so a viewer
+    /// whose deadline no peer can meet knows where to fetch from.
+    pub async fn publish_durable(
+        &self,
+        entries: Vec<(Seq, String)>,
+    ) -> unstation_core::Result<()> {
+        let topic = durable_topic(&self.stream);
+        let raw: Vec<(u64, Vec<u8>)> =
+            entries.into_iter().map(|(s, cid)| (s, cid.into_bytes())).collect();
+        let data = raw.encode();
+        tokio::task::spawn_blocking(move || ss::submit_fixed_topic(topic, &[topic], &data, 0))
+            .await
+            .map_err(err)?
+            .map_err(err)
+    }
+
+    /// Viewer: read the durable-copy map (merged newest-wins across statements).
+    pub async fn read_durable(&self) -> unstation_core::Result<Vec<(Seq, String)>> {
+        let topic = durable_topic(&self.stream);
+        let statements = tokio::task::spawn_blocking(move || ss::rpc_get_broadcasts(&[topic]))
+            .await
+            .map_err(err)?
+            .map_err(err)?;
+        let mut merged: std::collections::BTreeMap<Seq, String> = std::collections::BTreeMap::new();
+        for st in statements {
+            if let Ok(raw) = <Vec<(u64, Vec<u8>)>>::decode(&mut &st.data[..]) {
+                for (seq, cid) in raw {
+                    if cid.len() <= 256 {
+                        if let Ok(c) = String::from_utf8(cid) {
+                            merged.insert(seq, c);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(merged.into_iter().collect())
+    }
+
     pub async fn read_edge(&self) -> unstation_core::Result<Vec<(Seq, SegmentId)>> {
         let topic = edge_topic(&self.stream);
         let statements = tokio::task::spawn_blocking(move || ss::rpc_get_broadcasts(&[topic]))

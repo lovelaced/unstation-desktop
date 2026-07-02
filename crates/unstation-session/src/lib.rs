@@ -238,6 +238,46 @@ impl Session {
         })
     }
 
+    /// Publisher: republish the rolling durable-copy map — `(seq → Bulletin CID)` for
+    /// the sparse segments the app uploads to the durable floor (TECH_SPEC §8.6).
+    /// Mirrors [`Session::spawn_edge_publisher`]; abort the handle on teardown.
+    pub fn spawn_durable_publisher(
+        &self,
+        mut cid_rx: UnboundedReceiver<(Seq, String)>,
+    ) -> tokio::task::JoinHandle<()> {
+        const DURABLE_WINDOW: usize = 16; // ~1 KB of CIDs — well inside a statement
+        let signaling = self.signaling.clone();
+        tokio::spawn(async move {
+            let mut window: BTreeMap<Seq, String> = BTreeMap::new();
+            let mut tick = interval(Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                let mut dirty = false;
+                while let Ok((seq, cid)) = cid_rx.try_recv() {
+                    window.insert(seq, cid);
+                    dirty = true;
+                    while window.len() > DURABLE_WINDOW {
+                        if let Some(&oldest) = window.keys().next() {
+                            window.remove(&oldest);
+                        }
+                    }
+                }
+                if dirty && !window.is_empty() {
+                    let entries: Vec<(Seq, String)> =
+                        window.iter().map(|(s, c)| (*s, c.clone())).collect();
+                    if let Err(e) = signaling.publish_durable(entries).await {
+                        log::warn!("[session] publish_durable: {e}");
+                    }
+                }
+            }
+        })
+    }
+
+    /// Viewer: the current durable-copy map (seq → Bulletin CID) for this stream.
+    pub async fn read_durable(&self) -> unstation_core::Result<Vec<(Seq, String)>> {
+        self.signaling.read_durable().await
+    }
+
     /// Viewer: poll presence across all discovery shards until a publisher (any peer
     /// that isn't us) appears, and return its full presence record — including the
     /// signed-manifest CID the viewer fetches + verifies before trusting the stream.

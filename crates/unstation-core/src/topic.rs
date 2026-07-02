@@ -34,6 +34,16 @@ pub fn edge_topic(stream: &StreamId) -> TopicId {
     blake2b256(&buf)
 }
 
+/// Durable-copy map topic: `BLAKE2b-256("durable" ‖ stream_id)`. The publisher posts
+/// rolling `(seq → Bulletin CID)` entries here so a viewer whose deadline no peer can
+/// meet can fetch the segment from the durable floor (TECH_SPEC §8.6).
+pub fn durable_topic(stream: &StreamId) -> TopicId {
+    let mut buf = Vec::with_capacity(7 + 32);
+    buf.extend_from_slice(b"durable");
+    buf.extend_from_slice(&stream.0);
+    blake2b256(&buf)
+}
+
 /// Which discovery shard a peer announces into: `peer_id mod N_shards`.
 pub fn shard_for(peer: &PeerId, n_shards: u32) -> u32 {
     if n_shards <= 1 {

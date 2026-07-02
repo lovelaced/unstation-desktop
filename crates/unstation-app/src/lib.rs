@@ -366,6 +366,49 @@ async fn start_watch(
     // once a second; the UI stats task below reads the latest.
     let (stats_tx, stats_rx) = tokio::sync::watch::channel(unstation_core::node::NodeStats::default());
 
+    // The durable floor (TECH_SPEC §8.6): when no peer can meet a deadline, look the
+    // segment up in the publisher's durable map (seq → Bulletin CID, cached; refreshed
+    // at most every 2s on a miss) and fetch it from Bulletin. The node re-verifies
+    // whatever comes back against the authenticated content id.
+    let fallback: unstation_core::node::FallbackFetch = {
+        let s = session.clone();
+        let map: Arc<Mutex<HashMap<Seq, String>>> = Arc::new(Mutex::new(HashMap::new()));
+        let last_refresh: Arc<Mutex<Option<std::time::Instant>>> = Arc::new(Mutex::new(None));
+        Arc::new(move |seq, _id| {
+            let s = s.clone();
+            let map = map.clone();
+            let last_refresh = last_refresh.clone();
+            Box::pin(async move {
+                let cached =
+                    map.lock().unwrap_or_else(|e| e.into_inner()).get(&seq).cloned();
+                let cid = match cached {
+                    Some(c) => c,
+                    None => {
+                        // Refresh the map at most every 2s across concurrent fetches.
+                        let due = {
+                            let mut g = last_refresh.lock().unwrap_or_else(|e| e.into_inner());
+                            let due = g.map_or(true, |t| t.elapsed() >= Duration::from_secs(2));
+                            if due {
+                                *g = Some(std::time::Instant::now());
+                            }
+                            due
+                        };
+                        if !due {
+                            return None;
+                        }
+                        let entries = s.read_durable().await.ok()?;
+                        let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
+                        for (sq, c) in entries {
+                            g.insert(sq, c);
+                        }
+                        g.get(&seq).cloned()?
+                    }
+                };
+                BulletinOrigin.fetch_bytes(&cid).await.ok()
+            })
+        })
+    };
+
     // Real viewer node: starts with no known segments; the live-edge poller feeds
     // it `LiveEdge { seq, id }` so it knows what to fetch and how to verify it.
     let viewer = MeshNode::new_viewer(
@@ -384,6 +427,7 @@ async fn start_watch(
     .with_presence_book(session.presence_book())
     // Convictions (forged bytes, floods) bar re-dials + offers at the session edge.
     .with_ban_list(session.ban_list())
+    .with_fallback(fallback)
     .with_stats(stats_tx);
     let mut tasks = Vec::new();
     tasks.push(tokio::spawn(async move {
@@ -536,6 +580,7 @@ async fn start_watch(
         let s = session.clone();
         let appc = app.clone();
         tasks.push(tokio::spawn(async move {
+            let mut last_from_origin = 0usize;
             loop {
                 let peers = s.peer_count();
                 if peers == 0 {
@@ -545,18 +590,25 @@ async fn start_watch(
                     );
                 }
                 let ns = stats_rx.borrow().clone();
+                // "Leaning on the backup copy" is the honest amber state: the durable
+                // floor served segments since the last sample.
+                let leaning = ns.from_origin > last_from_origin;
+                last_from_origin = ns.from_origin;
+                let rho = if ns.delivered > 0 {
+                    (100 * ns.delivered.saturating_sub(ns.from_origin) / ns.delivered) as u32
+                } else {
+                    0
+                };
                 let _ = appc.emit(
                     "mesh-stats",
                     MeshStatsMsg {
                         peers,
-                        // All delivered bytes come from peers today (seed/Bulletin
-                        // segment fallback isn't in the fetch path yet).
-                        rho: if ns.delivered > 0 { 100 } else { 0 },
+                        rho,
                         from_seed: 0,
-                        from_chain: 0,
+                        from_chain: ns.from_origin as u32,
                         latency_s: ns.latency_s,
                         ice: if peers > 0 { "direct".into() } else { "connecting".into() },
-                        mode: "p2p".into(),
+                        mode: if leaning { "seed".into() } else { "p2p".into() },
                         delivered: ns.delivered,
                     },
                 );
@@ -701,6 +753,55 @@ fn watch_status(state: State<'_, AppState>) -> Option<WatchStatus> {
 /// init segment (filled into `init_slot` by the feeder), puts it on Bulletin, references it in
 /// the manifest's `init_segment_cid`, signs, and publishes — spawned so a slow chain never
 /// blocks going live. Shared by the desktop (ffmpeg) and Android (camera) publish paths.
+/// Sparse durable-floor uploads (TECH_SPEC §8.6): every Nth produced segment goes to
+/// Bulletin within a byte budget, and its `(seq → CID)` entry is announced on the
+/// durable topic so a viewer whose deadline no peer can meet can fetch it there.
+/// Sparse is the point — the metered allowance is scarce. Tunables:
+/// `UNSTATION_DURABLE_EVERY` (default 5; 0 disables) and
+/// `UNSTATION_DURABLE_BUDGET_MB` (default 50, per stream).
+#[cfg(feature = "publish")]
+fn spawn_durable_uploader(
+    session: &Session,
+    mut seg_rx: tokio::sync::mpsc::UnboundedReceiver<(Seq, Bytes)>,
+) -> Vec<JoinHandle<()>> {
+    let every: u64 = std::env::var("UNSTATION_DURABLE_EVERY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let budget: u64 = std::env::var("UNSTATION_DURABLE_BUDGET_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50)
+        * 1024
+        * 1024;
+    let (cid_tx, cid_rx) = unbounded_channel::<(Seq, String)>();
+    let map_task = session.spawn_durable_publisher(cid_rx);
+    let up_task = tokio::spawn(async move {
+        if every == 0 {
+            return;
+        }
+        let mut spent: u64 = 0;
+        while let Some((seq, bytes)) = seg_rx.recv().await {
+            if seq % every != 0 {
+                continue;
+            }
+            if spent + bytes.len() as u64 > budget {
+                log::info!("[durable] budget exhausted ({spent} B) — no further uploads this stream");
+                break;
+            }
+            match BulletinOrigin.put_bytes(bytes.to_vec()).await {
+                Ok(cid) => {
+                    spent += bytes.len() as u64;
+                    log::info!("[durable] seq={seq} → Bulletin {cid} ({spent} B of budget used)");
+                    let _ = cid_tx.send((seq, cid));
+                }
+                Err(e) => log::warn!("[durable] seq={seq} upload failed: {e:?}"),
+            }
+        }
+    });
+    vec![map_task, up_task]
+}
+
 /// Publisher dashboard numbers, every 2s: live viewer count plus ingest/uplink
 /// bitrates from windowed byte deltas (feeder meter / the node's sent_bytes stat).
 #[cfg(feature = "publish")]
@@ -908,6 +1009,10 @@ async fn start_publish(
     // turns the delta into a bitrate for the publisher dashboard).
     let ingest_bytes = Arc::new(AtomicU64::new(0));
 
+    // Durable floor (TECH_SPEC §8.6): sparse segment uploads + the (seq → CID) map.
+    let (dur_tx, dur_rx) = unbounded_channel::<(Seq, Bytes)>();
+    tasks.extend(spawn_durable_uploader(&session, dur_rx));
+
     // Feeder: tail the ingest dir → preview sink + the publisher's mesh seed +
     // the live-edge manifest. Emits `publish-state` and keeps `live_flag` current so
     // a re-attaching UI can read the true live state via `publish_status`.
@@ -971,6 +1076,7 @@ async fn start_publish(
                         for s in news {
                             ingest_w.fetch_add(s.bytes.len() as u64, Ordering::Relaxed);
                             preview.push_segment(s.seq, s.bytes.clone());
+                            let _ = dur_tx.send((s.seq, s.bytes.clone())); // sparse durable floor
                             let _ = ptx.send(EngineEvent::Produced { seq: s.seq, id: s.id, bytes: s.bytes });
                             let _ = edge_tx.send((s.seq, s.id));
                             seen = s.seq + 1;
@@ -1091,6 +1197,10 @@ async fn start_publish(
     // Camera → CMAF byte meter for the dashboard's ingest bitrate.
     let ingest_bytes = Arc::new(AtomicU64::new(0));
 
+    // Durable floor (TECH_SPEC §8.6): sparse segment uploads + the (seq → CID) map.
+    let (dur_tx, dur_rx) = unbounded_channel::<(Seq, Bytes)>();
+    tasks.extend(spawn_durable_uploader(&session, dur_rx));
+
     // Feeder: drain encoded AUs from the camera plugin → mux to CMAF → the three sinks
     // (self-preview, mesh `Produced`, live edge), exactly like the ffmpeg feeder's tail.
     let ptx = pub_tx.clone();
@@ -1144,6 +1254,7 @@ async fn start_publish(
                 log::info!("[publish] fragment seq={} ({} B)", seg.seq, seg.bytes.len());
                 ingest_w.fetch_add(seg.bytes.len() as u64, Ordering::Relaxed);
                 preview.push_segment(seg.seq, seg.bytes.clone());
+                let _ = dur_tx.send((seg.seq, seg.bytes.clone())); // sparse durable floor
                 let _ = ptx.send(EngineEvent::Produced { seq: seg.seq, id: seg.id, bytes: seg.bytes });
                 let _ = edge_tx.send((seg.seq, seg.id));
             }

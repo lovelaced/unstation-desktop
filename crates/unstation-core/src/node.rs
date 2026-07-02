@@ -136,6 +136,16 @@ pub trait EdgeSigner: Send + Sync {
     fn sign(&self, payload: &[u8]) -> [u8; 64];
 }
 
+/// Async fetch from the durable floor (TECH_SPEC §8.6) — Bulletin, or any other
+/// origin the app wires up: given a deadline-missing segment's seq and authenticated
+/// content id, resolve its bytes (or `None`). Injected by the app layer so the engine
+/// stays chain-free; the node re-verifies whatever comes back before accepting it.
+pub type FallbackFetch =
+    Arc<dyn Fn(Seq, SegmentId) -> crate::BoxFuture<'static, Option<Bytes>> + Send + Sync>;
+
+/// Concurrent durable-floor fetches — a panic-zone burst must not stampede the chain.
+const MAX_FALLBACK_INFLIGHT: usize = 3;
+
 /// Choose which peers to unchoke (serve) this round — the pure core of the upload-slot
 /// manager, separated for testability. Viewers reward reciprocation (rank by the
 /// throughput a peer has given US); seeds/publishers spread by proximity (lowest RTT).
@@ -208,6 +218,9 @@ pub struct NodeStats {
     /// dashboard's real "you're carrying N kbps" number). The off-loop disk-serve
     /// path isn't counted; the app's live nodes are memory-only, so nothing is missed.
     pub sent_bytes: u64,
+    /// Segments delivered by the durable floor (TECH_SPEC §8.6) rather than a peer —
+    /// the UI's honest "leaning on the backup copy" signal.
+    pub from_origin: usize,
     pub hash_failures: u64,
     /// Live-edge lag in seconds: `(head_seq − play_seq) × seg_ms` — how far behind
     /// the newest known segment playback currently is. The real number the UI's
@@ -303,6 +316,12 @@ pub struct MeshNode {
     /// Optional live stats feed (see [`MeshNode::with_stats`]).
     stats_tx: Option<tokio::sync::watch::Sender<NodeStats>>,
     last_stats_ms: u64,
+    /// Durable-floor fetch hook (see [`MeshNode::with_fallback`]) + its in-flight set
+    /// and the channel completed fetches re-enter the actor loop through.
+    fallback: Option<FallbackFetch>,
+    fallback_inflight: HashSet<Seq>,
+    fallback_tx: tokio::sync::mpsc::UnboundedSender<(Seq, SegmentId, Option<Bytes>)>,
+    fallback_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(Seq, SegmentId, Option<Bytes>)>>,
     /// Floor of the last live-window prune, so the per-tick prune only does work
     /// (store + id map + buffer map) when the play head actually advanced.
     last_prune_floor: Seq,
@@ -393,6 +412,7 @@ impl MeshNode {
             0.0
         };
         let preloaded = eng.local.count(); // a genesis-seed publisher starts full
+        let (fallback_tx, fallback_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             me,
             eng,
@@ -425,6 +445,10 @@ impl MeshNode {
             delivered_total: preloaded,
             stats_tx: None,
             last_stats_ms: 0,
+            fallback: None,
+            fallback_inflight: HashSet::new(),
+            fallback_tx,
+            fallback_rx: Some(fallback_rx),
             last_prune_floor: 0,
             stats: NodeStats::default(),
         }
@@ -473,6 +497,15 @@ impl MeshNode {
     /// live-edge lag — instead of fabricated placeholders.
     pub fn with_stats(mut self, tx: tokio::sync::watch::Sender<NodeStats>) -> Self {
         self.stats_tx = Some(tx);
+        self
+    }
+
+    /// Wire the durable floor (TECH_SPEC §8.6): when the picker's panic zone finds no
+    /// peer able to meet a deadline, the node fetches the segment through this hook
+    /// instead of stalling. Flips the picker's `bulletin_available` escalation on.
+    pub fn with_fallback(mut self, fetch: FallbackFetch) -> Self {
+        self.fallback = Some(fetch);
+        self.eng.bulletin_available = true;
         self
     }
 
@@ -526,6 +559,12 @@ impl MeshNode {
         let tick_ms = tick.as_millis() as u64;
         let mut ticker = tokio::time::interval(tick);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Completed durable-floor fetches re-enter the actor loop through this channel
+        // (the sender half stays on `self`, so `recv` never yields `None`).
+        let mut fallback_rx = match self.fallback_rx.take() {
+            Some(rx) => rx,
+            None => tokio::sync::mpsc::unbounded_channel().1,
+        };
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
@@ -538,6 +577,7 @@ impl MeshNode {
                         Some(e) => self.on_event(e),
                     }
                 }
+                Some((seq, id, bytes)) = fallback_rx.recv() => self.on_fallback(seq, id, bytes),
             }
             if let Some(target) = stop_at_count {
                 // Monotonic: a live viewer prunes its window, so `local.count()` shrinks.
@@ -836,31 +876,80 @@ impl MeshNode {
             }
         }
 
-        // Run the picker and issue Wants to peers.
+        // Run the picker and issue Wants to peers (and, when the panic zone finds no
+        // peer able to meet a deadline, escalate to the durable floor).
         let reqs = self.eng.plan(self.now_ms, &mut self.rng);
         for r in reqs {
-            if let Source::Peer(pid) = r.source {
-                if self.pending.contains_key(&r.seq) {
-                    continue;
-                }
-                // Don't waste a Want on a peer that's choking us.
-                if self.eng.peers.get(&pid).map(|p| p.choked_by).unwrap_or(false) {
-                    continue;
-                }
-                if let Some(link) = self.links.get(&pid).cloned() {
-                    let want = MeshMsg::Want {
-                        segment_seqs: vec![r.seq],
-                        deadline_hint_ms: 0,
-                    };
-                    link.send(Channel::Ctrl, want.encode());
-                    log::info!("[mesh] → Want seq={} to {:?}", r.seq, pid);
-                    self.pending.insert(r.seq, (pid, self.now_ms));
-                    if let Some(p) = self.eng.peers.get_mut(&pid) {
-                        p.pending_bytes = p.pending_bytes.saturating_add(self.eng.seg_bytes);
+            match r.source {
+                Source::Peer(pid) => {
+                    if self.pending.contains_key(&r.seq) {
+                        continue;
+                    }
+                    // Don't waste a Want on a peer that's choking us.
+                    if self.eng.peers.get(&pid).map(|p| p.choked_by).unwrap_or(false) {
+                        continue;
+                    }
+                    if let Some(link) = self.links.get(&pid).cloned() {
+                        let want = MeshMsg::Want {
+                            segment_seqs: vec![r.seq],
+                            deadline_hint_ms: 0,
+                        };
+                        link.send(Channel::Ctrl, want.encode());
+                        log::info!("[mesh] → Want seq={} to {:?}", r.seq, pid);
+                        self.pending.insert(r.seq, (pid, self.now_ms));
+                        if let Some(p) = self.eng.peers.get_mut(&pid) {
+                            p.pending_bytes =
+                                p.pending_bytes.saturating_add(self.eng.seg_bytes);
+                        }
                     }
                 }
+                // TECH_SPEC §8.6: the deadline is about to be missed and no peer can
+                // help — fetch from the durable floor instead of stalling. A stale
+                // `pending` entry does NOT block this (that slow peer is the reason
+                // we're here); delivery clears it and releases the peer's budget.
+                Source::Bulletin | Source::Seed => self.request_fallback(r.seq),
             }
         }
+    }
+
+    /// Kick off one bounded, off-loop durable-floor fetch for `seq` (see
+    /// [`MeshNode::with_fallback`]). Requires the authenticated id — bytes from
+    /// untrusted storage are only accepted if they hash to it.
+    fn request_fallback(&mut self, seq: Seq) {
+        let Some(fetch) = self.fallback.clone() else { return };
+        if self.fallback_inflight.contains(&seq)
+            || self.fallback_inflight.len() >= MAX_FALLBACK_INFLIGHT
+        {
+            return;
+        }
+        let Some(id) = self.segment_ids.get(&seq).copied() else { return };
+        self.fallback_inflight.insert(seq);
+        let tx = self.fallback_tx.clone();
+        log::info!("[fallback] seq={seq} → durable floor");
+        tokio::spawn(async move {
+            let bytes = fetch(seq, id).await;
+            let _ = tx.send((seq, id, bytes));
+        });
+    }
+
+    /// A durable-floor fetch completed — verify and deliver (the receive half of the
+    /// TECH_SPEC §8.6 escalation).
+    fn on_fallback(&mut self, seq: Seq, id: SegmentId, bytes: Option<Bytes>) {
+        self.fallback_inflight.remove(&seq);
+        let Some(b) = bytes else { return };
+        if self.eng.local.has(seq) {
+            return; // a peer beat the floor to it — fine
+        }
+        // Re-verify: the hook is app code and the floor is untrusted storage.
+        if !crypto::verify_segment(&b, &id) {
+            log::warn!("[fallback] seq={seq} bytes from the durable floor failed verification");
+            return;
+        }
+        // Release any in-flight peer request for this seq (the slow peer's budget).
+        self.clear_pending(seq);
+        self.stats.from_origin += 1;
+        log::info!("[fallback] seq={seq} delivered from the durable floor ({} B)", b.len());
+        self.deliver_verified(seq, id, b);
     }
 
     fn on_inbound(&mut self, peer: PeerId, _channel: Channel, bytes: &[u8]) {
@@ -1199,13 +1288,6 @@ impl MeshNode {
     fn accept_segment(&mut self, peer: PeerId, seq: Seq, id: SegmentId, b: Bytes) {
         let n = b.len();
         self.stats.peer_bytes += n as u64;
-        self.eng.store.insert(seq, id, b.clone());
-        if !self.eng.local.has(seq) {
-            self.delivered_total += 1;
-        }
-        self.eng.local.set(seq);
-        log::info!("[seg] seq={seq} verified → sink ({n} B)");
-        self.sink.push_segment(seq, b);
         // Real throughput: bytes delivered / time since we asked (push deliveries have no
         // matching `pending` entry, so they just don't update the estimate — correct).
         // `clear_pending` releases the ASKED peer's byte budget, which may not be the
@@ -1227,6 +1309,20 @@ impl MeshNode {
                 p.reputation = (p.reputation + REPUTATION_HEAL).min(1.0);
             }
         }
+        self.deliver_verified(seq, id, b);
+    }
+
+    /// Store a verified segment, feed the player, and reshare it to subscribers —
+    /// the source-agnostic tail of every delivery (peer, push, or durable floor).
+    fn deliver_verified(&mut self, seq: Seq, id: SegmentId, b: Bytes) {
+        let n = b.len();
+        self.eng.store.insert(seq, id, b.clone());
+        if !self.eng.local.has(seq) {
+            self.delivered_total += 1;
+        }
+        self.eng.local.set(seq);
+        log::info!("[seg] seq={seq} verified → sink ({n} B)");
+        self.sink.push_segment(seq, b);
         self.push_to_subscribers(seq);
     }
 
