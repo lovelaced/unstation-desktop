@@ -72,15 +72,19 @@ export function applyWatchPhase(p){
   const watching = ['live','seed','catchup'].includes(S.curState);
   if(!finding && !watching) return; // stale event after leaving the watch
   if(finding && !ttffSynced && typeof p.since_ms==='number'){ ttffStart=performance.now()-p.since_ms; ttffSynced=true; }
+  // A live "time to first frame" only makes sense while a frame is plausibly imminent.
+  // On the forward phases keep it visible; on `unreachable` there IS no imminent frame,
+  // so a counter climbing past 100s reads as broken, not reassuring — hide it.
+  const showTtff=(on)=>{ const el=document.getElementById('ttff'); if(el&&el.parentElement) el.parentElement.style.visibility=on?'':'hidden'; };
   switch(p.phase){
-    case 'resolving':   if(finding) setFindingStep('resolve'); break;
-    case 'verifying':   if(finding) setFindingStep('verify'); break;
+    case 'resolving':   if(finding){ showTtff(true); setFindingStep('resolve'); } break;
+    case 'verifying':   if(finding){ showTtff(true); setFindingStep('verify'); } break;
     case 'discovering':
     case 'connecting':
-      if(finding){ setFindingStep('peers'); findingCopy(STRINGS.joiningEyebrow,STRINGS.joiningTitle,STRINGS.joiningSub); }
+      if(finding){ showTtff(true); setFindingStep('peers'); findingCopy(STRINGS.joiningEyebrow,STRINGS.joiningTitle,STRINGS.joiningSub); }
       break;
     case 'buffering':
-      if(finding){ setFindingStep('first'); findingCopy(STRINGS.joiningEyebrow,STRINGS.joiningTitle,STRINGS.joiningSub); }
+      if(finding){ showTtff(true); setFindingStep('first'); findingCopy(STRINGS.joiningEyebrow,STRINGS.joiningTitle,STRINGS.joiningSub); }
       break;
     case 'live':
       if(finding) enterLiveFromFinding();
@@ -90,9 +94,10 @@ export function applyWatchPhase(p){
       if(watching) setCatchup('<span class="spin"></span>'+STRINGS.catchingUp);
       break;
     case 'unreachable':
-      // Non-terminal: the backend keeps retrying — say so honestly, keep the TTFF
-      // ticking, and let a later phase resume the steps.
-      if(finding) findingCopy(STRINGS.unreachableEyebrow,STRINGS.unreachableTitle,STRINGS.unreachableSub);
+      // Non-terminal: the backend keeps retrying, so the steps stay and a later phase
+      // resumes them — but hide the TTFF counter (no frame is imminent; a climbing
+      // "130 s to first frame" reads as broken).
+      if(finding){ showTtff(false); findingCopy(STRINGS.unreachableEyebrow,STRINGS.unreachableTitle,STRINGS.unreachableSub); }
       break;
     case 'ended':
       endWatchToEnded();
