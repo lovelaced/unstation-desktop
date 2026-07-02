@@ -171,7 +171,7 @@ fn negotiate(
             .map_err(|e| format!("parse offer: {e}"))?;
 
     let (gathered_tx, gathered_rx) = std::sync::mpsc::sync_channel::<()>(1);
-    let conf = RtcConfig::new(stun);
+    let conf = rtc_config(stun);
     let mut pc = RtcPeerConnection::new(&conf, Conn { gathered: gathered_tx })
         .map_err(|e| format!("pc create: {e}"))?;
 
@@ -248,6 +248,18 @@ fn video_mline(sdp: &str) -> Option<(String, i32)> {
 
 fn header(k: &str, v: &str) -> tiny_http::Header {
     tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()).expect("valid header")
+}
+
+/// ICE config. Mirrors transport-libdc: libjuice excludes 127.0.0.1 host candidates
+/// (RFC 8445), so a same-host WHIP client (ffmpeg/tests) never connects unless we bind
+/// an explicit address. Set `UNSTATION_BIND_ADDR=127.0.0.1` for local/CI; production
+/// leaves it unset and gathers all interfaces.
+fn rtc_config(stun: &[String]) -> RtcConfig {
+    let cfg = RtcConfig::new(stun);
+    match std::env::var("UNSTATION_BIND_ADDR") {
+        Ok(addr) if !addr.is_empty() => cfg.bind_address(&addr),
+        _ => cfg,
+    }
 }
 
 #[cfg(test)]
