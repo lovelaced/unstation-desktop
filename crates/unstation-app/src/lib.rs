@@ -388,9 +388,12 @@ async fn start_watch(
     emit_phase("resolving", "", &watch_started);
 
     // Localhost HLS re-server → the webview <video> plays from here.
+    // Start in standard mode; if the verified manifest advertises `ll_mode`, the candidate
+    // filter flips the re-server to low-latency (before any media fragment is delivered).
     let hls = HlsServer::start(1000).map_err(|e| e.to_string())?;
     let hls_url = hls.url();
-    let sink: Arc<dyn MediaSink> = Arc::new(hls.sink());
+    let hls_sink = hls.sink();
+    let sink: Arc<dyn MediaSink> = Arc::new(hls_sink.clone());
     // A second handle to the SAME local HLS server so the dial loop can install the CMAF
     // init segment it fetches from Bulletin, alongside the media segments the node feeds.
     let sink_for_init = sink.clone();
@@ -570,6 +573,7 @@ async fn start_watch(
         let vtx = view_tx.clone();
         let appc = app.clone();
         let sink_init = sink_for_init.clone();
+        let sink_cfg = hls_sink.clone();
         let init_installed = Arc::new(AtomicBool::new(false));
         let phase = emit_phase.clone();
         let started = watch_started;
@@ -578,6 +582,7 @@ async fn start_watch(
                 let vtx = vtx.clone();
                 let appc = appc.clone();
                 let sink_init = sink_init.clone();
+                let sink_cfg = sink_cfg.clone();
                 let init_installed = init_installed.clone();
                 let phase = phase.clone();
                 Box::pin(async move {
@@ -590,6 +595,14 @@ async fn start_watch(
                             // Verified publisher → its personhood key is the trust
                             // anchor for gossiped live-edge announcements (#17).
                             let _ = vtx.send(EngineEvent::SetPublisherKey { key: cand.publisher });
+                            // Match the local re-server to the publisher's tier: LL-HLS parts
+                            // if advertised (`target_segment_ms` = part duration), else standard.
+                            // Idempotent + runs before the first fragment (init install follows).
+                            sink_cfg.configure(
+                                m.manifest.ll_mode,
+                                m.manifest.target_segment_ms,
+                                if m.manifest.ll_mode { 0 } else { m.manifest.target_segment_ms },
+                            );
                             if !init_installed.load(Ordering::Relaxed)
                                 && !m.manifest.init_segment_cid.is_empty()
                             {
@@ -1060,12 +1073,21 @@ fn spawn_publish_stats(
     })
 }
 
+/// CMAF part duration for the low-latency (LL-HLS) tier — the in-process muxer emits a part
+/// this often, and it's the `target_segment_ms` we advertise in the manifest so viewers run
+/// their local HLS re-server in LL mode too. ~250ms trades a little mesh overhead (more,
+/// smaller addressable units) for the ~1.5s glass-to-glass the LL path targets.
+#[cfg(feature = "publish")]
+const LL_PART_MS: u32 = 250;
+
 #[cfg(feature = "publish")]
 fn spawn_manifest_publish(
     app: AppHandle,
     session: &Session,
     stream: StreamId,
     init_slot: Arc<Mutex<Option<Bytes>>>,
+    // `Some(part_ms)` → advertise low-latency (LL-HLS) so viewers serve parts; `None` → standard.
+    ll_part_ms: Option<u32>,
 ) -> JoinHandle<()> {
     let session_mc = session.clone();
     tokio::spawn(async move {
@@ -1109,8 +1131,10 @@ fn spawn_manifest_publish(
             // TODO(M2.1): derive codec / track dims from the CMAF init.
             codec: "avc1.640028,mp4a.40.2".into(),
             init_segment_cid,
-            target_segment_ms: 2000,
-            ll_mode: false,
+            // LL: advertise the part duration so viewers run their re-server in LL mode.
+            // Standard: the ~2s segment cadence ffmpeg/RTMP produces.
+            target_segment_ms: ll_part_ms.unwrap_or(2000),
+            ll_mode: ll_part_ms.is_some(),
             tracks: vec![Track { id: "v".into(), bitrate: 0, w: 0, h: 0 }],
             publisher,
             created_at,
@@ -1174,8 +1198,15 @@ async fn start_publish(
     // Broadcasting owns the uplink — retire any background seed.
     teardown_seed(&state);
 
-    // Self-preview HLS + the publisher node inbox.
-    let hls = HlsServer::start(1000).map_err(|e| e.to_string())?;
+    // Self-preview HLS + the publisher node inbox. WHIP ingest muxes in-process, so it emits
+    // CMAF parts → run the re-server in low-latency mode. RTMP goes through ffmpeg (whole
+    // segments on disk) → standard mode.
+    let hls = if whip {
+        HlsServer::start_ll(1000, LL_PART_MS)
+    } else {
+        HlsServer::start(1000)
+    }
+    .map_err(|e| e.to_string())?;
     let hls_url = hls.url();
     let preview = hls.sink();
     let (pub_tx, pub_rx) = unbounded_channel::<EngineEvent>();
@@ -1225,7 +1256,13 @@ async fn start_publish(
     // publisher waits for it, puts it on Bulletin, and references it in the signed manifest so
     // viewers can initialize MSE before any media fragment.
     let init_slot: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
-    tasks.push(spawn_manifest_publish(app.clone(), &session, stream, init_slot.clone()));
+    tasks.push(spawn_manifest_publish(
+        app.clone(),
+        &session,
+        stream,
+        init_slot.clone(),
+        whip.then_some(LL_PART_MS),
+    ));
     let (edge_tx, edge_rx) = unbounded_channel::<(Seq, SegmentId)>();
     tasks.push(session.spawn_edge_publisher(edge_rx));
 
@@ -1297,12 +1334,11 @@ async fn start_publish(
                     if let Some((sps, pps)) = iu.config {
                         let (width, height) =
                             segmenter::sps::dimensions(&sps).unwrap_or((1280, 720));
-                        let mut builder = segmenter::FragmentBuilder::new(segmenter::H264Params {
-                            sps,
-                            pps,
-                            width,
-                            height,
-                        });
+                        // WHIP → low-latency: emit ~250ms CMAF parts, not whole GOPs.
+                        let builder = segmenter::FragmentBuilder::new_ll(
+                            segmenter::H264Params { sps, pps, width, height },
+                            LL_PART_MS,
+                        );
                         let init = builder.init_segment();
                         *init_slot_feeder.lock().unwrap_or_else(|e| e.into_inner()) =
                             Some(init.clone());
@@ -1489,8 +1525,9 @@ async fn start_publish(
     // Broadcasting owns the uplink — retire any background seed.
     teardown_seed(&state);
 
-    // Self-preview HLS + the publisher node inbox — identical to desktop.
-    let hls = HlsServer::start(1000).map_err(|e| e.to_string())?;
+    // Self-preview HLS + the publisher node inbox — identical to desktop. The camera path
+    // muxes in-process (like WHIP), so it emits CMAF parts → low-latency re-server.
+    let hls = HlsServer::start_ll(1000, LL_PART_MS).map_err(|e| e.to_string())?;
     let hls_url = hls.url();
     let preview = hls.sink();
     let (pub_tx, pub_rx) = unbounded_channel::<EngineEvent>();
@@ -1524,7 +1561,13 @@ async fn start_publish(
     tasks.push(session.spawn_presence(80_000_000, true, Arc::new(AtomicBool::new(true))));
 
     let init_slot: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
-    tasks.push(spawn_manifest_publish(app.clone(), &session, stream, init_slot.clone()));
+    tasks.push(spawn_manifest_publish(
+        app.clone(),
+        &session,
+        stream,
+        init_slot.clone(),
+        Some(LL_PART_MS),
+    ));
 
     let (edge_tx, edge_rx) = unbounded_channel::<(Seq, SegmentId)>();
     tasks.push(session.spawn_edge_publisher(edge_rx));
@@ -1559,12 +1602,16 @@ async fn start_publish(
             "[publish] camera config {}x{}, sps={}B pps={}B",
             config.width, config.height, config.sps.len(), config.pps.len()
         );
-        let mut fb = segmenter::FragmentBuilder::new(segmenter::H264Params {
-            sps: config.sps,
-            pps: config.pps,
-            width: config.width,
-            height: config.height,
-        });
+        // Low-latency: emit ~250ms CMAF parts (matches the WHIP path + the advertised manifest).
+        let mut fb = segmenter::FragmentBuilder::new_ll(
+            segmenter::H264Params {
+                sps: config.sps,
+                pps: config.pps,
+                width: config.width,
+                height: config.height,
+            },
+            LL_PART_MS,
+        );
         // Init segment → self-preview + the manifest publisher (Bulletin, via `init_slot`).
         let init = fb.init_segment();
         *init_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(init.clone());

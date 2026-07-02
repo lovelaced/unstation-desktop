@@ -19,7 +19,7 @@ use unstation_core::crypto::segment_id;
 use unstation_core::types::Seq;
 
 /// Video media timescale (ticks per second) used in the init + fragment timing.
-const TIMESCALE: u32 = 90_000;
+pub const TIMESCALE: u32 = 90_000;
 const VIDEO_TRACK_ID: u32 = 1;
 
 /// H.264 decoder configuration + display size, learned once from the encoder's codec-specific
@@ -45,6 +45,13 @@ struct Au {
 ///
 /// Feed AUs with [`push_au`](Self::push_au); each new keyframe closes the previous GOP and
 /// returns it as a [`Segment`]. Call [`flush`](Self::flush) to emit a trailing partial GOP.
+///
+/// In **low-latency mode** ([`new_ll`](Self::new_ll)) the builder additionally closes a
+/// fragment once the pending AUs reach a target duration (a *part*, ~200ms), even mid-GOP —
+/// so the mesh and player see fine-grained CMAF chunks instead of whole ~1s GOPs. Each part
+/// is still an ordinary independently-parseable fragment (its own `moof`+`mdat`); the part
+/// that *starts* with a keyframe is decode-independent, which the hls-server recovers from
+/// the bytes with [`fragment_is_independent`] — no side-channel needed.
 pub struct FragmentBuilder {
     params: H264Params,
     /// Next fragment sequence number (also the `Segment.seq` and `moof` `mfhd` sequence).
@@ -52,11 +59,23 @@ pub struct FragmentBuilder {
     /// `tfdt` base media decode time: total sample duration emitted in prior fragments.
     base_decode_time: u64,
     pending: Vec<Au>,
+    /// Sum of `pending` AU durations (ticks) — the length of the part being accumulated.
+    pending_ticks: u64,
+    /// LL mode: close a part once `pending_ticks` reaches this. `None` = one fragment per GOP.
+    part_ticks: Option<u32>,
 }
 
 impl FragmentBuilder {
     pub fn new(params: H264Params) -> Self {
-        Self { params, seq: 0, base_decode_time: 0, pending: Vec::new() }
+        Self { params, seq: 0, base_decode_time: 0, pending: Vec::new(), pending_ticks: 0, part_ticks: None }
+    }
+
+    /// Low-latency builder: also close a fragment every `part_ms` of media (a CMAF *part*),
+    /// not just on GOP boundaries. `part_ms` is clamped to ≥20ms; a GOP shorter than a part
+    /// still emits per-keyframe, so parts never straddle a keyframe.
+    pub fn new_ll(params: H264Params, part_ms: u32) -> Self {
+        let part_ticks = (part_ms.max(20) as u64 * TIMESCALE as u64 / 1000) as u32;
+        Self { part_ticks: Some(part_ticks), ..Self::new(params) }
     }
 
     /// The CMAF init segment (`ftyp` + `moov`). Stable for the stream; push it once to the
@@ -73,10 +92,22 @@ impl FragmentBuilder {
     /// are dropped (they live in the init's `avcC`). `duration` is in `TIMESCALE` ticks.
     /// Returns the just-closed GOP as a fragment when this AU starts a new one.
     pub fn push_au(&mut self, nal: &[u8], duration: u32, keyframe: bool) -> Option<Segment> {
+        // A keyframe closes the prior fragment (GOP or part) and starts a fresh, decode-
+        // independent one. This has priority over the part-cadence close below.
         let closed = if keyframe && !self.pending.is_empty() { self.emit() } else { None };
         let avcc = annexb_to_avcc(nal);
         if !avcc.is_empty() {
             self.pending.push(Au { avcc, duration, keyframe });
+            self.pending_ticks += duration as u64;
+        }
+        // LL mode: once the pending part reaches its target duration, close it mid-GOP. Skip
+        // if a keyframe already closed a fragment this call, so we return at most one segment.
+        if closed.is_none() {
+            if let Some(pt) = self.part_ticks {
+                if !self.pending.is_empty() && self.pending_ticks >= pt as u64 {
+                    return self.emit();
+                }
+            }
         }
         closed
     }
@@ -92,6 +123,7 @@ impl FragmentBuilder {
             return None;
         }
         let aus = std::mem::take(&mut self.pending);
+        self.pending_ticks = 0;
         let seq = self.seq;
         self.seq += 1;
 
@@ -154,6 +186,94 @@ fn iter_annexb_nals(data: &[u8]) -> Vec<&[u8]> {
         }
     }
     nals
+}
+
+/// Is this CMAF fragment decode-independent — i.e. does it start with a keyframe?
+///
+/// The LL-HLS server rolls parts into parent segments at keyframe boundaries and marks the
+/// leading part `INDEPENDENT=YES`; it recovers that purely from the fragment bytes (no
+/// side-channel over the mesh). A sync sample has the `sample_is_non_sync_sample` bit
+/// (0x0001_0000) clear — matching the flags [`FragmentBuilder`] writes (`0x0200_0000`
+/// keyframe vs `0x0101_0000` other). Returns `false` if the box structure isn't the shape we
+/// emit (be conservative — never claim independence we can't see).
+pub fn fragment_is_independent(fragment: &[u8]) -> bool {
+    fragment_info(fragment).map_or(false, |i| i.independent)
+}
+
+/// What the LL-HLS server needs to place a fragment (part) in a playlist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FragmentInfo {
+    /// Starts with a keyframe → a valid parent-segment boundary / `INDEPENDENT=YES` part.
+    pub independent: bool,
+    /// Total presentation duration in [`TIMESCALE`] (90kHz) ticks, summed from the `trun`.
+    pub duration_ticks: u64,
+}
+
+/// Parse a CMAF fragment's `moof → traf → {tfhd, trun}` for its independence + duration.
+/// `None` if the bytes aren't the fragment shape [`FragmentBuilder`] emits (e.g. an init
+/// segment, or garbage) — callers treat that as "not a placeable part".
+pub fn fragment_info(fragment: &[u8]) -> Option<FragmentInfo> {
+    let moof = find_box(fragment, b"moof")?;
+    let traf = find_box(moof, b"traf")?;
+    // tfhd (full box): its flags decide which optional fields are present; the ones we may
+    // fall back on are default-sample-duration (0x000008) and default-sample-flags (0x000020).
+    let (mut default_dur, mut default_flags) = (None, None);
+    if let Some(tfhd) = find_box(traf, b"tfhd") {
+        if tfhd.len() >= 4 {
+            let f = u32::from_be_bytes([0, tfhd[1], tfhd[2], tfhd[3]]);
+            let mut p = 4 + 4; // full-box header + track_id
+            if f & 0x000001 != 0 { p += 8; } // base-data-offset
+            if f & 0x000002 != 0 { p += 4; } // sample-description-index
+            if f & 0x000008 != 0 { if p + 4 <= tfhd.len() { default_dur = Some(u32::from_be_bytes([tfhd[p], tfhd[p+1], tfhd[p+2], tfhd[p+3]])); } p += 4; }
+            if f & 0x000010 != 0 { p += 4; } // default-sample-size
+            if f & 0x000020 != 0 && p + 4 <= tfhd.len() { default_flags = Some(u32::from_be_bytes([tfhd[p], tfhd[p+1], tfhd[p+2], tfhd[p+3]])); }
+        }
+    }
+    let trun = find_box(traf, b"trun")?;
+    if trun.len() < 8 { return None; }
+    let f = u32::from_be_bytes([0, trun[1], trun[2], trun[3]]);
+    let count = u32::from_be_bytes([trun[4], trun[5], trun[6], trun[7]]);
+    let mut p = 8;
+    if f & 0x000001 != 0 { p += 4; } // data-offset
+    let first_sample_flags = if f & 0x000004 != 0 { // first-sample-flags overrides sample 1
+        let v = (p + 4 <= trun.len()).then(|| u32::from_be_bytes([trun[p], trun[p+1], trun[p+2], trun[p+3]]));
+        p += 4;
+        v
+    } else { None };
+    // Per-sample record: the present fields, in this fixed order.
+    let (has_dur, has_size, has_flags, has_cto) =
+        (f & 0x000100 != 0, f & 0x000200 != 0, f & 0x000400 != 0, f & 0x000800 != 0);
+    let rec = 4 * (has_dur as usize + has_size as usize + has_flags as usize + has_cto as usize);
+    let mut duration_ticks: u64 = 0;
+    let mut leading_flags = first_sample_flags.or(default_flags);
+    for i in 0..count as usize {
+        let base = p + i * rec;
+        if base + rec > trun.len() { break; }
+        let mut q = base;
+        let dur = if has_dur { let d = u32::from_be_bytes([trun[q], trun[q+1], trun[q+2], trun[q+3]]); q += 4; d } else { default_dur.unwrap_or(0) };
+        duration_ticks += dur as u64;
+        if has_size { q += 4; }
+        if has_flags {
+            let sf = u32::from_be_bytes([trun[q], trun[q+1], trun[q+2], trun[q+3]]);
+            if i == 0 && first_sample_flags.is_none() { leading_flags = Some(sf); }
+        }
+    }
+    let independent = leading_flags.map_or(false, |fl| fl & 0x0001_0000 == 0);
+    Some(FragmentInfo { independent, duration_ticks })
+}
+
+/// Return the body (after the 8-byte header) of the first top-level box of type `typ` in `buf`.
+fn find_box<'a>(buf: &'a [u8], typ: &[u8; 4]) -> Option<&'a [u8]> {
+    let mut i = 0;
+    while i + 8 <= buf.len() {
+        let size = u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]) as usize;
+        if size < 8 || i + size > buf.len() { return None; }
+        if &buf[i + 4..i + 8] == typ {
+            return Some(&buf[i + 8..i + size]);
+        }
+        i += size;
+    }
+    None
 }
 
 // ---- ISO-BMFF box helpers -------------------------------------------------------------
@@ -478,6 +598,45 @@ mod tests {
         // Flush closes the second GOP as seq 1, with a monotonically advanced decode time.
         let seg2 = fb.flush().expect("second GOP emitted");
         assert_eq!(seg2.seq, 1);
+    }
+
+    #[test]
+    fn ll_mode_closes_parts_within_a_gop_and_marks_independence() {
+        // Part target 100ms = 9000 ticks; AUs are 4000 ticks each so parts don't fall on
+        // AU boundaries — exercising both the duration-triggered close and a keyframe closing
+        // a still-accumulating part.
+        let mut fb = FragmentBuilder::new_ll(params(), 100);
+        let idr = [0, 0, 0, 1, 0x65, 1, 2, 3, 4];
+        let p = [0, 0, 0, 1, 0x41, 9, 8, 7];
+        let dur = 4000;
+        // GOP 0 opens on the keyframe; the part closes once ≥9000 ticks accumulate (3rd AU).
+        assert!(fb.push_au(&idr, dur, true).is_none()); // 4000
+        assert!(fb.push_au(&p, dur, false).is_none());  // 8000
+        let part0 = fb.push_au(&p, dur, false).expect("part closes past 100ms"); // 12000 ≥ 9000
+        assert_eq!(part0.seq, 0);
+        assert!(fragment_is_independent(&part0.bytes), "leading part starts on the keyframe");
+        // Duration is recovered from the trun: three 4000-tick AUs = 12000 ticks.
+        assert_eq!(fragment_info(&part0.bytes).unwrap().duration_ticks, 12000);
+        // Two more P-frames leave an 8000-tick part still open (below the 9000 target)…
+        assert!(fb.push_au(&p, dur, false).is_none()); // 4000
+        assert!(fb.push_au(&p, dur, false).is_none()); // 8000
+        // …which the next keyframe closes as a P-only (non-independent) part before opening GOP 1.
+        let part1 = fb.push_au(&idr, dur, true).expect("keyframe closes the pending part");
+        assert_eq!(part1.seq, 1);
+        assert!(!fragment_is_independent(&part1.bytes), "mid-GOP part holds only P-frames");
+        // The trailing part begins with that keyframe → independent again.
+        let part2 = fb.flush().expect("final part");
+        assert_eq!(part2.seq, 2);
+        assert!(fragment_is_independent(&part2.bytes), "part opening on the new keyframe is independent");
+    }
+
+    #[test]
+    fn non_fragment_bytes_are_never_claimed_independent() {
+        assert!(!fragment_is_independent(&[]));
+        assert!(!fragment_is_independent(b"not a box at all, just text"));
+        let fb = FragmentBuilder::new(params());
+        // The init segment (ftyp+moov) has no moof → conservatively not independent.
+        assert!(!fragment_is_independent(&fb.init_segment()));
     }
 
     /// End-to-end: generate a REAL H.264 stream with ffmpeg, mux it through

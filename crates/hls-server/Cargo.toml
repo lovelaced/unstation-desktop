@@ -7,10 +7,12 @@ description = "Localhost HLS re-server: serves a dynamically-generated media pla
 
 [dependencies]
 unstation-core = { path = "../unstation-core" }
+# CMAF fragment introspection for LL-HLS: derive each part's keyframe-independence +
+# duration from the bytes (segmenter is featherweight — only unstation-core + bytes).
+segmenter = { path = "../../infra/segmenter" }
 bytes.workspace = true
 tiny_http = "0.12"
 
 [dev-dependencies]
-segmenter = { path = "../../infra/segmenter" }
 tokio.workspace = true
 tempfile = "3"

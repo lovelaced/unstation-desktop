@@ -3044,6 +3044,7 @@ name = "hls-server"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "segmenter",
  "tiny_http",
  "unstation-core",
 ]

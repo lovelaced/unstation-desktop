@@ -24,7 +24,7 @@ use unstation_core::types::{SegmentId, Seq};
 /// In-memory CMAF muxer for the non-ffmpeg (Android camera) publish path — see [`fmp4`].
 mod fmp4;
 pub mod sps;
-pub use fmp4::{FragmentBuilder, H264Params};
+pub use fmp4::{fragment_info, fragment_is_independent, FragmentBuilder, FragmentInfo, H264Params, TIMESCALE};
 
 /// A content-addressed CMAF segment.
 pub struct Segment {
