@@ -32,6 +32,10 @@ hls-server = { path = "../hls-server" }
 # ffmpeg/RTMP publish source — desktop-only; behind the `publish` feature. The Android
 # shell (watch) omits it; Android publish (M4) supplies a camera-based source instead.
 segmenter = { path = "../../infra/segmenter", optional = true }
+# WHIP ingest (RFC 9725, sub-second). The RTP depacketizer is light; the `server`
+# feature (media-enabled libdatachannel) is added for non-Android below — Android
+# publishes from the camera, not WHIP, so it stays on the light default.
+whip-ingest = { path = "../whip-ingest", optional = true }
 bytes = "1"
 
 # Real chain integration.
@@ -49,8 +53,13 @@ bip39 = { version = "2", features = ["rand"] }
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
 
+# Desktop pulls the WHIP server (media libdatachannel); Android doesn't (camera ingest).
+[target.'cfg(not(target_os = "android"))'.dependencies]
+whip-ingest = { path = "../whip-ingest", features = ["server"], optional = true }
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
-# RTMP→CMAF ffmpeg publish path. Desktop enables it; Android watch omits it.
-publish = ["dep:segmenter"]
+# The publish path. `dep:whip-ingest` turns the crate on; the non-Android target table
+# above adds its `server` feature so desktop gets the WHIP endpoint.
+publish = ["dep:segmenter", "dep:whip-ingest"]

@@ -132,6 +132,15 @@
   .field .copy { flex: 0 0 auto; font-family: var(--ui); font-size: 12px; font-weight: 510; color: var(--text); background: rgba(255,255,255,.06); border: 1px solid var(--line-strong); border-radius: 8px; padding: 7px 12px; cursor: pointer; transition: all .15s var(--ease); }
   .field .copy:hover { background: rgba(255,255,255,.1); } .field .copy.done { color: var(--ok); border-color: rgba(33,201,174,.45); }
   .ingest-hint { margin: 2px 0 0; font-size: 12.5px; color: var(--dim); line-height: 1.5; } .ingest-hint b { color: var(--text); font-weight: 590; }
+  /* Ingest picker (RTMP vs WHIP) on the Go-Live setup — a two-up segmented control. */
+  .ingest-pick { display: flex; gap: 8px; margin: 2px 0 2px; }
+  .ing-opt { flex: 1 1 0; display: flex; flex-direction: column; gap: 2px; align-items: flex-start; text-align: left;
+    padding: 10px 12px; border-radius: 12px; background: var(--surface-1); border: 1px solid var(--line);
+    color: var(--dim); cursor: pointer; transition: all .15s var(--ease); }
+  .ing-opt:hover { border-color: var(--line-strong); }
+  .ing-opt.on { color: var(--text); border-color: var(--accent); background: rgba(255,92,122,.08); }
+  .ing-opt .ing-t { font-weight: 590; font-size: 13.5px; }
+  .ing-opt .ing-d { font-family: var(--mono); font-size: 10.5px; letter-spacing: .2px; color: var(--faint); }
   .await { display: flex; align-items: center; gap: 9px; font-family: var(--mono); font-size: 12.5px; color: var(--dim); }
   .await .dot-await { width: 7px; height: 7px; border-radius: 50%; background: var(--accent-2); box-shadow: 0 0 10px var(--accent-2); animation: pulse 1.4s var(--ease) infinite; }
   .await.live .dot-await { background: var(--ok); box-shadow: 0 0 10px var(--ok); animation: none; }

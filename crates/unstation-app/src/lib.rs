@@ -222,6 +222,9 @@ struct PublishInfo {
     ingest_server: String,
     stream_key: String,
     hls_url: String,
+    /// "rtmp" | "whip" | "camera" — lets the Go-Live UI show the right ingest
+    /// instructions (RTMP server+key, a WHIP URL, or the phone camera).
+    ingest_mode: String,
 }
 
 /// Snapshot of the current publish session, for the UI to re-attach the console.
@@ -1137,11 +1140,15 @@ async fn start_publish(
     app: AppHandle,
     state: State<'_, AppState>,
     title: Option<String>,
+    ingest_mode: Option<String>,
 ) -> Result<PublishInfo, String> {
     if !*state.chain_ready.lock().unwrap() {
         return Err("Sign in with the Polkadot app to go live — your stream is announced under your verified identity.".into());
     }
-    if !segmenter::ffmpeg_available() {
+    // WHIP ingest (RFC 9725, sub-second) takes WebRTC media straight from OBS 30+ and
+    // needs no ffmpeg; RTMP does. Default to RTMP.
+    let whip = ingest_mode.as_deref() == Some("whip");
+    if !whip && !segmenter::ffmpeg_available() {
         return Err("ffmpeg not found. Install it (e.g. `brew install ffmpeg`), or set \
                     UNSTATION_FFMPEG to its full path, then try again."
             .into());
@@ -1166,18 +1173,6 @@ async fn start_publish(
     }
     // Broadcasting owns the uplink — retire any background seed.
     teardown_seed(&state);
-    let port = 21935u16;
-    let key = "unstation";
-    let url = segmenter::rtmp_url(port, key);
-
-    // The ingest dir — wiped to a clean slate each session. The dir is reused across
-    // streams, and stale fragments from a previous one belong to an unrelated encode
-    // timeline: leaving them makes the player replay old video and then stall at the
-    // discontinuity (the "counts up ~2 s then freezes, even after the encoder is gone"
-    // bug). A clean dir also keeps the feeder's index-based segment sequence correct.
-    let dir = std::env::temp_dir().join("unstation-publish");
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::create_dir_all(&dir);
 
     // Self-preview HLS + the publisher node inbox.
     let hls = HlsServer::start(1000).map_err(|e| e.to_string())?;
@@ -1245,13 +1240,119 @@ async fn start_publish(
     // Feeder: tail the ingest dir → preview sink + the publisher's mesh seed +
     // the live-edge manifest. Emits `publish-state` and keeps `live_flag` current so
     // a re-attaching UI can read the true live state via `publish_status`.
-    let ptx = pub_tx.clone();
-    let appc = app.clone();
-    let init_slot_feeder = init_slot.clone();
     let live_flag = Arc::new(AtomicBool::new(false));
-    let live_w = live_flag.clone();
-    let ingest_w = ingest_bytes.clone();
-    let feeder = tokio::spawn(async move {
+
+    // The feeder differs by ingest; everything downstream (mesh, edge, durable, sinks)
+    // is identical. WHIP → WebRTC access units → FragmentBuilder (mirrors the Android
+    // camera path); RTMP → ffmpeg tails CMAF fragments off disk.
+    let (feeder, ingest_server, stream_key) = if whip {
+        let ptx = pub_tx.clone();
+        let appc = app.clone();
+        let init_slot_feeder = init_slot.clone();
+        let live_w = live_flag.clone();
+        let ingest_w = ingest_bytes.clone();
+        let (whip_tx, whip_rx) = std::sync::mpsc::channel::<whip_ingest::server::IngestAu>();
+        let server = whip_ingest::server::start(whip_tx, stun())
+            .map_err(|e| format!("couldn't start the WHIP endpoint: {e}"))?;
+        let ingest_url = server.url();
+        // Bridge the WHIP server's std channel (tiny_http thread) into async.
+        let (au_tx, mut au_rx) = unbounded_channel::<whip_ingest::server::IngestAu>();
+        std::thread::spawn(move || {
+            while let Ok(iu) = whip_rx.recv() {
+                if au_tx.send(iu).is_err() {
+                    break;
+                }
+            }
+        });
+        let feeder = tokio::spawn(async move {
+            let _server = server; // hold the endpoint alive for the feeder's lifetime
+            let mut fb: Option<segmenter::FragmentBuilder> = None;
+            let mut last_pts: Option<i64> = None;
+            let mut live = false;
+            let mut last_fresh = std::time::Instant::now();
+            let announce_live = |appc: &AppHandle, live: bool| {
+                let _ = appc.emit("publish-state", PublishStateMsg { live });
+                let _ = appc.emit(
+                    "publish-progress",
+                    PublishProgressMsg { step: "encoder".into(), ok: live, detail: String::new() },
+                );
+            };
+            loop {
+                // The live flag flips off if RTP dries up (encoder stopped/roaming).
+                let iu = match tokio::time::timeout(Duration::from_millis(500), au_rx.recv()).await {
+                    Ok(Some(iu)) => iu,
+                    Ok(None) => break, // bridge closed
+                    Err(_) => {
+                        if live && last_fresh.elapsed() > Duration::from_millis(2000) {
+                            live = false;
+                            live_w.store(false, Ordering::Relaxed);
+                            announce_live(&appc, false);
+                        }
+                        continue;
+                    }
+                };
+                // Build the muxer once the codec config (SPS/PPS) arrives, deriving the
+                // frame dimensions from the SPS (WHIP carries no explicit size).
+                if fb.is_none() {
+                    if let Some((sps, pps)) = iu.config {
+                        let (width, height) =
+                            segmenter::sps::dimensions(&sps).unwrap_or((1280, 720));
+                        let mut builder = segmenter::FragmentBuilder::new(segmenter::H264Params {
+                            sps,
+                            pps,
+                            width,
+                            height,
+                        });
+                        let init = builder.init_segment();
+                        *init_slot_feeder.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(init.clone());
+                        preview.push_init(init);
+                        fb = Some(builder);
+                    } else {
+                        continue; // wait for config before any media fragment
+                    }
+                }
+                let builder = fb.as_mut().unwrap();
+                // Sample duration in 90 kHz ticks from PTS deltas (first AU ≈30 fps).
+                let dur = match last_pts {
+                    Some(prev) => (((iu.au.pts_us - prev).max(1)) as u64 * 90_000 / 1_000_000) as u32,
+                    None => 3_000,
+                };
+                last_pts = Some(iu.au.pts_us);
+                if let Some(seg) = builder.push_au(&iu.au.data, dur.max(1), iu.au.keyframe) {
+                    ingest_w.fetch_add(seg.bytes.len() as u64, Ordering::Relaxed);
+                    preview.push_segment(seg.seq, seg.bytes.clone());
+                    let _ = dur_tx.send((seg.seq, seg.bytes.clone()));
+                    let _ = ptx.send(EngineEvent::Produced { seq: seg.seq, id: seg.id, bytes: seg.bytes });
+                    let _ = edge_tx.send((seg.seq, seg.id));
+                    last_fresh = std::time::Instant::now();
+                    if !live {
+                        live = true;
+                        live_w.store(true, Ordering::Relaxed);
+                        announce_live(&appc, true);
+                    }
+                }
+            }
+        });
+        (feeder, ingest_url, String::new())
+    } else {
+        let port = 21935u16;
+        let key = "unstation";
+        let url = segmenter::rtmp_url(port, key);
+        // The ingest dir — wiped to a clean slate each session. Stale fragments from a
+        // previous stream belong to an unrelated encode timeline (they'd make the player
+        // replay old video then stall at the discontinuity); a clean dir also keeps the
+        // feeder's index-based segment sequence correct.
+        let dir = std::env::temp_dir().join("unstation-publish");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let ingest_server = format!("rtmp://127.0.0.1:{port}/live");
+        let ptx = pub_tx.clone();
+        let appc = app.clone();
+        let init_slot_feeder = init_slot.clone();
+        let live_w = live_flag.clone();
+        let ingest_w = ingest_bytes.clone();
+        let feeder = tokio::spawn(async move {
         // Keep an ingest listener available AT ALL TIMES so the encoder can connect or
         // reconnect whenever — no ordering required. ffmpeg's RTMP `-listen` is one-shot,
         // so we respawn it (into a clean dir, with a reset preview) whenever it isn't up.
@@ -1329,7 +1430,9 @@ async fn start_publish(
                 );
             }
         }
-    });
+        });
+        (feeder, ingest_server, key.to_string())
+    };
 
     // Publisher dashboard numbers: viewer count + ingest/uplink bitrates.
     let stats = spawn_publish_stats(app.clone(), session.clone(), ingest_bytes, pub_stats_rx);
@@ -1337,9 +1440,10 @@ async fn start_publish(
     tasks.push(feeder);
     tasks.push(stats);
     let info = PublishInfo {
-        ingest_server: format!("rtmp://127.0.0.1:{port}/live"),
-        stream_key: key.into(),
+        ingest_server,
+        stream_key,
         hls_url,
+        ingest_mode: if whip { "whip".into() } else { "rtmp".into() },
     };
     *state.publish.lock().unwrap() = Some(PublishSession {
         _hls: hls,
@@ -1495,7 +1599,7 @@ async fn start_publish(
     let stats = spawn_publish_stats(app.clone(), session.clone(), ingest_bytes, pub_stats_rx);
 
     // No RTMP ingest on Android — the camera is the source; the UI hides the OBS rail.
-    let info = PublishInfo { ingest_server: String::new(), stream_key: String::new(), hls_url };
+    let info = PublishInfo { ingest_server: String::new(), stream_key: String::new(), hls_url, ingest_mode: "camera".into() };
     tasks.push(feeder);
     tasks.push(stats);
     *state.publish.lock().unwrap() = Some(PublishSession {

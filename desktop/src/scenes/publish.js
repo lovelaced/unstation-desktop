@@ -100,14 +100,46 @@ function cancelObsTimer(){ if(obsTimer){ clearTimeout(obsTimer); obsTimer=null; 
   const set=(id,t)=>{ const el=document.getElementById(id); if(el) el.textContent=t; };
   set('phIngestK', isMobile() ? STRINGS.stepCamera : STRINGS.statEncoder);
   set('phUplinkK', STRINGS.statUplink);
-  set('obsSetupSummary', STRINGS.obsSetupTitle);
   set('inviteHint', STRINGS.inviteHint);
   set('showQrBtn', STRINGS.showQr);
   set('shareInviteBtn', STRINGS.shareSheet);
   set('inviteQrClose', STRINGS.close);
-  const ol=document.getElementById('obsSteps');
-  if(ol){ [STRINGS.obsStep1, STRINGS.obsStep2, STRINGS.obsStep3].forEach(t=>{ const li=document.createElement('li'); li.textContent=t; ol.appendChild(li); }); }
   const sh=document.getElementById('shareInviteBtn'); if(sh) sh.hidden = !isMobile();
+}
+
+/* ---- ingest picker (desktop): OBS-RTMP (default) vs OBS-WHIP (lower latency) ---- */
+// Android publishes from the camera, so the picker is desktop-only.
+let ingestMode = 'rtmp';
+{
+  const pick=document.getElementById('ingestPick');
+  if(pick){
+    if(isMobile()) pick.style.display='none';
+    pick.querySelectorAll('.ing-opt').forEach(b=>b.addEventListener('click', ()=>{
+      ingestMode=b.dataset.mode;
+      pick.querySelectorAll('.ing-opt').forEach(o=>{ const on=o===b; o.classList.toggle('on',on); o.setAttribute('aria-checked', on?'true':'false'); });
+    }));
+  }
+}
+
+// Populate the console's ingest card for the mode the backend actually opened
+// (info.ingest_mode): RTMP shows Server + Stream key + OBS-custom steps; WHIP shows a
+// single WHIP URL (no key) + WHIP steps. Used by both go-live and tab-back re-attach.
+function renderIngestCard(info){
+  const whip = info.ingest_mode === 'whip';
+  const set=(id,t)=>{ const el=document.getElementById(id); if(el) el.textContent=t; };
+  set('ingestServer', info.ingest_server);
+  set('ingestKey', info.stream_key);
+  set('ingestServerK', whip ? 'WHIP URL' : 'Server');
+  const kf=document.getElementById('ingestKeyField'); if(kf) kf.style.display = whip ? 'none' : '';
+  set('obsSetupSummary', whip ? STRINGS.obsSetupTitleWhip : STRINGS.obsSetupTitle);
+  const hint=document.getElementById('pubWaitingHint');
+  if(hint && whip) hint.textContent = STRINGS.whipWaitingHint;
+  const ol=document.getElementById('obsSteps');
+  if(ol){ ol.innerHTML='';
+    (whip ? [STRINGS.whipStep1, STRINGS.whipStep2, STRINGS.whipStep3]
+          : [STRINGS.obsStep1, STRINGS.obsStep2, STRINGS.obsStep3])
+      .forEach(t=>{ const li=document.createElement('li'); li.textContent=t; ol.appendChild(li); });
+  }
 }
 
 /* ---- invite link + QR + share sheet ---- */
@@ -219,10 +251,9 @@ export async function goLiveStart(){
   applyPublishState(false); // enter the console in the waiting state
   if(NATIVE && invoke){
     try {
-      const info = await invoke('start_publish', { title: S.pubName });
+      const info = await invoke('start_publish', { title: S.pubName, ingestMode });
       S.pubHlsUrl = info.hls_url; S.pubActive = true; refreshGoLiveBadge();
-      document.getElementById('ingestServer').textContent = info.ingest_server;
-      document.getElementById('ingestKey').textContent = info.stream_key;
+      renderIngestCard(info);
       // Android: start_publish has opened the AU intake; now start the camera capture
       // (a no-op seam on desktop, which ingests via RTMP/OBS instead). Its error — e.g. a
       // camera-permission rejection — surfaces in the same waiting UI (with Open Settings /
@@ -281,8 +312,7 @@ export async function enterGoLive(){
   if(status){
     S.publishing = true; S.pubActive = true; S.pubName = status.name; S.pubHlsUrl = status.info.hls_url;
     titleEl.value = status.name; titleEl.readOnly = true;
-    document.getElementById('ingestServer').textContent = status.info.ingest_server;
-    document.getElementById('ingestKey').textContent = status.info.stream_key;
+    renderIngestCard(status.info);
     document.getElementById('shareLink').textContent = status.name;
     refreshInviteUi();
     S.lastViewers = status.viewers||0;

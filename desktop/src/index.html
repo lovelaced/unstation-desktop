@@ -107,6 +107,14 @@
             <input id="streamTitle" maxlength="60" spellcheck="false" placeholder="Friday Night Football" />
           </form>
           <div class="hint">viewers tune in with&nbsp;&nbsp;<b id="sharePreview" class="accent">friday-night-football</b></div>
+          <div class="ingest-pick" id="ingestPick" role="radiogroup" aria-label="Ingest">
+            <button class="ing-opt on" id="ingRtmp" data-mode="rtmp" type="button" role="radio" aria-checked="true">
+              <span class="ing-t">OBS · RTMP</span><span class="ing-d">works everywhere · ~3–5s</span>
+            </button>
+            <button class="ing-opt" id="ingWhip" data-mode="whip" type="button" role="radio" aria-checked="false">
+              <span class="ing-t">OBS · WHIP</span><span class="ing-d">lower latency · OBS 30+</span>
+            </button>
+          </div>
           <div class="pub-actions" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
             <button class="btn" id="startStream" type="button">Go live</button>
             <button class="btn ghost" id="cancelPublish" type="button">Cancel</button>
@@ -124,7 +132,7 @@
             <div id="pubWaiting" style="position:absolute;inset:0;z-index:5;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:11px;text-align:center;padding:26px">
               <span class="dot-await"></span>
               <b style="font-size:15px">Waiting for your encoder…</b>
-              <div style="max-width:32rem;opacity:.72;font-size:12.5px;line-height:1.55">Point any encoder — OBS, or <code>scripts/mock-obs.sh</code> — at the server below and start streaming. Connect it any time, before or after this screen; it goes live on its own.</div>
+              <div id="pubWaitingHint" style="max-width:32rem;opacity:.72;font-size:12.5px;line-height:1.55">Point any encoder — OBS, or <code>scripts/mock-obs.sh</code> — at the server below and start streaming. Connect it any time, before or after this screen; it goes live on its own.</div>
             </div>
             <div id="pubVidDiag" class="diag" hidden></div>
           </div>
@@ -132,8 +140,8 @@
         <aside class="pub-rail">
           <div class="eyebrow">Connect your encoder</div>
           <div class="ingest-card">
-            <div class="field"><span class="k">Server</span><code id="ingestServer">rtmp://127.0.0.1:21935/live</code><button class="copy" data-copy="ingestServer" type="button">Copy</button></div>
-            <div class="field"><span class="k">Stream key</span><code id="ingestKey">unstation</code><button class="copy" data-copy="ingestKey" type="button">Copy</button></div>
+            <div class="field"><span class="k" id="ingestServerK">Server</span><code id="ingestServer">rtmp://127.0.0.1:21935/live</code><button class="copy" data-copy="ingestServer" type="button">Copy</button></div>
+            <div class="field" id="ingestKeyField"><span class="k">Stream key</span><code id="ingestKey">unstation</code><button class="copy" data-copy="ingestKey" type="button">Copy</button></div>
             <details class="obs-setup" id="obsSetup">
               <summary id="obsSetupSummary">Set up OBS</summary>
               <ol class="obs-steps" id="obsSteps"></ol>

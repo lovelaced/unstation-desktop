@@ -66,6 +66,12 @@ export const STRINGS = {
   obsStep1: 'OBS → Settings → Stream → Service: Custom.',
   obsStep2: 'Paste the Server and Stream key from above.',
   obsStep3: 'Recommended: keyframe interval 1s, CBR, B-frames 0, preset veryfast.',
+  // WHIP ingest (OBS 30+ · lower latency)
+  obsSetupTitleWhip: 'Set up OBS (WHIP)',
+  whipStep1: 'OBS 30+ → Settings → Stream → Service: WHIP.',
+  whipStep2: 'Paste the WHIP URL above as the Server; leave the Bearer token empty.',
+  whipStep3: 'Recommended: keyframe interval 1s, CBR, B-frames 0, preset veryfast.',
+  whipWaitingHint: 'In OBS 30+, set Service to WHIP and paste the URL above — or run scripts/mock-whip.sh. It goes live on its own.',
 
   // Camera-permission recovery (mobile publish).
   camPermHelp: 'Unstation needs camera access to go live. Allow it in Settings, then try again.',
