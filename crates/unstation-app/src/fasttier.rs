@@ -171,8 +171,11 @@ mod publisher {
             let (frame_tx, frame_rx) = channel::<FastFrame>();
             let (ans_tx, ans_rx) = tokio::sync::oneshot::channel::<Option<String>>();
             let stun = self.stun.clone();
-            let me = self.clone();
-            // The egress + its libdatachannel handles live entirely on this thread.
+            // The egress + its libdatachannel handles live entirely on this thread. The thread
+            // never touches the viewer map: when it exits, its `frame_rx` drops, so the next
+            // `broadcast` prunes the stale sender. (It must not `drop_viewer` itself — a re-offer
+            // may have already replaced this viewer's sender, and the exiting old thread would
+            // otherwise evict the live new one.)
             std::thread::Builder::new()
                 .name("fast-egress".into())
                 .spawn(move || {
@@ -181,7 +184,6 @@ mod publisher {
                         Err(e) => {
                             log::warn!("[fast] egress answer failed: {e}");
                             let _ = ans_tx.send(None);
-                            me.drop_viewer(&viewer);
                             return;
                         }
                     };
@@ -215,7 +217,6 @@ mod publisher {
                         }
                     }
                     log::info!("[fast] egress for a viewer closed");
-                    me.drop_viewer(&viewer);
                 })
                 .ok()?;
             self.viewers
