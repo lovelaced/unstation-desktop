@@ -18,6 +18,13 @@
 #   scripts/mock-whip.sh -u <url> -t 10        # one-shot: 10 s then exit (handy for tests)
 #   scripts/mock-whip.sh -u <url> -s 1920x1080 -r 60 -b 6000
 #
+# KNOWN LIMITATION (ffmpeg <= 8.1): ffmpeg's whip muxer never answers mid-session STUN
+# consent checks (RFC 7675), so any compliant WebRTC receiver — ours included — expires
+# the session after exactly 30 s ("Consent expired for candidate pair"). This script
+# auto-reconnects, so the stream continues with a ~1 s hiccup every 30 s. Real encoders
+# (OBS 30+, libdatachannel-based) answer consent and hold indefinitely; ffmpeg git master
+# has consent support and will too. See whip-ingest/tests/ffmpeg_whip.rs (the canary soak).
+#
 # WHIP has no stream key — the URL identifies the session. No `nounset` (macOS bash 3.2).
 set -eo pipefail
 
@@ -83,6 +90,6 @@ while true; do
   if [ -n "$DURATION" ]; then
     exit "$rc"                      # one-shot mode (tests)
   fi
-  echo "… WHIP endpoint not ready or stream ended (rc=$rc). Retrying in 2 s — click 'Go live' (WHIP) in Unstation."
-  sleep 2
+  echo "… WHIP session ended (rc=$rc; ffmpeg <= 8.1 caps at 30 s — see header). Reconnecting…"
+  sleep 0.5
 done

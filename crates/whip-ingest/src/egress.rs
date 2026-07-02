@@ -165,13 +165,27 @@ mod tests {
     /// offer/answer roles, RTP over SRTP, and packetize→send→receive→depacketize — short of a
     /// real browser (the remaining SDP/codec-param interop unknown). Ignored: it needs the
     /// media-enabled libdatachannel and runs a full ICE/DTLS/SRTP session.
-    #[test]
-    #[ignore = "media libdatachannel + live ICE/DTLS/SRTP loopback; run explicitly"]
-    fn libdatachannel_media_loopback_delivers_access_units() {
+    /// A canned keyframe access unit (SPS + PPS + IDR).
+    fn idr_au() -> Vec<u8> {
+        [
+            &[0u8, 0, 0, 1, 0x67, 0x42, 0x00, 0x0a][..], // SPS
+            &[0, 0, 0, 1, 0x68, 0xce, 0x3c, 0x80],       // PPS
+            &[0, 0, 0, 1, 0x65, 1, 2, 3, 4, 5, 6, 7, 8], // IDR slice
+        ]
+        .concat()
+    }
+
+    /// Set up the loopback pair: a libdatachannel subscriber (offerer, recvonly — standing in
+    /// for the browser) negotiated against [`MediaEgress`] (answerer, sendonly), connected over
+    /// real ICE/DTLS/SRTP on loopback. Returns the connected egress, the subscriber's decoded
+    /// AU stream, and the subscriber PC (keep it alive for the session's duration).
+    fn connected_loopback() -> (
+        MediaEgress,
+        std::sync::mpsc::Receiver<AccessUnit>,
+        Box<RtcPeerConnection<SubConn>>,
+    ) {
         // libjuice drops 127.0.0.1 host candidates unless we bind explicitly (RFC 8445).
         std::env::set_var("UNSTATION_BIND_ADDR", "127.0.0.1");
-
-        // Subscriber (offerer): recvonly H.264 track, depacketizing what it receives.
         let (au_tx, au_rx) = sync_channel::<AccessUnit>(64);
         let (sub_gathered_tx, sub_gathered_rx) = sync_channel::<()>(1);
         let sub_connected = Arc::new(Mutex::new(false));
@@ -196,19 +210,16 @@ mod tests {
             .expect("sub add_track");
         std::mem::forget(sub_track);
 
-        // Subscriber creates the offer.
         sub.set_local_description(SdpType::Offer).expect("sub set_local offer");
         let _ = sub_gathered_rx.recv_timeout(Duration::from_secs(3));
         let offer = sub.local_description().expect("sub offer").sdp.to_string();
 
-        // Publisher answers with a sendonly track.
-        let mut egress = MediaEgress::answer(&offer, &[]).expect("egress answer");
+        let egress = MediaEgress::answer(&offer, &[]).expect("egress answer");
         let answer: SessionDescription =
             serde_json::from_value(serde_json::json!({ "type": "answer", "sdp": egress.answer_sdp() }))
                 .unwrap();
         sub.set_remote_description(&answer).expect("sub set answer");
 
-        // Wait for both ends to connect.
         let deadline = std::time::Instant::now() + Duration::from_secs(8);
         while std::time::Instant::now() < deadline {
             if egress.is_connected() && *sub_connected.lock().unwrap() {
@@ -217,15 +228,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(egress.is_connected(), "publisher side never connected");
+        (egress, au_rx, sub)
+    }
 
+    #[test]
+    #[ignore = "media libdatachannel + live ICE/DTLS/SRTP loopback; run explicitly"]
+    fn libdatachannel_media_loopback_delivers_access_units() {
+        let (mut egress, au_rx, _sub) = connected_loopback();
         // Publisher writes a keyframe AU repeatedly (a real feed keeps sending); the
         // subscriber should depacketize at least one.
-        let idr = [
-            &[0u8, 0, 0, 1, 0x67, 0x42, 0x00, 0x0a][..], // SPS
-            &[0, 0, 0, 1, 0x68, 0xce, 0x3c, 0x80],       // PPS
-            &[0, 0, 0, 1, 0x65, 1, 2, 3, 4, 5, 6, 7, 8], // IDR slice
-        ]
-        .concat();
+        let idr = idr_au();
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
         let got = loop {
             if std::time::Instant::now() >= deadline {
                 break None;
@@ -238,6 +251,33 @@ mod tests {
         let au = got.expect("subscriber received no access unit within the deadline");
         assert!(au.keyframe, "the delivered AU is the keyframe we sent");
         assert_eq!(au.data, idr, "delivered bytes match what the publisher packetized");
+    }
+
+    /// A consent-answering peer must hold the session PAST libjuice's 30s consent window
+    /// (RFC 7675). This is the compliant-peer counterpart to the ffmpeg soak in
+    /// tests/ffmpeg_whip.rs (known-fail: ffmpeg ≤ 8.1 never answers mid-session consent
+    /// checks, so juice expires it at exactly 30s). Media sessions with real WebRTC peers
+    /// — OBS-WHIP, browsers — behave like this test.
+    #[test]
+    #[ignore = "40s media soak across the ICE consent window; run explicitly"]
+    fn media_session_with_a_compliant_peer_survives_the_consent_window() {
+        let (mut egress, au_rx, _sub) = connected_loopback();
+        let idr = idr_au();
+        let start = std::time::Instant::now();
+        let mut ts: u32 = 0;
+        let mut last_rx = Duration::ZERO;
+        while start.elapsed() < Duration::from_secs(40) {
+            egress.write_au(&idr, ts);
+            ts = ts.wrapping_add(90_000); // 1s cadence
+            if au_rx.recv_timeout(Duration::from_millis(1000)).is_ok() {
+                last_rx = start.elapsed();
+            }
+        }
+        assert!(egress.is_connected(), "session dropped inside 40s (consent should be honored)");
+        assert!(
+            last_rx >= Duration::from_secs(35),
+            "media stopped flowing at {last_rx:?} — consent/keepalive regression"
+        );
     }
 
     struct RecvTrack {
