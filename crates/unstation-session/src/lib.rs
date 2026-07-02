@@ -450,18 +450,26 @@ impl Session {
     pub fn spawn_edge_poller(&self, inbox: UnboundedSender<EngineEvent>) -> tokio::task::JoinHandle<()> {
         let signaling = self.signaling.clone();
         let transport = self.transport.clone();
+        // Push-based signaling: new edge statements wake the read immediately —
+        // the periodic read below is only reconciliation for anything push missed.
+        let mut push = self.signaling.subscribe_edge_push();
         tokio::spawn(async move {
             let mut seen: HashSet<Seq> = HashSet::new();
             loop {
                 // Adaptive: poll fast until connected (the first edge must land quickly),
-                // then back off — once in-mesh, signed edge gossip delivers new segments
-                // at mesh speed and this chain read is only reconciliation.
+                // then back off — once in-mesh, pushes + signed edge gossip deliver new
+                // segments immediately and this chain read is only reconciliation.
                 let period = if transport.peer_count() == 0 {
                     SIGNAL_POLL_ACTIVE
                 } else {
                     SIGNAL_POLL_IDLE
                 };
-                sleep(period).await;
+                tokio::select! {
+                    _ = sleep(period) => {}
+                    Some(_) = push.recv() => {
+                        while push.try_recv().is_ok() {} // coalesce a burst into one read
+                    }
+                }
                 if let Ok(edge) = signaling.read_edge().await {
                     if !edge.is_empty() {
                         log::debug!("[edge] chain poll → {} entr(ies)", edge.len());
@@ -523,12 +531,20 @@ async fn relay_inbound(
     bans: BanList,
 ) {
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    // Push-based signaling: an SDP/ICE statement addressed to us wakes the read
+    // immediately — handshakes stop paying the poll interval.
+    let mut push = signaling.subscribe_signals_push(me);
     loop {
         // Adaptive: while establishing (no live peer) poll fast so SDP/ICE round-trips
-        // promptly; once connected, offers still arrive within the idle period (worst
-        // case a few seconds to add a new peer) at a fraction of the chain reads.
+        // promptly; once connected, pushes handle new offers instantly and the idle
+        // poll is only reconciliation.
         let period = if transport.peer_count() == 0 { SIGNAL_POLL_ACTIVE } else { SIGNAL_POLL_IDLE };
-        sleep(period).await;
+        tokio::select! {
+            _ = sleep(period) => {}
+            Some(_) = push.recv() => {
+                while push.try_recv().is_ok() {} // coalesce a burst into one read
+            }
+        }
         let mut sigs = match signaling.read_signals(me).await {
             Ok(s) => s,
             Err(e) => {

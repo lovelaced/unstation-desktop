@@ -278,9 +278,64 @@ impl Signaling for ChainSignaling {
     }
 
     fn subscribe_edge(&self, _stream: StreamId) -> Subscription<LiveEdge> {
-        // Real live-edge subscription (set_on_statement → bounded channel) lands
-        // with the live path in M1.
+        // The trait-level subscription stays a placeholder; real push delivery runs
+        // through [`subscribe_topic`] (see `subscribe_edge_push`), which the session
+        // uses as poll wakeups — one decode path, no drift.
         Subscription::default()
+    }
+}
+
+// ── Push-based signaling ─────────────────────────────────────────────────────────
+// The SDK delivers every incoming statement (TopicFilter::Any on the default init)
+// to ONE global callback. In this process that slot is unclaimed — only the phone
+// app's mobile runtime uses it — so we own it with a topic dispatcher: sessions
+// subscribe to a topic and are pushed the statement `data` the moment it arrives,
+// instead of waiting out a poll interval. Polling remains as reconciliation.
+
+type PushSubs = Mutex<HashMap<[u8; 32], Vec<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>>;
+static PUSH_SUBS: OnceLock<PushSubs> = OnceLock::new();
+
+fn push_subs() -> &'static PushSubs {
+    PUSH_SUBS.get_or_init(Default::default)
+}
+
+/// Subscribe to pushed statement payloads on `topic`. Dropping the receiver
+/// unsubscribes (dead senders are swept on the next delivery to that topic).
+pub fn subscribe_topic(topic: [u8; 32]) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        ss::set_on_statement(Box::new(|stmt| {
+            // Runs on the SDK's delivery thread: lock, fan out, never block.
+            let mut subs = push_subs().lock().unwrap_or_else(|e| e.into_inner());
+            for t in &stmt.topics {
+                if let Some(list) = subs.get_mut(t) {
+                    list.retain(|tx| tx.send(stmt.data.clone()).is_ok());
+                }
+            }
+        }));
+    });
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    push_subs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(topic)
+        .or_default()
+        .push(tx);
+    rx
+}
+
+impl ChainSignaling {
+    /// Push wakeups for this stream's live-edge statements.
+    pub fn subscribe_edge_push(&self) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
+        subscribe_topic(edge_topic(&self.stream))
+    }
+
+    /// Push wakeups for SDP/ICE statements addressed to `me` on this stream.
+    pub fn subscribe_signals_push(
+        &self,
+        me: PeerId,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
+        subscribe_topic(signaling_topic(&self.stream, &me))
     }
 }
 
