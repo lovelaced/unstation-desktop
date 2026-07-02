@@ -8,6 +8,59 @@ import { viewerVerdict } from '../health.js';
 import { isVideoPlaying } from '../player.js';
 import { STRINGS } from '../copy.js';
 
+/* ---- preference controls (persisted in localStorage; pushed to the backend) ----
+   - Sharing your connection: how much upload Unstation may use to pass streams along
+     (never called "seeding"). 0 = Auto (health-gated); 1 = effectively off.
+   - Camera quality: phone broadcasts only.
+   - Fast connect: whether the broadcaster honors fast-connect invites. */
+const isMobile = () => window.__unstationPlatformType === 'mobile' || document.body.classList.contains('plat-android');
+{
+  const explain=(id,t)=>{ const el=document.getElementById(id); if(el) el.textContent=t; };
+  explain('lendExplain', STRINGS.lendExplain);
+  explain('camQExplain', STRINGS.camQExplain);
+  explain('fastSetExplain', STRINGS.fastSetExplain);
+
+  const cap=document.getElementById('lendCap');
+  if(cap){
+    cap.value = localStorage.getItem('lendCap') || '0';
+    if(![...cap.options].some(o=>o.value===cap.value)) cap.value='0';
+    cap.addEventListener('change', ()=>{
+      localStorage.setItem('lendCap', cap.value);
+      if(NATIVE && invoke) invoke('set_lend_cap', { bps: parseInt(cap.value,10)||0 }).catch(()=>{});
+    });
+  }
+
+  const rowQ=document.getElementById('rowCamQuality');
+  const q=document.getElementById('camQuality');
+  if(rowQ) rowQ.hidden = !isMobile(); // camera broadcasts are phone-only
+  if(q){
+    q.value = localStorage.getItem('camQuality') || '720';
+    if(![...q.options].some(o=>o.value===q.value)) q.value='720';
+    q.addEventListener('change', ()=>{ localStorage.setItem('camQuality', q.value); });
+  }
+
+  // Fast connect is a broadcaster capability of the desktop (WHIP) publish path.
+  const rowF=document.getElementById('rowFastConnect');
+  if(rowF) rowF.hidden = isMobile();
+  const ft=document.getElementById('fastConnectToggle');
+  if(ft){
+    const render=()=>{
+      const off = localStorage.getItem('fastConnect')==='off';
+      const set=(id,t)=>{ const el=document.getElementById(id); if(el) el.textContent=t; };
+      set('setFast', off ? STRINGS.fastSetOff : STRINGS.fastSetOn);
+      const d=document.getElementById('setFastDot'); if(d) d.dataset.h = off ? '' : 'good';
+      ft.textContent = off ? 'Turn on' : 'Turn off';
+    };
+    render();
+    ft.addEventListener('click', ()=>{
+      const off = localStorage.getItem('fastConnect')==='off';
+      localStorage.setItem('fastConnect', off ? 'on' : 'off');
+      if(NATIVE && invoke) invoke('set_fast_connect', { allowed: off }).catch(()=>{});
+      render();
+    });
+  }
+}
+
 // Settings → Network + Connection health, reflecting real state.
 export function updateSettingsStatus(){
   const set=(id,t)=>{ const el=document.getElementById(id); if(el) el.textContent=t; };

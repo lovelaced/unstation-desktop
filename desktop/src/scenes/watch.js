@@ -12,7 +12,7 @@ import { updateSettingsStatus } from './settings.js';
 import { ensureSignedIn } from './onboarding.js';
 import { shareName } from './publish.js';
 import { toggleFullscreen } from '../main.js';
-import { refreshFastAvailability, stopFastTier } from '../fasttier.js';
+import { refreshFastAvailability, stopFastTier, maybeAutoEngageFast } from '../fasttier.js';
 
 function materialize(){}   /* retained as a no-op — runFinding() still calls it */
 
@@ -56,7 +56,8 @@ function enterLiveFromFinding(){
   ttffFrozen=true; // freeze at the real time-to-first-frame; go() cancels the rAF
   go('live');
   if(S.watchTarget) setTitle(S.watchTarget,true);
-  refreshFastAvailability(); // the opt-in low-latency toggle becomes available
+  refreshFastAvailability();  // fast-connect toggle appears only for invited watches…
+  maybeAutoEngageFast();      // …and an invited friend connects without hunting for it
 }
 // The broadcast is over (terminal from the backend): tear the player down WITHOUT
 // leaveWatch (which also navigates to entry) and land on the ended scene. stop_watch
@@ -139,6 +140,8 @@ export async function startWatch(target){
   if(!ensureSignedIn()) return;
   if(NATIVE && S.publishing && S.pubName && shareName(target)===S.pubName){ selfWatch(S.pubName); return; }
   S.watchTarget=target;
+  // Fast connect is unlocked per-stream by the broadcaster's invite, never by default.
+  S.fastEligible = !!S.fastFor && S.fastFor === shareName(target);
   go('finding');
   if(NATIVE && invoke){ try{ const info=await invoke('start_watch',{ target }); document.getElementById('mPub').textContent=info.publisher; S.lastPeers=0; setTitle(target,true); applyStats({peers:0,rho:0,mode:'p2p',from_seed:0,from_chain:0,latency_s:0,ice:'connecting'}); startWatchWatchdog(); setVideo(info.hls_url); }catch(err){ console.error('start_watch failed',err); findingCopy('Problem','Couldn’t start watching',((err&&err.message)||(''+err))); clearSeq(); } }
   else { setTimeout(()=>go('live'),1200); }

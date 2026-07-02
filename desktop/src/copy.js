@@ -42,6 +42,26 @@ export const STRINGS = {
   backupOn: 'On — viewers can find the stream even if you briefly drop',
   backupOff: 'Off · optional backup',
 
+  // Settings — sharing your connection (never the word "seeding"): how much upload
+  // Unstation may use to pass streams along to other viewers.
+  lendAuto: 'Auto — pause when your connection is busy',
+  lend5: 'Up to 5 Mbps',
+  lend2: 'Up to 2 Mbps',
+  lend1: 'Up to 1 Mbps',
+  lendOffOpt: 'Off — never share upload',
+  lendExplain: 'While you watch, Unstation passes the stream along to nearby viewers. It backs off on its own if your connection struggles.',
+
+  // Settings — camera quality (phone broadcasting).
+  camQAuto: 'Standard (720p)',
+  camQLow: 'Data saver (480p)',
+  camQHigh: 'High (1080p)',
+  camQExplain: 'Quality of your camera broadcast. Higher looks better but uses more upload and battery. Applies the next time you go live.',
+
+  // Settings — fast connect (broadcaster side).
+  fastSetOn: 'On — friends with a fast-connect invite get video straight from you',
+  fastSetOff: 'Off — everyone gets the verified stream',
+  fastSetExplain: 'Fast-connect invites send your video directly to a few trusted friends, sooner but without the byte-for-byte check. Uses your upload; the verified stream keeps running for everyone.',
+
   // Invite links (unstation://watch/<name>) — share bar, QR overlay, entry hint.
   inviteHint: 'Got an invite link? Just open it — or type the stream name here.',
   showQr: 'Show QR',
@@ -61,24 +81,33 @@ export const STRINGS = {
   advEncoderStruggling: 'Your encoder is struggling — lower the bitrate or resolution.',
   advNoViewers: 'No one’s connected yet — send your invite link.',
 
-  // OBS guided setup (desktop-only collapsible panel in the ingest card).
-  obsSetupTitle: 'Set up OBS',
+  // Encoder setup (desktop-only collapsible panel in the ingest card). The DEFAULT is the
+  // modern path (OBS 30+, spoken of as "your streaming app" — WHIP is a wire detail); the
+  // classic RTMP setup is one link away for older encoders. Users never pick a protocol.
+  obsSetupTitle: 'Set up OBS (classic)',
   obsStep1: 'OBS → Settings → Stream → Service: Custom.',
   obsStep2: 'Paste the Server and Stream key from above.',
   obsStep3: 'Recommended: keyframe interval 1s, CBR, B-frames 0, preset veryfast.',
-  // WHIP ingest (OBS 30+ · lower latency)
-  obsSetupTitleWhip: 'Set up OBS (WHIP)',
-  whipStep1: 'OBS 30+ → Settings → Stream → Service: WHIP.',
-  whipStep2: 'Paste the WHIP URL above as the Server; leave the Bearer token empty.',
+  obsSetupTitleWhip: 'Set up OBS',
+  whipStep1: 'OBS 30 or newer → Settings → Stream → Service: WHIP.',
+  whipStep2: 'Paste the URL above as the Server; leave the Bearer token empty.',
   whipStep3: 'Recommended: keyframe interval 1s, CBR, B-frames 0, preset veryfast.',
-  whipWaitingHint: 'In OBS 30+, set Service to WHIP and paste the URL above — or run scripts/mock-whip.sh. It goes live on its own.',
+  whipWaitingHint: 'In OBS (30+), set Service to WHIP and paste the URL above. It goes live on its own.',
+  rtmpWaitingHint: 'Point your encoder at the Server + Stream key above. It goes live on its own.',
+  ingestSwitchToClassic: 'Older encoder without WHIP? Use the classic setup',
+  ingestSwitchToModern: 'On OBS 30+? Switch back to the faster setup',
 
-  // Fast tier (opt-in, unverified, sub-second WebRTC media, direct from the broadcaster).
-  fastOff: 'Low-latency',
+  // Fast connect — the broadcaster's trust circle. Publisher-direct WebRTC video: sooner
+  // than the verified stream, but WITHOUT the byte-for-byte check, so it's offered through
+  // a special invite rather than to everyone. The verified stream stays underneath as the
+  // automatic fallback.
+  fastOff: 'Fast connect',
   fastConnecting: 'Connecting…',
-  fastOn: 'Low-latency · on',
-  fastBadge: '⚡ low-latency · unverified · direct',
-  fastUnavailable: 'Low-latency unavailable — on the verified stream',
+  fastOn: 'Fast connect · on',
+  fastBadge: '⚡ direct from the broadcaster · not verified',
+  fastUnavailable: 'Fast connect unavailable — back on the verified stream',
+  fastInviteChip: '⚡ Fast connect',
+  fastInviteOnHint: 'This invite lets a friend connect straight to you — video arrives sooner, without the byte-for-byte check. For people you trust; a few at a time.',
 
   // Camera-permission recovery (mobile publish).
   camPermHelp: 'Unstation needs camera access to go live. Allow it in Settings, then try again.',

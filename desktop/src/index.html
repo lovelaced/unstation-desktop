@@ -92,7 +92,9 @@
         <div class="set-row"><div><div class="set-k">Backup copy</div><div class="set-v"><span class="set-status"><span class="sdot" id="setBackupDot" data-h="wait"></span><span id="setBackup">—</span></span></div></div></div>
         <div class="set-row"><div><div class="set-k">Network status</div><div class="set-v"><span class="set-status"><span class="sdot" id="setNetDot" data-h="wait"></span><span id="setNetwork">Checking…</span></span></div></div></div>
         <div class="set-row"><div><div class="set-k">Connection health</div><div class="set-v"><span class="set-status"><span class="sdot" id="setHealthDot"></span><span id="setHealth">Not watching or streaming right now.</span></span></div></div></div>
-        <div class="set-row"><div><div class="set-k">Lending bandwidth</div><div class="set-v"><span class="set-status"><span class="sdot" id="setLendDot"></span><span id="setLend">On by default while you watch — paused automatically if your connection struggles.</span></span></div></div><button class="btn ghost" id="stopSeedBtn" type="button" style="display:none;">Stop</button></div>
+        <div class="set-row"><div><div class="set-k">Sharing your connection</div><div class="set-v"><span class="set-status"><span class="sdot" id="setLendDot"></span><span id="setLend">On while you watch — pauses if your connection struggles.</span></span></div><div class="set-v set-note" id="lendExplain"></div></div><div class="set-ctl"><select class="set-select" id="lendCap"><option value="0">Auto — pause when busy</option><option value="5000000">Up to 5 Mbps</option><option value="2000000">Up to 2 Mbps</option><option value="1000000">Up to 1 Mbps</option><option value="1">Off</option></select><button class="btn ghost" id="stopSeedBtn" type="button" style="display:none;">Stop</button></div></div>
+        <div class="set-row" id="rowCamQuality" hidden><div><div class="set-k">Camera quality</div><div class="set-v set-note" id="camQExplain"></div></div><div class="set-ctl"><select class="set-select" id="camQuality"><option value="720">Standard (720p)</option><option value="480">Data saver (480p)</option><option value="1080">High (1080p)</option></select></div></div>
+        <div class="set-row" id="rowFastConnect"><div><div class="set-k">Fast connect</div><div class="set-v"><span class="set-status"><span class="sdot" id="setFastDot" data-h="good"></span><span id="setFast">On</span></span></div><div class="set-v set-note" id="fastSetExplain"></div></div><div class="set-ctl"><button class="btn ghost" id="fastConnectToggle" type="button">Turn off</button></div></div>
         <div class="set-row"><div><div class="set-k">About</div><div class="set-v">Unstation · v0.0.0 · AGPL-3.0-or-later</div></div></div>
       </div>
     </div>
@@ -107,14 +109,6 @@
             <input id="streamTitle" maxlength="60" spellcheck="false" placeholder="Friday Night Football" />
           </form>
           <div class="hint">viewers tune in with&nbsp;&nbsp;<b id="sharePreview" class="accent">friday-night-football</b></div>
-          <div class="ingest-pick" id="ingestPick" role="radiogroup" aria-label="Ingest">
-            <button class="ing-opt on" id="ingRtmp" data-mode="rtmp" type="button" role="radio" aria-checked="true">
-              <span class="ing-t">OBS · RTMP</span><span class="ing-d">works everywhere · ~3–5s</span>
-            </button>
-            <button class="ing-opt" id="ingWhip" data-mode="whip" type="button" role="radio" aria-checked="false">
-              <span class="ing-t">OBS · WHIP</span><span class="ing-d">lower latency · OBS 30+</span>
-            </button>
-          </div>
           <div class="pub-actions" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
             <button class="btn" id="startStream" type="button">Go live</button>
             <button class="btn ghost" id="cancelPublish" type="button">Cancel</button>
@@ -146,6 +140,7 @@
               <summary id="obsSetupSummary">Set up OBS</summary>
               <ol class="obs-steps" id="obsSteps"></ol>
             </details>
+            <button class="linklike" id="ingestSwitch" type="button" hidden>Older encoder without WHIP? Use the classic setup</button>
           </div>
           <div class="share-bar">
             <span class="share-k">Share</span>
@@ -157,9 +152,11 @@
             <span class="share-k">Invite</span>
             <code id="inviteLink">unstation://watch/…</code>
             <button class="copy" id="copyInvite" data-copy="inviteLink" type="button">Copy</button>
+            <button class="share-act fast-chip" id="fastInviteChip" type="button" aria-pressed="false" hidden>⚡ Fast connect</button>
             <button class="share-act" id="showQrBtn" type="button">Show QR</button>
             <button class="share-act" id="shareInviteBtn" type="button" hidden>Share…</button>
           </div>
+          <div class="fast-invite-hint" id="fastInviteHint" hidden>This invite lets a friend connect straight to you — video arrives sooner, without the byte-for-byte check.</div>
           <div class="pub-health" id="pubHealth">
             <div class="steps pub-steps" id="pubSteps">
               <div class="step" data-k="identity"><span class="dot"></span><span class="s-lbl">Identity</span></div>

@@ -108,47 +108,73 @@ function cancelObsTimer(){ if(obsTimer){ clearTimeout(obsTimer); obsTimer=null; 
   const sh=document.getElementById('shareInviteBtn'); if(sh) sh.hidden = !isMobile();
 }
 
-/* ---- ingest picker (desktop): OBS-RTMP (default) vs OBS-WHIP (lower latency) ---- */
-// Android publishes from the camera, so the picker is desktop-only.
-let ingestMode = 'rtmp';
-{
-  const pick=document.getElementById('ingestPick');
-  if(pick){
-    if(isMobile()) pick.style.display='none';
-    pick.querySelectorAll('.ing-opt').forEach(b=>b.addEventListener('click', ()=>{
-      ingestMode=b.dataset.mode;
-      pick.querySelectorAll('.ing-opt').forEach(o=>{ const on=o===b; o.classList.toggle('on',on); o.setAttribute('aria-checked', on?'true':'false'); });
-    }));
-  }
-}
+/* ---- ingest: no user-facing protocol choice ----
+   The default is the modern encoder path (WHIP: OBS 30+, lower latency, enables fast
+   connect); a quiet link in the console switches to the classic RTMP setup for older
+   encoders — offered only while WAITING for the encoder, never under a live stream.
+   Android publishes from the camera; none of this applies there. */
+let ingestMode = 'whip';
 
 // Populate the console's ingest card for the mode the backend actually opened
-// (info.ingest_mode): RTMP shows Server + Stream key + OBS-custom steps; WHIP shows a
-// single WHIP URL (no key) + WHIP steps. Used by both go-live and tab-back re-attach.
+// (info.ingest_mode): WHIP shows a single URL (no key) + OBS-30 steps; RTMP shows
+// Server + Stream key + classic steps. Used by go-live, tab-back re-attach, and the
+// setup-switch link.
 function renderIngestCard(info){
   const whip = info.ingest_mode === 'whip';
   const set=(id,t)=>{ const el=document.getElementById(id); if(el) el.textContent=t; };
   set('ingestServer', info.ingest_server);
   set('ingestKey', info.stream_key);
-  set('ingestServerK', whip ? 'WHIP URL' : 'Server');
+  set('ingestServerK', whip ? 'URL' : 'Server');
   const kf=document.getElementById('ingestKeyField'); if(kf) kf.style.display = whip ? 'none' : '';
   set('obsSetupSummary', whip ? STRINGS.obsSetupTitleWhip : STRINGS.obsSetupTitle);
   const hint=document.getElementById('pubWaitingHint');
-  if(hint && whip) hint.textContent = STRINGS.whipWaitingHint;
+  if(hint && !isMobile()) hint.textContent = whip ? STRINGS.whipWaitingHint : STRINGS.rtmpWaitingHint;
   const ol=document.getElementById('obsSteps');
   if(ol){ ol.innerHTML='';
     (whip ? [STRINGS.whipStep1, STRINGS.whipStep2, STRINGS.whipStep3]
           : [STRINGS.obsStep1, STRINGS.obsStep2, STRINGS.obsStep3])
       .forEach(t=>{ const li=document.createElement('li'); li.textContent=t; ol.appendChild(li); });
   }
+  const sw=document.getElementById('ingestSwitch');
+  if(sw){
+    sw.textContent = whip ? STRINGS.ingestSwitchToClassic : STRINGS.ingestSwitchToModern;
+    sw.hidden = isMobile() || S.pubLive; // never offer a restart under a live stream
+  }
+  // Fast-connect invites exist only where the fast tier does (the WHIP publish path).
+  const fc=document.getElementById('fastInviteChip');
+  if(fc) fc.hidden = !whip;
+  if(!whip && fastInviteOn){ fastInviteOn = false; refreshInviteUi(); }
 }
 
-/* ---- invite link + QR + share sheet ---- */
+// Switch encoder setups while waiting (stop + restart the publish in the other mode).
+async function switchIngest(){
+  if(S.pubLive || !NATIVE || !invoke) return;
+  ingestMode = ingestMode === 'whip' ? 'rtmp' : 'whip';
+  try{
+    await invoke('stop_publish');
+    const info = await invoke('start_publish', { title: S.pubName, ingestMode });
+    S.pubHlsUrl = info.hls_url;
+    renderIngestCard(info);
+  }catch(err){ publishStartFailed(err); }
+}
+{ const sw=document.getElementById('ingestSwitch'); if(sw) sw.addEventListener('click', switchIngest); }
+
+/* ---- invite link + QR + share sheet ----
+   The invite row can flip into a FAST-CONNECT invite (a ?fast link): the broadcaster's
+   explicit act of trust — direct, sooner, unverified video for a few friends. */
+let fastInviteOn = false;
 function refreshInviteUi(){
-  const link = S.pubName ? makeInviteLink(S.pubName) : '';
+  const link = S.pubName ? makeInviteLink(S.pubName, fastInviteOn) : '';
   const el=document.getElementById('inviteLink'); if(el) el.textContent = link || '—';
+  const fc=document.getElementById('fastInviteChip');
+  if(fc){ fc.classList.toggle('on', fastInviteOn); fc.setAttribute('aria-pressed', fastInviteOn?'true':'false'); }
+  const hint=document.getElementById('fastInviteHint');
+  if(hint) hint.hidden = !fastInviteOn;
   return link;
 }
+{ const fc=document.getElementById('fastInviteChip');
+  if(fc){ fc.textContent = STRINGS.fastInviteChip; fc.addEventListener('click', ()=>{ fastInviteOn = !fastInviteOn; refreshInviteUi(); }); } }
+{ const h=document.getElementById('fastInviteHint'); if(h) h.textContent = STRINGS.fastInviteOnHint; }
 async function showInviteQr(){
   const link=refreshInviteUi(); if(!link) return;
   const box=document.getElementById('inviteQrBox'); if(!box) return;
@@ -280,6 +306,8 @@ export function applyPublishState(live){
     cancelObsTimer();
     if(window.__keepAwake) window.__keepAwake(true); // a background publish still keeps the device awake
   } else { S.pubLiveSince = 0; lowIngestRuns = 0; zeroViewersSince = 0; }
+  // The setup-switch link restarts the ingest — never offer that under a live stream.
+  { const sw=document.getElementById('ingestSwitch'); if(sw) sw.hidden = isMobile() || live; }
   updatePubHealth();
   if(S.curState==='settings') updateSettingsStatus();
   // Only drive the on-screen console video when it's visible — a background publish

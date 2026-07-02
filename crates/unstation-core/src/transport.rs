@@ -51,9 +51,10 @@ pub enum EngineEvent {
     /// left converts to a background seed (keeps caching + resharing the live window,
     /// no playback) instead of tearing down. Seeding-by-default keeps the mesh healthy.
     SetRole(crate::config::Role),
-    /// Locally injected: retune the upload budget at runtime (bits/sec; 0 = unmetered).
+    /// Locally injected: retune the upload budget at runtime (bits/sec; 0 = STOP serving —
+    /// the token bucket stops refilling, so uploads cease once the residual burst drains).
     /// The health monitor lowers it on an unstable/slow link and restores it when the
-    /// link proves itself again.
+    /// link proves itself again; the Settings sharing cap clamps it.
     SetUploadBudget(u64),
     /// Locally injected once the verified manifest is in hand: the stream's REAL segment
     /// (or LL part) duration in ms. The picker's deadline math and the live-lag stat both

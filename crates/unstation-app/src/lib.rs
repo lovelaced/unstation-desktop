@@ -53,6 +53,12 @@ const TICK: Duration = Duration::from_millis(100);
 #[derive(Default)]
 struct AppState {
     signed_in: Mutex<bool>,
+    /// Upload-sharing cap in bits/sec, from Settings ("Sharing your connection").
+    /// 0 = Auto (the health monitor's ladder unclamped); 1 ≈ Off (the token bucket
+    /// effectively never refills); anything else clamps the ladder.
+    lend_cap_bps: Arc<AtomicU64>,
+    /// Settings kill-switch for fast-connect invites (default OFF = invites honored).
+    fast_off: Arc<AtomicBool>,
     watch: Mutex<Option<WatchSession>>,
     /// A background seed (seed-by-default): the converted remains of a watch whose
     /// player left — still caching + resharing the live window for the mesh.
@@ -262,6 +268,17 @@ fn cfg(mode: Mode, role: Role) -> MeshConfig {
     }
 }
 
+/// The health monitor's contribution ladder (full / reduced / paused) for viewers
+/// sharing their connection. The Settings cap clamps it (see [`effective_lend`]).
+const LEND_BUDGETS: [u64; 3] = [20_000_000, 4_000_000, 0];
+
+/// Apply the user's upload-sharing cap to a health-ladder budget. `cap == 0` means Auto
+/// (no clamp); `1` is the Settings "Off" (a bucket refilling at 1 bit/s serves nothing);
+/// otherwise the smaller of the two wins. "Paused" (budget 0) always stays paused.
+fn effective_lend(budget: u64, cap: u64) -> u64 {
+    if cap == 0 { budget } else { budget.min(cap) }
+}
+
 /// ICE servers. Host candidates carry a LAN on their own; a public STUN server lets
 /// cross-subnet/NAT pairs find a route too. Overridable via `UNSTATION_STUN`
 /// (comma-separated URIs; set it empty for host-candidate-only, e.g. an offline/
@@ -460,9 +477,16 @@ async fn start_watch(
 
     // Real viewer node: starts with no known segments; the live-edge poller feeds
     // it `LiveEdge { seq, id }` so it knows what to fetch and how to verify it.
+    // The initial upload budget honors the Settings sharing cap from the first tick
+    // (the health monitor only re-sends budgets on level transitions).
+    let mut viewer_cfg = cfg(Mode::Live, Role::Viewer);
+    viewer_cfg.upload_budget_bps = effective_lend(
+        viewer_cfg.upload_budget_bps,
+        state.lend_cap_bps.load(Ordering::Relaxed),
+    );
     let viewer = MeshNode::new_viewer(
         session.my_peer,
-        cfg(Mode::Live, Role::Viewer),
+        viewer_cfg,
         SEG_BYTES,
         sink,
         HashMap::new(),
@@ -506,13 +530,13 @@ async fn start_watch(
     // paused) and drops the relay advertisement; 30s of clean samples steps back up.
     let health = Arc::new(std::sync::atomic::AtomicU8::new(0));
     {
-        const BUDGETS: [u64; 3] = [20_000_000, 4_000_000, 0];
         let s = session.clone();
         let vtx = view_tx.clone();
         let appc = app.clone();
         let mut rx = stats_rx.clone();
         let relay_gate = relay_gate.clone();
         let health = health.clone();
+        let lend_cap = state.lend_cap_bps.clone();
         let stream_name = canonical_stream_name(&target);
         tasks.push(tokio::spawn(async move {
             let mut last = rx.borrow().clone();
@@ -543,7 +567,10 @@ async fn start_watch(
                 if next != cur {
                     health.store(next, Ordering::Relaxed);
                     relay_gate.store(next == 0, Ordering::Relaxed);
-                    let _ = vtx.send(EngineEvent::SetUploadBudget(BUDGETS[next as usize]));
+                    let _ = vtx.send(EngineEvent::SetUploadBudget(effective_lend(
+                        LEND_BUDGETS[next as usize],
+                        lend_cap.load(Ordering::Relaxed),
+                    )));
                     log::info!(
                         "[lend] contribution → {} ({})",
                         ["full", "reduced", "paused"][next as usize],
@@ -1016,6 +1043,32 @@ fn watch_status(state: State<'_, AppState>) -> Option<WatchStatus> {
     })
 }
 
+/// Settings → "Sharing your connection": cap the upload the mesh may use to pass streams
+/// along. `bps` 0 = Auto (health-gated only), 1 ≈ Off, else a hard ceiling. Applied to any
+/// running watch/seed node immediately; new sessions pick it up at build time.
+#[tauri::command]
+fn set_lend_cap(state: State<'_, AppState>, bps: u64) {
+    state.lend_cap_bps.store(bps, Ordering::Relaxed);
+    log::info!("[lend] sharing cap → {}", if bps == 0 { "auto".into() } else { format!("{bps} bps") });
+    // A running watch applies the cap at its CURRENT health level.
+    if let Some(w) = state.watch.lock().unwrap().as_ref() {
+        let level = w.health.load(Ordering::Relaxed).min(2) as usize;
+        let _ = w.node_tx.send(EngineEvent::SetUploadBudget(effective_lend(LEND_BUDGETS[level], bps)));
+    }
+    // A background seed serves at the full ladder budget; clamp it too.
+    if let Some(sd) = state.seed.lock().unwrap().as_ref() {
+        let _ = sd.node_tx.send(EngineEvent::SetUploadBudget(effective_lend(LEND_BUDGETS[0], bps)));
+    }
+}
+
+/// Settings → "Fast connect": whether the publisher honors fast-connect invites. When off,
+/// the accept loop declines offers and invited viewers stay on the verified stream.
+#[tauri::command]
+fn set_fast_connect(state: State<'_, AppState>, allowed: bool) {
+    state.fast_off.store(!allowed, Ordering::Relaxed);
+    log::info!("[fast] invites {}", if allowed { "honored" } else { "declined (Settings)" });
+}
+
 /// Fast tier (opt-in, unverified, sub-second): the webview built a recvonly `RTCPeerConnection`
 /// and gathered `offer_sdp`. Relay it to the publisher over the fast-tier signaling topic and
 /// pump the answer back to the webview (`fast-answer`), or `fast-closed` if the publisher
@@ -1389,7 +1442,12 @@ async fn start_publish(
         // feeder fans each AU onto the connected viewers' tracks. (RTMP has no raw AUs, so it
         // offers no fast tier — those viewers stay on the mesh.)
         let fast = fasttier::FastTier::new(FAST_TIER_CAP, stun());
-        tasks.push(fasttier::spawn_accept_loop(session.signaling(), session.my_peer, fast.clone()));
+        tasks.push(fasttier::spawn_accept_loop(
+            session.signaling(),
+            session.my_peer,
+            fast.clone(),
+            state.fast_off.clone(),
+        ));
         let fast_feed = fast;
         let (whip_tx, whip_rx) = std::sync::mpsc::channel::<whip_ingest::server::IngestAu>();
         let server = whip_ingest::server::start(whip_tx, stun())
@@ -1836,17 +1894,22 @@ static CAMERA_PLUGIN: std::sync::OnceLock<tauri::plugin::PluginHandle<tauri::Wry
 /// which ingests via RTMP/OBS. JS calls this right after `start_publish` opens the AU intake.
 #[cfg(feature = "publish")]
 #[tauri::command]
-fn camera_start() -> Result<(), String> {
+fn camera_start(quality: Option<String>) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
+        // Settings → "Camera quality": "480" | "720" | "1080" (anything else = the
+        // plugin's 720p default). Applies from this capture onward.
         return CAMERA_PLUGIN
             .get()
             .ok_or("camera plugin not registered")?
-            .run_mobile_plugin::<()>("startCapture", ())
+            .run_mobile_plugin::<()>("startCapture", serde_json::json!({ "quality": quality }))
             .map_err(|e| e.to_string());
     }
     #[cfg(not(target_os = "android"))]
-    Ok(())
+    {
+        let _ = quality;
+        Ok(())
+    }
 }
 
 /// Stop the Android camera capture. No-op on desktop.
@@ -1949,6 +2012,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         watch_status,
         fast_watch_start,
         fast_watch_stop,
+        set_lend_cap,
+        set_fast_connect,
         start_publish,
         stop_publish,
         publish_status,
@@ -1973,6 +2038,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         watch_status,
         fast_watch_start,
         fast_watch_stop,
+        set_lend_cap,
+        set_fast_connect,
         set_keep_awake,
         open_app_settings
     ]);

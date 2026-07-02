@@ -21,7 +21,11 @@ window.__keepAwake = (on)=>{ if(NATIVE && invoke) return invoke('set_keep_awake'
 // stashed (S.pendingWatch) and the normal onboarding flow resumes it on success
 // (resumeAfterSignIn); when already signed in it starts the watch immediately.
 function handleInviteUrl(url){
-  const name = parseInviteLink(url); if(!name) return;
+  const inv = parseInviteLink(url); if(!inv) return;
+  const name = inv.name;
+  // A fast-connect invite unlocks the publisher-direct attempt for THIS stream only;
+  // the verified path is unchanged and remains the fallback.
+  S.fastFor = inv.fast ? name : '';
   if(!NATIVE || S.chainReady){ startWatch(name); return; }
   S.pendingWatch = name;
   // Not signed in: surface the sign-in flow (a cached session coalesces onto the
@@ -118,6 +122,12 @@ async function boot(){
     // reload, or relaunch while the process lived), light the Go-Live tab badge so
     // the user can tab straight back into it.
     if(invoke){ try{ const ps = await invoke('publish_status'); if(ps){ S.pubActive = true; S.pubName = ps.name; S.pubHlsUrl = ps.info.hls_url; S.publishing = true; refreshGoLiveBadge(); } }catch(e){} }
+    // Push saved preferences to the backend (it holds no persistent store of its own):
+    // the upload-sharing cap and whether fast-connect invites are honored.
+    if(invoke){
+      try{ const cap = parseInt(localStorage.getItem('lendCap')||'0',10); if(cap>=0) invoke('set_lend_cap',{ bps: cap }).catch(()=>{}); }catch(e){}
+      try{ const off = localStorage.getItem('fastConnect')==='off'; invoke('set_fast_connect',{ allowed: !off }).catch(()=>{}); }catch(e){}
+    }
     try {
       // Wait for the saved session to hydrate from storage (async) before
       // deciding — a sync check here races hydration and re-prompts for the QR.
@@ -127,7 +137,14 @@ async function boot(){
         // phone already disposed), surface onboarding with a retry instead of sitting
         // on entry looking signed-in while publish/watch silently fail. On success,
         // resume a deep-linked invite that arrived while the bridge was in flight.
-        pushChainIdentity().then(ok=>{ if(!ok){ go('onboarding'); const pb=document.getElementById('pairedBtn'); if(pb) pb.style.display='none'; showRetry(true); } else if(S.pendingWatch){ resumeAfterSignIn(); } });
+        pushChainIdentity().then(ok=>{
+          if(!ok){ go('onboarding'); const pb=document.getElementById('pairedBtn'); if(pb) pb.style.display='none'; showRetry(true); }
+          else if(S.pendingWatch){ resumeAfterSignIn(); }
+          // Re-attach a running WATCH — on Android an activity recreation reloads the
+          // webview while the stream keeps playing in Rust; without this the user lands
+          // on the entry screen with no way back to their live player.
+          else { invoke('watch_status').then(ws=>{ if(ws) enterWatch(); }).catch(()=>{}); }
+        });
       }
       else { go('onboarding'); document.getElementById('pairedBtn').style.display='none'; beginPairing(); }
     } catch(e){ go('entry'); }

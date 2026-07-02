@@ -32,13 +32,26 @@ let badgeTimer = 0;
 
 const byId = (id) => document.getElementById(id);
 
-/** Show the toggle only when it can do anything: native shell + actively watching. */
+/** Show the toggle only when this watch is fast-connect ELIGIBLE: the broadcaster shared
+ *  a fast-connect invite for this stream (S.fastEligible, set by startWatch). Everyone
+ *  else stays on the verified stream with no choice to make. */
 export function refreshFastAvailability() {
   const btn = byId('fastBtn');
   if (!btn) return;
-  const canFast = NATIVE && !!invoke && ['live', 'catchup'].includes(S.curState);
+  const canFast =
+    NATIVE && !!invoke && S.fastEligible && ['live', 'catchup'].includes(S.curState);
   btn.hidden = !canFast;
   if (!canFast && active) disableFastTier(); // left the watch while engaged
+}
+
+// Auto-engage once per watch: a friend opening a fast-connect invite shouldn't need to
+// find a button — the direct connection is attempted as soon as the verified stream is
+// up, and any failure falls back silently to what's already playing.
+let autoEngaged = false;
+export function maybeAutoEngageFast() {
+  if (!S.fastEligible || autoEngaged || active) return;
+  autoEngaged = true;
+  enableFastTier();
 }
 
 export function toggleFastTier() {
@@ -116,6 +129,7 @@ function onTrack(stream) {
 
 /** Tear the fast tier down from outside (watch teardown / leave). */
 export function stopFastTier() {
+  autoEngaged = false; // the next fast-invited watch auto-engages afresh
   if (active || pc) disableFastTier();
 }
 

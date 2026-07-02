@@ -78,6 +78,8 @@ export const S = {
   fsOn: false,
   watchTarget: '',      // the stream name last submitted to start_watch — Rejoin/Try-again re-submit it
   pendingWatch: '',     // invite deep-link received before sign-in finished — resumed by resumeAfterSignIn
+  fastFor: '',          // canonical stream name a fast-connect invite unlocked ('' = none)
+  fastEligible: false,  // the CURRENT watch arrived via a fast-connect invite (set by startWatch)
   ingestKbps: 0,        // publish-stats: encoder → ingest bitrate (last 2s window)
   uplinkKbps: 0,        // publish-stats: mesh uplink to viewers (last 2s window)
 };

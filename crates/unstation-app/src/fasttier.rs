@@ -310,8 +310,12 @@ pub fn spawn_accept_loop(
     signaling: unstation_chain::ChainSignaling,
     my_peer: PeerId,
     fast: std::sync::Arc<FastTier>,
+    // Settings kill-switch ("Fast connect: off") — offers are declined while set, so
+    // invited viewers stay on the verified stream.
+    off: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     use std::collections::HashSet;
+    use std::sync::atomic::Ordering;
     tokio::spawn(async move {
         let mut push = signaling.subscribe_fast_signals_push(my_peer);
         // Offers we've already answered this session (dedup — the viewer resends until it
@@ -335,7 +339,12 @@ pub fn spawn_accept_loop(
                             // them to its CURRENT attempt (stale statements linger ~30s).
                             let tag = offer_tag(&sdp);
                             let offer = sdp_str(&sdp);
-                            match fast.accept_offer(viewer.0, offer).await {
+                            let decision = if off.load(Ordering::Relaxed) {
+                                None // Settings: fast connect off → decline; mesh carries them
+                            } else {
+                                fast.accept_offer(viewer.0, offer).await
+                            };
+                            match decision {
                                 Some(answer) => {
                                     match signaling
                                         .publish_fast_signal(
