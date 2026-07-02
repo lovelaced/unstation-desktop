@@ -211,7 +211,7 @@ fn negotiate(
 /// SDP: find the `m=video` section, its `a=mid:`, and the payload type of the
 /// `a=rtpmap:<pt> H264/90000` line. Text-scanning keeps this independent of the SDP
 /// object model.
-fn video_mline(sdp: &str) -> Option<(String, i32)> {
+pub(crate) fn video_mline(sdp: &str) -> Option<(String, i32)> {
     let mut in_video = false;
     let mut mid: Option<String> = None;
     let mut pt: Option<i32> = None;
@@ -254,7 +254,7 @@ fn header(k: &str, v: &str) -> tiny_http::Header {
 /// (RFC 8445), so a same-host WHIP client (ffmpeg/tests) never connects unless we bind
 /// an explicit address. Set `UNSTATION_BIND_ADDR=127.0.0.1` for local/CI; production
 /// leaves it unset and gathers all interfaces.
-fn rtc_config(stun: &[String]) -> RtcConfig {
+pub(crate) fn rtc_config(stun: &[String]) -> RtcConfig {
     let cfg = RtcConfig::new(stun);
     match std::env::var("UNSTATION_BIND_ADDR") {
         Ok(addr) if !addr.is_empty() => cfg.bind_address(&addr),
