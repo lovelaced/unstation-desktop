@@ -85,6 +85,15 @@ impl H264Depacketizer {
         if pkt.len() < 12 || pkt.len() > MAX_RTP_LEN || (pkt[0] >> 6) != 2 {
             return None; // not RTP v2 / absurd size
         }
+        // RFC 5761 §4: with rtcp-mux, RTCP shares the transport and libdatachannel hands
+        // the track handler both kinds. The second byte disambiguates: 192..=223 are RTCP
+        // packet types (SR=200, RR=201, …) — a range RTP can't produce because payload
+        // types 64–95 are reserved for exactly this reason. An SR parsed as RTP reads as
+        // a giant sequence jump, poisoning the stream to the next IDR (a dropped GOP
+        // every RTCP interval), so RTCP must never touch the sequence/timestamp state.
+        if (192..=223).contains(&pkt[1]) {
+            return None;
+        }
         let has_padding = pkt[0] & 0x20 != 0;
         let has_ext = pkt[0] & 0x10 != 0;
         let csrc_count = (pkt[0] & 0x0F) as usize;
@@ -439,6 +448,25 @@ mod tests {
             au.data,
             [&[0, 0, 0, 1, 0x67, 1][..], &[0, 0, 0, 1, 0x68, 2], &[0, 0, 0, 1, 0x65, 3]].concat()
         );
+    }
+
+    #[test]
+    fn rtcp_on_the_muxed_transport_does_not_poison_the_stream() {
+        // rtcp-mux delivers RTCP to the same track handler (RFC 5761). ffmpeg's whip
+        // muxer sends an SR every ~5s; parsed as RTP it looked like a sequence jump and
+        // dropped a GOP each time. RTCP must be ignored without touching seq state.
+        let mut d = H264Depacketizer::new();
+        for p in idr_packets(1, 0) {
+            d.push(&p);
+        }
+        // A minimal RTCP Sender Report: V=2, PT=200, length words, SSRC + sender info.
+        let mut sr = vec![0x80u8, 200, 0, 6];
+        sr.extend_from_slice(&[0; 24]);
+        assert!(d.push(&sr).is_none(), "RTCP yields no access unit");
+        // The very next RTP packet continues the sequence — no poison, the P-frame plays.
+        let au = d.push(&rtp(4, 3000, true, &[0x41, 1, 2])).expect("stream unbroken");
+        assert!(!au.keyframe);
+        assert_eq!(au.data, vec![0, 0, 0, 1, 0x41, 1, 2]);
     }
 
     #[test]
