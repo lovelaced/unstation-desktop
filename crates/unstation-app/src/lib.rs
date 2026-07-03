@@ -316,7 +316,12 @@ fn effective_lend(budget: u64, cap: u64) -> u64 {
 fn stun() -> Vec<String> {
     let mut servers: Vec<String> = match std::env::var("UNSTATION_STUN") {
         Ok(v) => v.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).map(String::from).collect(),
-        Err(_) => vec!["stun:stun.l.google.com:19302".into()],
+        // Two independent providers: STUN is stateless commodity infrastructure, but a
+        // single provider is still a single hostname to block or break.
+        Err(_) => vec![
+            "stun:stun.l.google.com:19302".into(),
+            "stun:stun.cloudflare.com:3478".into(),
+        ],
     };
     if let Ok(turn) = std::env::var("UNSTATION_TURN") {
         servers.extend(
