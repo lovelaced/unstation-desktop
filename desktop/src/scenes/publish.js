@@ -272,8 +272,13 @@ export function showPubSetup(){
 // ingest stays available (the Rust feeder keeps the listener up), so the encoder
 // can connect ANY time, in any order — `publish-state` flips the console
 // LIVE/waiting to match the actual video.
+let goLiveInFlight = false; // a double submit (keyboard Go + click, key repeat) must not start twice
 export async function goLiveStart(){
-  if(!S.publishing) return;
+  if(!S.publishing || goLiveInFlight) return;
+  goLiveInFlight = true;
+  try { await goLiveStartInner(); } finally { goLiveInFlight = false; }
+}
+async function goLiveStartInner(){
   if(!ensureSignedIn()) return;
   try{ titleEl.blur(); }catch(e){} // drop the phone keyboard before the console appears
   S.pubName = shareName(titleEl.value);

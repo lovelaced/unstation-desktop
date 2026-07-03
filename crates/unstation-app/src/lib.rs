@@ -65,6 +65,12 @@ struct AppState {
     seed: Mutex<Option<SeedSession>>,
     #[cfg(feature = "publish")]
     publish: Mutex<Option<PublishSession>>,
+    /// Serializes start_publish: two CONCURRENT calls (a double submit) both pass the
+    /// re-attach check and the second silently REPLACES the first session — detaching
+    /// (not aborting) its tasks, which then leak: a second stats loop kept emitting
+    /// stale zeros over the real numbers ("Camera —" while visibly live).
+    #[cfg(feature = "publish")]
+    pub_busy: Arc<AtomicBool>,
     /// True once the statement store has been initialized with the paired
     /// (allowance-backed) identity via `set_chain_identity`. Publishing/watching
     /// requires this — an unprovisioned key can't write to the chain.
@@ -271,6 +277,24 @@ fn cfg(mode: Mode, role: Role) -> MeshConfig {
 /// The health monitor's contribution ladder (full / reduced / paused) for viewers
 /// sharing their connection. The Settings cap clamps it (see [`effective_lend`]).
 const LEND_BUDGETS: [u64; 3] = [20_000_000, 4_000_000, 0];
+
+/// Scope guard for [`AppState::pub_busy`]: clears the flag on every exit path
+/// (including `?` early returns) so a failed start never wedges publishing.
+#[cfg(feature = "publish")]
+struct PubBusyGuard(Arc<AtomicBool>);
+#[cfg(feature = "publish")]
+impl Drop for PubBusyGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+#[cfg(feature = "publish")]
+fn claim_pub_busy(state: &AppState) -> Result<PubBusyGuard, String> {
+    if state.pub_busy.swap(true, Ordering::SeqCst) {
+        return Err("Already going live — one moment.".into());
+    }
+    Ok(PubBusyGuard(state.pub_busy.clone()))
+}
 
 /// Apply the user's upload-sharing cap to a health-ladder budget. `cap == 0` means Auto
 /// (no clamp); `1` is the Settings "Off" (a bucket refilling at 1 bit/s serves nothing);
@@ -1201,6 +1225,7 @@ fn spawn_publish_stats(
             let uplink_kbps = (sent.saturating_sub(last_sent) * 8 / 2 / 1000) as u32;
             last_ingest = ing;
             last_sent = sent;
+            log::info!("[publish] stats viewers={} ingest={}kbps uplink={}kbps", session.peer_count(), ingest_kbps, uplink_kbps);
             let _ = app.emit(
                 "publish-stats",
                 PublishStatsMsg { viewers: session.peer_count(), ingest_kbps, uplink_kbps },
@@ -1308,6 +1333,7 @@ async fn start_publish(
     title: Option<String>,
     ingest_mode: Option<String>,
 ) -> Result<PublishInfo, String> {
+    let _busy = claim_pub_busy(&state)?; // one setup at a time — see AppState::pub_busy
     if !*state.chain_ready.lock().unwrap() {
         return Err("Sign in with the Polkadot app to go live — your stream is announced under your verified identity.".into());
     }
@@ -1681,6 +1707,7 @@ async fn start_publish(
     state: State<'_, AppState>,
     title: Option<String>,
 ) -> Result<PublishInfo, String> {
+    let _busy = claim_pub_busy(&state)?; // one setup at a time — see AppState::pub_busy
     if !*state.chain_ready.lock().unwrap() {
         return Err("Sign in with the Polkadot app to go live — your stream is announced under your verified identity.".into());
     }

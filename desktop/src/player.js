@@ -45,12 +45,18 @@ export function startWatchWatchdog(){
 // players fetch the parts-free /std.m3u8 view of the same window. hls.js keeps /live.m3u8.
 export function nativeUrl(url){ return url ? url.replace('live.m3u8','std.m3u8') : url; }
 
-// Videos stay invisible (opacity 0) until frames actually render — an attached-but-idle
-// <video> paints the WebView's stretched play-glyph placeholder, which reads as broken.
-// `.playing` flips on the playing event and off whenever the media resets.
+// Videos stay invisible (opacity 0) until a frame has actually been PRESENTED — an
+// attached-but-frameless <video> paints the WebView's stretched play-glyph placeholder,
+// which reads as broken. The `playing` event alone races the first decoded frame (the
+// glyph would ride the fade-in), so the reveal waits for requestVideoFrameCallback —
+// the true first-composited-frame signal — with `playing` as the fallback on engines
+// without it. `.playing` drops whenever the media resets.
 ['vid','pubVid','fastVid'].forEach(id=>{
   const v=document.getElementById(id); if(!v) return;
-  v.addEventListener('playing', ()=>v.classList.add('playing'));
+  v.addEventListener('playing', ()=>{
+    if (typeof v.requestVideoFrameCallback === 'function') v.requestVideoFrameCallback(()=>v.classList.add('playing'));
+    else v.classList.add('playing');
+  });
   ['emptied','loadstart','ended'].forEach(ev=>v.addEventListener(ev, ()=>v.classList.remove('playing')));
 });
 
