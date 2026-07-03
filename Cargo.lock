@@ -1925,13 +1925,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "unstation-node"
-version = "0.0.0"
-dependencies = [
- "unstation-core",
-]
-
-[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"

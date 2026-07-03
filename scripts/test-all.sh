@@ -45,6 +45,8 @@ step "engine suite (cargo test --workspace)" \
   cargo test --workspace
 step "real-WebRTC mesh over loopback" \
   env UNSTATION_BIND_ADDR=127.0.0.1 cargo test -p transport-libdc --test mesh_loopback -- --ignored --nocapture
+step "real-WebRTC wide fan-out (1 publisher → 8 viewers, 2 leave mid-stream)" \
+  env UNSTATION_BIND_ADDR=127.0.0.1 cargo test -p transport-libdc --test fanout_loopback -- --ignored --nocapture
 step "scale sim (metrics)" \
   cargo test -p unstation-core --test scale_sim -- --nocapture
 
@@ -76,6 +78,13 @@ if [ "$WITH_CHAIN" = 1 ]; then
       && NODE_WS="${NODE_WS:-ws://127.0.0.1:9944}" \
          cargo test --test chain_e2e -- --ignored --nocapture ) \
       && echo "  ✓ chain e2e" || { echo "  ✗ chain e2e"; FAILED+=("chain e2e"); }
+    # Volunteer seed e2e: the REAL unstation-node binary discovers a publisher
+    # session over the real chain, dials it over real WebRTC, and caches the live
+    # window. (It provisions its own key via provision-allowance.sh.)
+    ( cd crates/unstation-node \
+      && NODE_WS="${NODE_WS:-ws://127.0.0.1:9944}" \
+         cargo test --test seed_e2e -- --ignored --nocapture ) \
+      && echo "  ✓ seed e2e" || { echo "  ✗ seed e2e"; FAILED+=("seed e2e"); }
   fi
 fi
 

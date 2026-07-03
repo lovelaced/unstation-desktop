@@ -1,12 +1,22 @@
 [package]
 name = "unstation-node"
 version = "0.0.0"
-edition.workspace = true
-license.workspace = true
+edition = "2021"
+license = "AGPL-3.0-or-later"
 
 [[bin]]
 name = "unstation-node"
 path = "src/main.rs"
 
+# Excluded from the engine workspace (like unstation-app): it boots the chain SDK via
+# unstation-chain/-session. Build from this directory: `cargo build`.
 [dependencies]
 unstation-core = { path = "../unstation-core" }
+unstation-chain = { path = "../unstation-chain" }
+unstation-session = { path = "../unstation-session" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }
+log = "0.4"
+env_logger = "0.11"
+
+[dev-dependencies]
+bytes = "1"
