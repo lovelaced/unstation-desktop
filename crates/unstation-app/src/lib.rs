@@ -927,13 +927,17 @@ fn spawn_seed_status(
 }
 
 #[tauri::command]
-fn stop_watch(app: AppHandle, state: State<'_, AppState>) {
+async fn stop_watch(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    // Async so it runs on the tauri/tokio runtime: `spawn_seed_status` below calls
+    // `tokio::spawn`, and a sync command executes on the MAIN thread (inside the wry
+    // URL-scheme handler), where there is no reactor — that panic aborted the app.
+    //
     // Seed-by-default: leaving a stream converts the session into a background seed
     // (same node + connections, Role::Seed, cursor pinned to the live edge) so the
     // mesh keeps a helper — but only on a link the health monitor rates FULL. An
     // unstable or slow connection tears down like before; so does opting out
     // (UNSTATION_SEED=0).
-    let Some(sess) = state.watch.lock().unwrap().take() else { return };
+    let Some(sess) = state.watch.lock().unwrap().take() else { return Ok(()) };
     let healthy = sess.health.load(Ordering::Relaxed) == 0;
     if !(seed_by_default() && healthy) {
         let _ = sess.node_tx.send(EngineEvent::Stop);
@@ -941,7 +945,7 @@ fn stop_watch(app: AppHandle, state: State<'_, AppState>) {
             t.abort();
         }
         sess.session.shutdown();
-        return;
+        return Ok(());
     }
     let _ = sess.node_tx.send(EngineEvent::SetRole(Role::Seed));
     let _ = sess.node_tx.send(EngineEvent::SetUploadBudget(SEED_BUDGET_BPS));
@@ -968,6 +972,7 @@ fn stop_watch(app: AppHandle, state: State<'_, AppState>) {
         }
         prev.session.shutdown();
     }
+    Ok(())
 }
 
 /// Stop lending bandwidth (the Settings control).
