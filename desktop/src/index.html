@@ -106,7 +106,7 @@
         <div class="pub-left">
           <form class="cmd" id="titleForm" onsubmit="return false;">
             <span class="lead"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m22 8-6 4 6 4V8Z"/><rect x="2" y="6" width="14" height="12" rx="2"/></svg></span>
-            <input id="streamTitle" maxlength="60" spellcheck="false" placeholder="Friday Night Football" />
+            <input id="streamTitle" maxlength="60" spellcheck="false" enterkeyhint="go" placeholder="Friday Night Football" />
           </form>
           <div class="hint">viewers tune in with&nbsp;&nbsp;<b id="sharePreview" class="accent">friday-night-football</b></div>
           <div class="pub-actions" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
@@ -142,21 +142,22 @@
             </details>
             <button class="linklike" id="ingestSwitch" type="button" hidden>Older encoder without WHIP? Use the classic setup</button>
           </div>
-          <div class="share-bar">
-            <span class="share-k">Share</span>
-            <code id="shareLink">friday-night-football</code>
-            <button class="copy" id="copyShare" data-copy="shareLink" type="button">Copy</button>
-            <span class="viewers"><span id="pubViewers">0</span> watching</span>
-          </div>
           <div class="share-bar invite-bar">
-            <span class="share-k">Invite</span>
+            <span class="share-k">Share</span>
             <code id="inviteLink">unstation://watch/…</code>
             <button class="copy" id="copyInvite" data-copy="inviteLink" type="button">Copy</button>
-            <button class="share-act fast-chip" id="fastInviteChip" type="button" aria-pressed="false" hidden>⚡ Fast connect</button>
             <button class="share-act" id="showQrBtn" type="button">Show QR</button>
             <button class="share-act" id="shareInviteBtn" type="button" hidden>Share…</button>
+            <span class="viewers"><span id="pubViewers">0</span> watching</span>
           </div>
-          <div class="fast-invite-hint" id="fastInviteHint" hidden>This invite lets a friend connect straight to you — video arrives sooner, without the byte-for-byte check.</div>
+          <div class="share-alt">or viewers just type <b id="shareLink" class="accent">friday-night-football</b> in Unstation</div>
+          <div class="share-bar fast-invite-row" id="fastInviteRow" hidden>
+            <span class="share-k fast-k">⚡ Fast</span>
+            <span class="fast-d" id="fastInviteDesc">straight from you, sooner — trusted friends only (not verified)</span>
+            <code id="fastInviteLink" hidden>…</code>
+            <button class="copy" id="copyFastInvite" data-copy="fastInviteLink" type="button">Copy invite</button>
+            <button class="share-act" id="shareFastInvite" type="button" hidden>Share…</button>
+          </div>
           <div class="pub-health" id="pubHealth">
             <div class="steps pub-steps" id="pubSteps">
               <div class="step" data-k="identity"><span class="dot"></span><span class="s-lbl">Identity</span></div>

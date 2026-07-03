@@ -106,8 +106,7 @@ export const STRINGS = {
   fastOn: 'Fast connect · on',
   fastBadge: '⚡ direct from the broadcaster · not verified',
   fastUnavailable: 'Fast connect unavailable — back on the verified stream',
-  fastInviteChip: '⚡ Fast connect',
-  fastInviteOnHint: 'This invite lets a friend connect straight to you — video arrives sooner, without the byte-for-byte check. For people you trust; a few at a time.',
+  fastInviteDesc: 'straight from you, sooner — trusted friends only (not verified)',
 
   // Camera-permission recovery (mobile publish).
   camPermHelp: 'Unstation needs camera access to go live. Allow it in Settings, then try again.',

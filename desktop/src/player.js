@@ -45,6 +45,15 @@ export function startWatchWatchdog(){
 // players fetch the parts-free /std.m3u8 view of the same window. hls.js keeps /live.m3u8.
 export function nativeUrl(url){ return url ? url.replace('live.m3u8','std.m3u8') : url; }
 
+// Videos stay invisible (opacity 0) until frames actually render — an attached-but-idle
+// <video> paints the WebView's stretched play-glyph placeholder, which reads as broken.
+// `.playing` flips on the playing event and off whenever the media resets.
+['vid','pubVid','fastVid'].forEach(id=>{
+  const v=document.getElementById(id); if(!v) return;
+  v.addEventListener('playing', ()=>v.classList.add('playing'));
+  ['emptied','loadstart','ended'].forEach(ev=>v.addEventListener(ev, ()=>v.classList.remove('playing')));
+});
+
 export function setVideo(url){
   const v=document.getElementById('vid'), catchup=document.getElementById('catchup'); if(!url)return;
   soundHandled=false; // a fresh attach = a fresh watch for the sound-pref logic

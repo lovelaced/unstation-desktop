@@ -67,7 +67,12 @@
   .frame .video { position: absolute; inset: 0; background:
       radial-gradient(60% 120% at 20% 10%, #2a1420, transparent 60%), radial-gradient(50% 120% at 85% 80%, #2a2018, transparent 60%), linear-gradient(120deg, #141016, #0c0a10);
     background-size: 200% 200%; animation: drift 18s var(--ease) infinite alternate; }
-  .frame video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: 1; background: transparent; display: none; }
+  .frame video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: 1; background: transparent; display: none;
+    /* Invisible until frames actually render: the WebView paints an ugly stretched
+       play-glyph placeholder on an attached-but-not-yet-playing <video>. player.js
+       adds .playing on the `playing` event and removes it when the source resets. */
+    opacity: 0; transition: opacity .35s var(--ease); }
+  .frame video.playing { opacity: 1; }
   @keyframes drift { to { background-position: 100% 100%, 0% 0%, 50% 50%; } }
   .frame .grain { position: absolute; inset: 0; opacity: .5; mix-blend-mode: overlay; background-image: radial-gradient(rgba(255,255,255,.06) .5px, transparent .5px); background-size: 3px 3px; }
   .frame .live-tag { position: absolute; top: 12px; left: 12px; z-index: 3; display: flex; align-items: center; gap: 7px; padding: 5px 10px 5px 9px; border-radius: var(--r-pill); background: rgba(8,10,15,.55); backdrop-filter: blur(10px); font-family: var(--mono); font-size: 11px; letter-spacing: 1.2px;
@@ -141,10 +146,13 @@
     font-family: var(--ui); font-size: 12px; color: var(--dim); text-decoration: underline;
     text-underline-offset: 3px; transition: color .15s var(--ease); }
   .linklike:hover { color: var(--text); }
-  /* Fast-connect invite chip in the share bar: amber when armed, matching the viewer badge. */
-  .fast-chip.on { color: #ffd27a; border-color: rgba(255,180,60,.5); background: rgba(255,180,60,.12); }
-  .fast-invite-hint { font-size: 12px; line-height: 1.5; color: #ffd27a; opacity: .85;
-    padding: 2px 2px 0; max-width: 46ch; }
+  /* "or viewers just type <name>" — the plain-name hint under the single share bar. */
+  .share-alt { font-size: 12px; color: var(--faint); text-align: left; padding: 0 4px; margin-top: -6px; }
+  .share-alt b { font-weight: 590; }
+  /* Fast-connect invite: a quiet amber one-shot row (copy/share the ?fast link). */
+  .fast-invite-row { border-color: rgba(255,180,60,.28); }
+  .fast-invite-row .fast-k { color: #ffd27a; }
+  .fast-invite-row .fast-d { flex: 1 1 auto; min-width: 0; font-size: 11.5px; line-height: 1.35; color: var(--dim); text-align: left; }
   .await { display: flex; align-items: center; gap: 9px; font-family: var(--mono); font-size: 12.5px; color: var(--dim); }
   .await .dot-await { width: 7px; height: 7px; border-radius: 50%; background: var(--accent-2); box-shadow: 0 0 10px var(--accent-2); animation: pulse 1.4s var(--ease) infinite; }
   .await.live .dot-await { background: var(--ok); box-shadow: 0 0 10px var(--ok); animation: none; }

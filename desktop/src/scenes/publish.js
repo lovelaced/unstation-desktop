@@ -106,6 +106,7 @@ function cancelObsTimer(){ if(obsTimer){ clearTimeout(obsTimer); obsTimer=null; 
   set('shareInviteBtn', STRINGS.shareSheet);
   set('inviteQrClose', STRINGS.close);
   const sh=document.getElementById('shareInviteBtn'); if(sh) sh.hidden = !isMobile();
+  const sf=document.getElementById('shareFastInvite'); if(sf){ sf.hidden = !isMobile(); sf.textContent = STRINGS.shareSheet; }
 }
 
 /* ---- ingest: no user-facing protocol choice ----
@@ -140,10 +141,9 @@ function renderIngestCard(info){
     sw.textContent = whip ? STRINGS.ingestSwitchToClassic : STRINGS.ingestSwitchToModern;
     sw.hidden = isMobile() || S.pubLive; // never offer a restart under a live stream
   }
-  // Fast-connect invites exist only where the fast tier does (the WHIP publish path).
-  const fc=document.getElementById('fastInviteChip');
-  if(fc) fc.hidden = !whip;
-  if(!whip && fastInviteOn){ fastInviteOn = false; refreshInviteUi(); }
+  // The fast-invite row exists only where the fast tier does (the WHIP publish path).
+  const fr=document.getElementById('fastInviteRow');
+  if(fr) fr.hidden = !whip;
 }
 
 // Switch encoder setups while waiting (stop + restart the publish in the other mode).
@@ -160,21 +160,26 @@ async function switchIngest(){
 { const sw=document.getElementById('ingestSwitch'); if(sw) sw.addEventListener('click', switchIngest); }
 
 /* ---- invite link + QR + share sheet ----
-   The invite row can flip into a FAST-CONNECT invite (a ?fast link): the broadcaster's
-   explicit act of trust — direct, sooner, unverified video for a few friends. */
-let fastInviteOn = false;
+   ONE share bar: the invite link IS the share (the plain name is a hint line under it).
+   The fast-connect invite is a separate ONE-SHOT copy/share of the ?fast link — no mode
+   toggle whose state a broadcaster could misread. */
 function refreshInviteUi(){
-  const link = S.pubName ? makeInviteLink(S.pubName, fastInviteOn) : '';
+  const link = S.pubName ? makeInviteLink(S.pubName) : '';
   const el=document.getElementById('inviteLink'); if(el) el.textContent = link || '—';
-  const fc=document.getElementById('fastInviteChip');
-  if(fc){ fc.classList.toggle('on', fastInviteOn); fc.setAttribute('aria-pressed', fastInviteOn?'true':'false'); }
-  const hint=document.getElementById('fastInviteHint');
-  if(hint) hint.hidden = !fastInviteOn;
+  const fl=document.getElementById('fastInviteLink');
+  if(fl) fl.textContent = S.pubName ? makeInviteLink(S.pubName, true) : '';
   return link;
 }
-{ const fc=document.getElementById('fastInviteChip');
-  if(fc){ fc.textContent = STRINGS.fastInviteChip; fc.addEventListener('click', ()=>{ fastInviteOn = !fastInviteOn; refreshInviteUi(); }); } }
-{ const h=document.getElementById('fastInviteHint'); if(h) h.textContent = STRINGS.fastInviteOnHint; }
+{ const d=document.getElementById('fastInviteDesc'); if(d) d.textContent = STRINGS.fastInviteDesc; }
+{ const b=document.getElementById('shareFastInvite');
+  if(b) b.addEventListener('click', async ()=>{
+    if(!S.pubName) return;
+    const link = makeInviteLink(S.pubName, true);
+    if(navigator.share){ try{ await navigator.share({ url: link, title: S.pubName }); return; }catch(e){ if(e && e.name==='AbortError') return; } }
+    try{ await navigator.clipboard.writeText(link); }catch(e){}
+    const old=b.textContent; b.textContent=STRINGS.copied; b.classList.add('done');
+    setTimeout(()=>{ b.textContent=old; b.classList.remove('done'); }, 1200);
+  }); }
 async function showInviteQr(){
   const link=refreshInviteUi(); if(!link) return;
   const box=document.getElementById('inviteQrBox'); if(!box) return;
@@ -244,6 +249,11 @@ export const shareName = t => slugify(t);
 const titleEl = document.getElementById('streamTitle');
 const startStreamBtn = document.getElementById('startStream');
 titleEl.addEventListener('input', ()=>{ document.getElementById('sharePreview').textContent = shareName(titleEl.value); });
+// Keyboard-first go-live: on the phone the keyboard auto-opens over the buttons, so the
+// keyboard's "Go" action key (enterkeyhint) submits directly — no closing the keyboard
+// to hunt for a button.
+{ const f=document.getElementById('titleForm');
+  if(f) f.addEventListener('submit', (e)=>{ e.preventDefault(); titleEl.blur(); goLiveStart(); }); }
 
 // Step 1 — name the stream. We deliberately do NOT open the ingest yet: the
 // stream's identity is derived from this name, so it must be fixed before we
@@ -265,6 +275,7 @@ export function showPubSetup(){
 export async function goLiveStart(){
   if(!S.publishing) return;
   if(!ensureSignedIn()) return;
+  try{ titleEl.blur(); }catch(e){} // drop the phone keyboard before the console appears
   S.pubName = shareName(titleEl.value);
   titleEl.value = S.pubName;
   titleEl.readOnly = true;
