@@ -1165,8 +1165,12 @@ async fn fast_watch_stop(state: State<'_, AppState>) -> Result<(), String> {
 /// Bulletin within a byte budget, and its `(seq → CID)` entry is announced on the
 /// durable topic so a viewer whose deadline no peer can meet can fetch it there.
 /// Sparse is the point — the metered allowance is scarce. Tunables:
-/// `UNSTATION_DURABLE_EVERY` (default 5; 0 disables) and
-/// `UNSTATION_DURABLE_BUDGET_MB` (default 50, per stream).
+/// `UNSTATION_DURABLE_EVERY` (default 5; 0 disables),
+/// `UNSTATION_DURABLE_BUDGET_MB` (default 50, per stream), and
+/// `UNSTATION_DURABLE_MIN_SECS` (default 5) — a time floor between uploads, because
+/// "every Nth segment" means 4x/5s under WHIP's 250ms LL parts vs 1x/5s under RTMP's
+/// 1s GOPs; without it a WHIP stream stacks pool transactions and burns the whole
+/// budget in minutes.
 #[cfg(feature = "publish")]
 fn spawn_durable_uploader(
     session: &Session,
@@ -1182,6 +1186,12 @@ fn spawn_durable_uploader(
         .unwrap_or(50)
         * 1024
         * 1024;
+    let min_interval = Duration::from_secs(
+        std::env::var("UNSTATION_DURABLE_MIN_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5),
+    );
     let (cid_tx, cid_rx) = unbounded_channel::<(Seq, String)>();
     let map_task = session.spawn_durable_publisher(cid_rx);
     let up_task = tokio::spawn(async move {
@@ -1189,14 +1199,22 @@ fn spawn_durable_uploader(
             return;
         }
         let mut spent: u64 = 0;
+        // Gates ATTEMPTS, not successes: a persistently failing upload must not retry
+        // at part cadence (4x/s under WHIP) — that's a several-RPC-calls-per-attempt
+        // storm against the public endpoint.
+        let mut last_attempt: Option<std::time::Instant> = None;
         while let Some((seq, bytes)) = seg_rx.recv().await {
             if seq % every != 0 {
+                continue;
+            }
+            if last_attempt.is_some_and(|t| t.elapsed() < min_interval) {
                 continue;
             }
             if spent + bytes.len() as u64 > budget {
                 log::info!("[durable] budget exhausted ({spent} B) — no further uploads this stream");
                 break;
             }
+            last_attempt = Some(std::time::Instant::now());
             match BulletinOrigin.put_bytes(bytes.to_vec()).await {
                 Ok(cid) => {
                     spent += bytes.len() as u64;
