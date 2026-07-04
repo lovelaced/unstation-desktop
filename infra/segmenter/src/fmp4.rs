@@ -46,8 +46,15 @@ pub struct H264Params {
 struct Au {
     /// Sample data in AVCC form (each NAL unit prefixed by a 4-byte big-endian length).
     avcc: Vec<u8>,
-    /// Sample duration in `TIMESCALE` ticks.
+    /// Presentation timestamp in `TIMESCALE` ticks (only relative values matter). Set by the
+    /// PTS-based path ([`push_au_pts`]); unused (0) by the duration-based path.
+    pts: i64,
+    /// DECODE duration in `TIMESCALE` ticks. In the duration-based path it's the caller's
+    /// value; in the PTS-based path [`compute_timing`] fills it from the PTS timeline.
     duration: u32,
+    /// Composition time offset (`PTS - DTS`) in `TIMESCALE` ticks — non-zero only when a
+    /// B-frame stream reorders presentation vs decode order; [`compute_timing`] fills it.
+    comp_offset: u32,
     keyframe: bool,
 }
 
@@ -90,6 +97,17 @@ pub struct FragmentBuilder {
     pending_ticks: u64,
     /// LL mode: close a part once `pending_ticks` reaches this. `None` = one fragment per GOP.
     part_ticks: Option<u32>,
+    /// True once fed via [`push_au_pts`]: at emit, decode durations + composition offsets are
+    /// derived from the PTS timeline (handles B-frames). The duration-based path leaves this
+    /// false and uses the caller's per-AU durations verbatim (no reordering).
+    pts_mode: bool,
+    /// Nominal frame duration carried across fragments as a fallback for a 1-AU part (where a
+    /// single PTS gives no gap to measure).
+    last_frame_dur: u32,
+    /// Presentation span of `pending` in the PTS path (max−min PTS), for the LL part cadence
+    /// — PTS can arrive out of order, so a running sum of deltas wouldn't measure the span.
+    pending_pts_lo: i64,
+    pending_pts_hi: i64,
     /// Opus audio track, when the ingest negotiated one. Fragment cadence stays
     /// video-driven; whatever audio accumulated rides in the same fragment as a
     /// second `traf`.
@@ -106,6 +124,10 @@ impl FragmentBuilder {
             pending_ticks: 0,
             part_ticks: None,
             audio: None,
+            pts_mode: false,
+            last_frame_dur: 3000, // 30fps @ 90kHz until measured
+            pending_pts_lo: i64::MAX,
+            pending_pts_hi: i64::MIN,
         }
     }
 
@@ -153,7 +175,7 @@ impl FragmentBuilder {
         let closed = if keyframe && !self.pending.is_empty() { self.emit() } else { None };
         let avcc = annexb_to_avcc(nal);
         if !avcc.is_empty() {
-            self.pending.push(Au { avcc, duration, keyframe });
+            self.pending.push(Au { avcc, pts: 0, duration, comp_offset: 0, keyframe });
             self.pending_ticks += duration as u64;
         }
         // LL mode: once the pending part reaches its target duration, close it mid-GOP. Skip
@@ -161,6 +183,36 @@ impl FragmentBuilder {
         if closed.is_none() {
             if let Some(pt) = self.part_ticks {
                 if !self.pending.is_empty() && self.pending_ticks >= pt as u64 {
+                    return self.emit();
+                }
+            }
+        }
+        closed
+    }
+
+    /// Queue one access unit by its **presentation timestamp** (microseconds) instead of a
+    /// precomputed duration. This is the path real encoders (OBS, cameras) need: they emit
+    /// **B-frames**, so presentation order differs from decode order and per-AU PTS deltas go
+    /// negative — a duration can't be read off them. The builder buffers the fragment's PTS
+    /// and, at emit, derives a monotonic decode timeline (DTS) plus per-sample composition
+    /// offsets (`ctts`) so playback timing is exact. `nal` is Annex-B (see [`push_au`]).
+    /// Returns the just-closed fragment when this AU starts a new one.
+    pub fn push_au_pts(&mut self, nal: &[u8], pts_us: i64, keyframe: bool) -> Option<Segment> {
+        self.pts_mode = true;
+        let pts = pts_us.saturating_mul(TIMESCALE as i64) / 1_000_000;
+        let closed = if keyframe && !self.pending.is_empty() { self.emit() } else { None };
+        let avcc = annexb_to_avcc(nal);
+        if !avcc.is_empty() {
+            self.pending.push(Au { avcc, pts, duration: 0, comp_offset: 0, keyframe });
+            self.pending_pts_lo = self.pending_pts_lo.min(pts);
+            self.pending_pts_hi = self.pending_pts_hi.max(pts);
+        }
+        // LL part cadence, measured as the PTS SPAN of the pending part (not a delta sum —
+        // B-frame PTS arrives out of order).
+        if closed.is_none() {
+            if let Some(pt) = self.part_ticks {
+                let span = (self.pending_pts_hi - self.pending_pts_lo).max(0);
+                if !self.pending.is_empty() && span >= pt as i64 {
                     return self.emit();
                 }
             }
@@ -198,8 +250,16 @@ impl FragmentBuilder {
         if self.pending.is_empty() {
             return None;
         }
-        let aus = std::mem::take(&mut self.pending);
+        let mut aus = std::mem::take(&mut self.pending);
         self.pending_ticks = 0;
+        self.pending_pts_lo = i64::MAX;
+        self.pending_pts_hi = i64::MIN;
+        // PTS path: derive the decode durations + composition offsets for this fragment from
+        // its buffered presentation timestamps (handles B-frame reorder). The duration path
+        // left `duration` set per-AU already and `comp_offset` 0.
+        if self.pts_mode {
+            self.last_frame_dur = compute_timing(&mut aus, self.last_frame_dur);
+        }
         let seq = self.seq;
         self.seq += 1;
 
@@ -678,6 +738,46 @@ fn d_ops(channels: u8) -> Vec<u8> {
 
 // ---- media fragment: moof + mdat ------------------------------------------------------
 
+/// Derive each AU's DECODE duration + composition offset (`PTS − DTS`) from the fragment's
+/// presentation timestamps, so a B-frame stream (presentation order ≠ decode order) muxes
+/// with a monotonic DTS and exact playback timing. `aus` is in DECODE order (the order the
+/// encoder/RTP delivered). Returns the nominal frame duration used (carried as a fallback).
+///
+/// Method: run a uniform decode clock `dts[i] = i·frame_dur`, and choose a per-fragment
+/// reorder delay `D` so every `comp_offset[i] = pts_rel[i] − dts[i] + D ≥ 0`. Presentation
+/// time `= tfdt + dts[i] + comp_offset[i] = base + pts_rel[i] + D` reproduces the input PTS
+/// exactly (a constant `D` delay); DTS stays monotonic. With no B-frames PTS is already in
+/// decode order, `D = 0`, and every offset is 0 — identical to the duration path.
+fn compute_timing(aus: &mut [Au], fallback_frame_dur: u32) -> u32 {
+    let n = aus.len();
+    if n == 0 {
+        return fallback_frame_dur.max(1);
+    }
+    let min_pts = aus.iter().map(|a| a.pts).min().unwrap_or(0);
+    let rel: Vec<i64> = aus.iter().map(|a| a.pts - min_pts).collect();
+    // Nominal frame duration: the median positive gap between SORTED PTS (for constant-fps
+    // input every gap equals the frame duration; sorting undoes the B-frame reorder).
+    let mut sorted = rel.clone();
+    sorted.sort_unstable();
+    let mut gaps: Vec<i64> = sorted.windows(2).map(|w| w[1] - w[0]).filter(|d| *d > 0).collect();
+    let frame_dur: i64 = if gaps.is_empty() {
+        fallback_frame_dur.max(1) as i64
+    } else {
+        gaps.sort_unstable();
+        gaps[gaps.len() / 2].max(1)
+    };
+    // Reorder delay: the smallest D making all composition offsets non-negative.
+    let mut delay = 0i64;
+    for (i, &r) in rel.iter().enumerate() {
+        delay = delay.max(i as i64 * frame_dur - r);
+    }
+    for (i, au) in aus.iter_mut().enumerate() {
+        au.duration = frame_dur as u32;
+        au.comp_offset = (rel[i] - i as i64 * frame_dur + delay).max(0) as u32;
+    }
+    frame_dur as u32
+}
+
 fn moof(
     seq: Seq,
     base_decode_time: u64,
@@ -738,7 +838,10 @@ fn traf(base_decode_time: u64, aus: &[Au]) -> (Vec<u8>, usize) {
         // sample flags: non-keyframes are non-sync + may depend on others.
         let sample_flags: u32 = if au.keyframe { 0x0200_0000 } else { 0x0101_0000 };
         trun_body.extend_from_slice(&sample_flags.to_be_bytes());
-        trun_body.extend_from_slice(&0u32.to_be_bytes()); // composition time offset (0)
+        // Composition time offset (PTS − DTS). 0 for the duration path / no B-frames; the
+        // PTS path fills it so a reordered stream presents in the right order. Non-negative,
+        // so version-0 (unsigned) trun is valid.
+        trun_body.extend_from_slice(&au.comp_offset.to_be_bytes());
     }
     let trun = full_bx(b"trun", 0, flags, &trun_body);
 
@@ -794,6 +897,47 @@ fn audio_traf(base_decode_time: u64, frames: &[AudioFrame]) -> (Vec<u8>, usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B-frame reorder: decode order `I P B B` presents as `I B B P`. `compute_timing` must
+    /// yield a monotonic DTS (constant frame duration) and composition offsets that reproduce
+    /// the presentation timeline exactly — the fix for OBS/High-profile decode failures.
+    #[test]
+    fn compute_timing_handles_bframe_reorder() {
+        // PTS in decode order for I(0) P(3) B(1) B(2), 30fps → 3000 ticks/frame.
+        let fd = 3000i64;
+        let pts_decode = [0i64, 3 * fd, 1 * fd, 2 * fd];
+        let mut aus: Vec<Au> = pts_decode
+            .iter()
+            .map(|&p| Au { avcc: vec![0], pts: p, duration: 0, comp_offset: 0, keyframe: false })
+            .collect();
+        let frame_dur = compute_timing(&mut aus, 3000);
+        assert_eq!(frame_dur, fd as u32, "measures 30fps frame duration");
+
+        // DTS is the uniform decode clock i*frame_dur; PTS = DTS + comp_offset must equal the
+        // input PTS (up to the constant reorder delay), and be strictly the input order.
+        let delay = aus[0].comp_offset as i64; // sample 0 has pts_rel 0 → comp == delay
+        for (i, au) in aus.iter().enumerate() {
+            assert_eq!(au.duration, fd as u32, "monotonic DTS ⇒ constant per-sample duration");
+            let dts = i as i64 * fd;
+            let recovered_pts = dts + au.comp_offset as i64 - delay;
+            assert_eq!(recovered_pts, pts_decode[i], "sample {i} PTS reproduced exactly");
+        }
+        // Every composition offset is non-negative (valid for a version-0 trun).
+        assert!(aus.iter().all(|a| a.comp_offset <= i32::MAX as u32));
+    }
+
+    /// No B-frames (PTS already in decode order): reorder delay 0, every offset 0 — the
+    /// PTS path must degrade to exactly what the duration path produces.
+    #[test]
+    fn compute_timing_no_bframes_is_offsetless() {
+        let fd = 3000i64;
+        let mut aus: Vec<Au> = (0..5)
+            .map(|i| Au { avcc: vec![0], pts: i * fd, duration: 0, comp_offset: 0, keyframe: i == 0 })
+            .collect();
+        compute_timing(&mut aus, 3000);
+        assert!(aus.iter().all(|a| a.comp_offset == 0), "no reorder ⇒ no composition offsets");
+        assert!(aus.iter().all(|a| a.duration == fd as u32));
+    }
 
     fn params() -> H264Params {
         // Minimal SPS/PPS payloads (byte 0 = NAL header 0x67/0x68). Enough to exercise the

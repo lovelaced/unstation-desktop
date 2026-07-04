@@ -1642,7 +1642,6 @@ async fn start_publish(
         let feeder = tokio::spawn(async move {
             let _server = server; // hold the endpoint alive for the feeder's lifetime
             let mut fb: Option<segmenter::FragmentBuilder> = None;
-            let mut last_pts: Option<i64> = None;
             // Audio state: the channel count arrives at answer time (before any media,
             // same ordered channel), so it's known before the muxer is built; the 48kHz
             // clock of the previous frame sizes the current one (same delta approach as
@@ -1739,16 +1738,6 @@ async fn start_publish(
                     }
                 }
                 let builder = fb.as_mut().unwrap();
-                // Sample duration in 90 kHz ticks from PTS deltas (first AU ≈30 fps). Clamped
-                // to ≤1s: a PTS discontinuity (ingest reconnect / timebase jump) must never
-                // become a segment claiming hours in its trun — that poisons every viewer's
-                // EXTINF/TARGETDURATION. The depacketizer guards this too; belt and braces.
-                let dur = match last_pts {
-                    Some(prev) => (((iu.au.pts_us - prev).max(1)) as u64 * 90_000 / 1_000_000)
-                        .clamp(1, 90_000) as u32,
-                    None => 3_000,
-                };
-                last_pts = Some(iu.au.pts_us);
                 // Fan the raw access unit onto any fast-tier viewers' WebRTC tracks (before
                 // muxing — the fast tier is the un-segmented, sub-second path). The fast tier
                 // is publisher-direct to an already-invited viewer (who holds the key), so it
@@ -1758,7 +1747,11 @@ async fn start_publish(
                     fasttier::pts_us_to_rtp90k(iu.au.pts_us),
                     iu.au.keyframe,
                 );
-                if let Some(seg) = builder.push_au(&iu.au.data, dur.max(1), iu.au.keyframe) {
+                // Mux by PTS, not a precomputed duration: real encoders (OBS, etc.) emit
+                // B-frames, so presentation order ≠ decode order and per-AU PTS deltas can go
+                // negative. The builder derives the decode timeline + composition offsets so
+                // a High-profile/B-frame stream plays correctly.
+                if let Some(seg) = builder.push_au_pts(&iu.au.data, iu.au.pts_us, iu.au.keyframe) {
                     ingest_w.fetch_add(seg.bytes.len() as u64, Ordering::Relaxed);
                     // Plaintext to the local preview; ciphertext (+ ciphertext-id) to the mesh.
                     let (mesh_id, mesh_bytes) = mesh_segment(feed_key, &seg);
@@ -2054,16 +2047,10 @@ async fn start_publish(
             PublishProgressMsg { step: "encoder".into(), ok: true, detail: String::new() },
         );
 
-        let mut last_pts: Option<i64> = None;
         while let Some(au) = rx.recv().await {
-            // Sample duration in 90 kHz ticks from PTS deltas (≈constant-fps; the first AU
-            // gets a ~30fps default). Close enough for CMAF timing at low latency.
-            let dur = match last_pts {
-                Some(prev) => (((au.pts_us - prev).max(1)) as u64 * 90_000 / 1_000_000) as u32,
-                None => 3_000,
-            };
-            last_pts = Some(au.pts_us);
-            if let Some(seg) = fb.push_au(&au.data, dur.max(1), au.keyframe) {
+            // Mux by PTS (see the WHIP feeder): the camera encoder may emit B-frames, so the
+            // builder derives the decode timeline + composition offsets from the PTS itself.
+            if let Some(seg) = fb.push_au_pts(&au.data, au.pts_us, au.keyframe) {
                 log::info!("[publish] fragment seq={} ({} B)", seg.seq, seg.bytes.len());
                 ingest_w.fetch_add(seg.bytes.len() as u64, Ordering::Relaxed);
                 let (mesh_id, mesh_bytes) = mesh_segment(feed_key, &seg);
