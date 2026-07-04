@@ -42,6 +42,25 @@ pub struct H264Params {
     pub height: u16,
 }
 
+/// Remaps decode-order timestamps to presentation order using the H.264 POC, for streams
+/// whose encoder puts the B-frame reorder in the bitstream (not the RTP timestamps).
+struct PocMapper {
+    sps: crate::h264_poc::SpsPoc,
+    tracker: crate::h264_poc::PocTracker,
+    /// Presentation-time anchor for the current GOP (the IDR's decode timestamp, µs).
+    gop_base_us: i64,
+    /// Frame duration (µs), estimated from monotonic decode-order RTP deltas.
+    frame_dur_us: i64,
+    last_rtp_us: Option<i64>,
+}
+
+/// The first coded-slice NAL (type 1/5) in an Annex-B access unit — where the POC lives.
+fn first_slice_nal(annexb: &[u8]) -> Option<&[u8]> {
+    iter_annexb_nals(annexb)
+        .into_iter()
+        .find(|n| !n.is_empty() && matches!(n[0] & 0x1f, 1 | 5))
+}
+
 /// One encoded video access unit queued for the current fragment.
 struct Au {
     /// Sample data in AVCC form (each NAL unit prefixed by a 4-byte big-endian length).
@@ -108,6 +127,14 @@ pub struct FragmentBuilder {
     /// — PTS can arrive out of order, so a running sum of deltas wouldn't measure the span.
     pending_pts_lo: i64,
     pending_pts_hi: i64,
+    /// POC-based presentation remapping, set up lazily from the SPS. Real encoders (OBS/x264)
+    /// stamp RTP with MONOTONIC decode-order timestamps and put the B-frame reorder only in
+    /// the bitstream POC; this recovers the true presentation order so composition offsets
+    /// come out right. `None` once we've determined the stream has no usable POC (no
+    /// B-frames / unsupported POC type) — then decode-order timing is used as-is.
+    poc: Option<PocMapper>,
+    /// Whether we've attempted the (one-time) SPS parse for `poc`.
+    poc_init: bool,
     /// Opus audio track, when the ingest negotiated one. Fragment cadence stays
     /// video-driven; whatever audio accumulated rides in the same fragment as a
     /// second `traf`.
@@ -128,6 +155,8 @@ impl FragmentBuilder {
             last_frame_dur: 3000, // 30fps @ 90kHz until measured
             pending_pts_lo: i64::MAX,
             pending_pts_hi: i64::MIN,
+            poc: None,
+            poc_init: false,
         }
     }
 
@@ -199,7 +228,11 @@ impl FragmentBuilder {
     /// Returns the just-closed fragment when this AU starts a new one.
     pub fn push_au_pts(&mut self, nal: &[u8], pts_us: i64, keyframe: bool) -> Option<Segment> {
         self.pts_mode = true;
-        let pts = pts_us.saturating_mul(TIMESCALE as i64) / 1_000_000;
+        // Presentation timestamp: normally the RTP timestamp, but for a B-frame stream whose
+        // encoder ships monotonic decode-order timestamps we recover the true presentation
+        // time from the H.264 POC (set up lazily from the SPS the first time through).
+        let pres_us = self.presentation_us(nal, pts_us, keyframe);
+        let pts = pres_us.saturating_mul(TIMESCALE as i64) / 1_000_000;
         let closed = if keyframe && !self.pending.is_empty() { self.emit() } else { None };
         let avcc = annexb_to_avcc(nal);
         if !avcc.is_empty() {
@@ -218,6 +251,45 @@ impl FragmentBuilder {
             }
         }
         closed
+    }
+
+    /// Map an access unit's decode-order RTP timestamp to a PRESENTATION timestamp (µs)
+    /// via the H.264 POC. Falls back to the RTP timestamp when there's no usable POC (the
+    /// SPS won't parse, an unsupported POC type, or no slice) — which is exactly right for
+    /// a no-B-frame stream, whose RTP timestamps are already the presentation order.
+    fn presentation_us(&mut self, nal: &[u8], pts_us: i64, keyframe: bool) -> i64 {
+        if !self.poc_init {
+            self.poc_init = true;
+            if let Some(sps) = crate::h264_poc::parse_sps(&self.params.sps) {
+                self.poc = Some(PocMapper {
+                    sps,
+                    tracker: crate::h264_poc::PocTracker::new(&sps),
+                    gop_base_us: pts_us,
+                    frame_dur_us: 33_367, // 30fps until measured
+                    last_rtp_us: None,
+                });
+            }
+        }
+        let Some(m) = self.poc.as_mut() else { return pts_us };
+        // Frame duration from monotonic decode-order deltas (guard against reconnect jumps).
+        if let Some(last) = m.last_rtp_us {
+            let d = pts_us - last;
+            if (1_000..=200_000).contains(&d) {
+                m.frame_dur_us = d;
+            }
+        }
+        m.last_rtp_us = Some(pts_us);
+        if keyframe {
+            m.gop_base_us = pts_us;
+        }
+        let Some(slice) = first_slice_nal(nal) else { return pts_us };
+        let Some((is_idr, lsb)) = crate::h264_poc::slice_poc_lsb(slice, &m.sps) else {
+            return pts_us;
+        };
+        let poc = m.tracker.poc(is_idr, lsb, crate::h264_poc::nal_ref_idc(slice[0]));
+        // Frame coding: TopFieldOrderCnt advances by 2 per frame, so POC/2 is the frame's
+        // index in presentation order from the GOP's IDR.
+        m.gop_base_us + (poc as i64 / 2) * m.frame_dur_us
     }
 
     /// Queue one Opus frame (a raw Opus packet). `duration` is in 48 kHz ticks —
@@ -897,6 +969,59 @@ fn audio_traf(base_decode_time: u64, frames: &[AudioFrame]) -> (Vec<u8>, usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// End-to-end POC muxing over a REAL B-frame stream: reads an Annex-B H.264 file (High
+    /// profile, B-frames), feeds each access unit with a MONOTONIC decode-order timestamp
+    /// (what OBS/x264 send over WHIP), and writes `init.mp4` + the muxed segments. A correct
+    /// muxer recovers presentation order from the bitstream POC and writes composition
+    /// offsets, so the output decodes cleanly on strict players. Verify externally:
+    ///   ffmpeg -y -f lavfi -i testsrc=s=320x240:r=30 -t 1 -c:v libx264 -profile:v high \
+    ///          -pix_fmt yuv420p -bf 2 -g 30 -f h264 /tmp/bf.h264
+    ///   POC_H264=/tmp/bf.h264 cargo test -p segmenter poc_muxes_real_bframe_stream -- --ignored
+    ///   cat /tmp/poc_init.mp4 /tmp/poc_seg*.m4s > /tmp/poc_out.mp4 && ffmpeg -v error -i /tmp/poc_out.mp4 -f null -
+    #[test]
+    #[ignore = "needs a local Annex-B B-frame file via POC_H264"]
+    fn poc_muxes_real_bframe_stream() {
+        let path = std::env::var("POC_H264").unwrap_or_else(|_| "/tmp/bf.h264".into());
+        let data = std::fs::read(&path).expect("read POC_H264 file");
+        let nals = iter_annexb_nals(&data);
+        let sps = nals.iter().find(|n| n[0] & 0x1f == 7).expect("SPS").to_vec();
+        let pps = nals.iter().find(|n| n[0] & 0x1f == 8).expect("PPS").to_vec();
+        let mut fb = FragmentBuilder::new(H264Params { sps, pps, width: 320, height: 240 });
+        std::fs::write("/tmp/poc_init.mp4", fb.init_segment()).unwrap();
+
+        // Group NALs into access units (one per VCL slice), Annex-B framed, and feed with a
+        // monotonic 30fps timeline — exactly the decode-order timestamps OBS emits.
+        let mut au = Vec::new();
+        let mut idx = 0i64;
+        let mut segn = 0;
+        let emit = |fb: &mut FragmentBuilder, au: &[u8], kf: bool, idx: i64, segn: &mut usize| {
+            if let Some(seg) = fb.push_au_pts(au, idx * 33_367, kf) {
+                std::fs::write(format!("/tmp/poc_seg{:03}.m4s", *segn), &seg.bytes).unwrap();
+                *segn += 1;
+            }
+        };
+        for nal in &nals {
+            let t = nal[0] & 0x1f;
+            if matches!(t, 1 | 5) {
+                // finish the AU with this slice
+                au.extend_from_slice(&[0, 0, 0, 1]);
+                au.extend_from_slice(nal);
+                emit(&mut fb, &au, t == 5, idx, &mut segn);
+                idx += 1;
+                au.clear();
+            } else {
+                au.extend_from_slice(&[0, 0, 0, 1]);
+                au.extend_from_slice(nal);
+            }
+        }
+        if let Some(seg) = fb.flush() {
+            std::fs::write(format!("/tmp/poc_seg{:03}.m4s", segn), &seg.bytes).unwrap();
+            segn += 1;
+        }
+        assert!(segn > 0, "muxed at least one segment");
+        eprintln!("wrote /tmp/poc_init.mp4 + {segn} segments");
+    }
 
     /// B-frame reorder: decode order `I P B B` presents as `I B B P`. `compute_timing` must
     /// yield a monotonic DTS (constant frame duration) and composition offsets that reproduce

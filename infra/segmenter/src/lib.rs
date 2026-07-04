@@ -15,6 +15,8 @@
 //!     Stream → Service: *Custom*, Server: `rtmp://127.0.0.1:<port>/live`, Stream
 //!     Key: `<key>`) straight at it; no plugins, no special workflow.
 
+mod h264_poc;
+
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
