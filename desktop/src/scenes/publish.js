@@ -248,7 +248,35 @@ export const slugify = t => ((t||'').trim().toLowerCase().replace(/[^a-z0-9]+/g,
 export const shareName = t => slugify(t);
 const titleEl = document.getElementById('streamTitle');
 const startStreamBtn = document.getElementById('startStream');
-titleEl.addEventListener('input', ()=>{ document.getElementById('sharePreview').textContent = shareName(titleEl.value); });
+const unlistedToggle = document.getElementById('unlistedToggle');
+
+// A capability token for an unlisted stream: ~72 bits of base32 (no ambiguous
+// 0/1/l/o), appended to the slug so the discovery topic — blake2b(stream name) —
+// is unguessable. Anyone with the full share link has it; nobody can enumerate it.
+// Held stable while the toggle stays on so the preview matches what Go Live locks in.
+let unlistedToken = '';
+function freshUnlistedToken(){
+  const alphabet = 'abcdefghijkmnpqrstuvwxyz23456789';
+  const bytes = new Uint8Array(15);
+  (crypto || window.crypto).getRandomValues(bytes);
+  let s = '';
+  for(const b of bytes) s += alphabet[b & 31];
+  return s;
+}
+// The name we actually publish/share: the typed slug, plus the token when unlisted.
+// An empty title with the toggle on still yields a usable unguessable name.
+function effectiveName(){
+  const base = shareName(titleEl.value);
+  if(!unlistedToggle || !unlistedToggle.checked) return base;
+  if(!unlistedToken) unlistedToken = freshUnlistedToken();
+  return (base && base !== 'my-stream' ? base + '-' : '') + unlistedToken;
+}
+function refreshSharePreview(){ document.getElementById('sharePreview').textContent = effectiveName(); }
+titleEl.addEventListener('input', refreshSharePreview);
+if(unlistedToggle) unlistedToggle.addEventListener('change', ()=>{
+  if(unlistedToggle.checked && !unlistedToken) unlistedToken = freshUnlistedToken();
+  refreshSharePreview();
+});
 // Keyboard-first go-live: on the phone the keyboard auto-opens over the buttons, so the
 // keyboard's "Go" action key (enterkeyhint) submits directly — no closing the keyboard
 // to hunt for a button.
@@ -265,7 +293,7 @@ export function showPubSetup(){
   document.getElementById('pubHeadline').textContent = 'Name your stream';
   titleEl.readOnly = false;
   startStreamBtn.hidden = false;
-  document.getElementById('sharePreview').textContent = shareName(titleEl.value);
+  refreshSharePreview();
 }
 
 // Step 2 — lock the name in, open the ingest, and enter the console. From here the
@@ -281,7 +309,7 @@ export async function goLiveStart(){
 async function goLiveStartInner(){
   if(!ensureSignedIn()) return;
   try{ titleEl.blur(); }catch(e){} // drop the phone keyboard before the console appears
-  S.pubName = shareName(titleEl.value);
+  S.pubName = effectiveName();
   titleEl.value = S.pubName;
   titleEl.readOnly = true;
   document.getElementById('shareLink').textContent = S.pubName;
