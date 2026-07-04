@@ -1503,12 +1503,12 @@ async fn start_publish(
             state.fast_off.clone(),
         ));
         let fast_feed = fast;
-        let (whip_tx, whip_rx) = std::sync::mpsc::channel::<whip_ingest::server::IngestAu>();
+        let (whip_tx, whip_rx) = std::sync::mpsc::channel::<whip_ingest::server::IngestEvent>();
         let server = whip_ingest::server::start(whip_tx, stun())
             .map_err(|e| format!("couldn't start the WHIP endpoint: {e}"))?;
         let ingest_url = server.url();
         // Bridge the WHIP server's std channel (tiny_http thread) into async.
-        let (au_tx, mut au_rx) = unbounded_channel::<whip_ingest::server::IngestAu>();
+        let (au_tx, mut au_rx) = unbounded_channel::<whip_ingest::server::IngestEvent>();
         std::thread::spawn(move || {
             while let Ok(iu) = whip_rx.recv() {
                 if au_tx.send(iu).is_err() {
@@ -1520,6 +1520,13 @@ async fn start_publish(
             let _server = server; // hold the endpoint alive for the feeder's lifetime
             let mut fb: Option<segmenter::FragmentBuilder> = None;
             let mut last_pts: Option<i64> = None;
+            // Audio state: the channel count arrives at answer time (before any media,
+            // same ordered channel), so it's known before the muxer is built; the 48kHz
+            // clock of the previous frame sizes the current one (same delta approach as
+            // video PTS). Audio frames landing before the video config (SPS/PPS builds
+            // the muxer) are dropped — a few tens of ms at stream start.
+            let mut audio_channels: Option<u8> = None;
+            let mut last_ts48: Option<u64> = None;
             let mut live = false;
             let mut last_fresh = std::time::Instant::now();
             let announce_live = |appc: &AppHandle, live: bool| {
@@ -1531,8 +1538,8 @@ async fn start_publish(
             };
             loop {
                 // The live flag flips off if RTP dries up (encoder stopped/roaming).
-                let iu = match tokio::time::timeout(Duration::from_millis(500), au_rx.recv()).await {
-                    Ok(Some(iu)) => iu,
+                let event = match tokio::time::timeout(Duration::from_millis(500), au_rx.recv()).await {
+                    Ok(Some(ev)) => ev,
                     Ok(None) => break, // bridge closed
                     Err(_) => {
                         if live && last_fresh.elapsed() > Duration::from_millis(2000) {
@@ -1542,6 +1549,33 @@ async fn start_publish(
                         }
                         continue;
                     }
+                };
+                let iu = match event {
+                    whip_ingest::server::IngestEvent::AudioNegotiated { channels } => {
+                        // Arrives at answer time, before any media. A RECONNECT that
+                        // renegotiates audio can't change the already-published init
+                        // segment — the first session's shape wins for the stream.
+                        if fb.is_none() {
+                            audio_channels = Some(channels);
+                        }
+                        continue;
+                    }
+                    whip_ingest::server::IngestEvent::Audio(frame) => {
+                        if let Some(builder) = fb.as_mut() {
+                            // Frame duration from the 48kHz clock delta (previous →
+                            // current), clamped like video; default 20ms for the first.
+                            let dur = match last_ts48 {
+                                Some(prev) => (frame.ts48.saturating_sub(prev))
+                                    .clamp(1, segmenter::AUDIO_TIMESCALE as u64)
+                                    as u32,
+                                None => segmenter::OPUS_DEFAULT_FRAME_TICKS,
+                            };
+                            last_ts48 = Some(frame.ts48);
+                            builder.push_opus(&frame.data, dur);
+                        }
+                        continue; // fragments close on the video cadence
+                    }
+                    whip_ingest::server::IngestEvent::Video(iu) => iu,
                 };
                 // Keep the fast tier's codec config fresh — it's prepended to keyframe AUs
                 // so a viewer whose track comes up mid-stream can initialize its decoder.
@@ -1555,10 +1589,17 @@ async fn start_publish(
                         let (width, height) =
                             segmenter::sps::dimensions(&sps).unwrap_or((1280, 720));
                         // WHIP → low-latency: emit ~250ms CMAF parts, not whole GOPs.
-                        let builder = segmenter::FragmentBuilder::new_ll(
+                        let mut builder = segmenter::FragmentBuilder::new_ll(
                             segmenter::H264Params { sps, pps, width, height },
                             LL_PART_MS,
                         );
+                        // The ingest negotiated Opus → mux it as track 2 (48kHz), same
+                        // fragments. Playback needs no transcode: AVPlayer (desktop
+                        // native) and hls.js/MSE (Android) both decode Opus-in-fMP4.
+                        if let Some(ch) = audio_channels {
+                            builder = builder.with_opus_audio(ch);
+                            log::info!("[publish] whip audio: opus {ch}ch muxed as track 2");
+                        }
                         let init = builder.init_segment();
                         *init_slot_feeder.lock().unwrap_or_else(|e| e.into_inner()) =
                             Some(init.clone());

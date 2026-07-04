@@ -21,6 +21,16 @@ use unstation_core::types::Seq;
 /// Video media timescale (ticks per second) used in the init + fragment timing.
 pub const TIMESCALE: u32 = 90_000;
 const VIDEO_TRACK_ID: u32 = 1;
+/// Opus always runs a 48 kHz clock (RFC 7587) — the audio track's timescale, so RTP
+/// timestamps ARE sample counts and no rescaling ever rounds.
+pub const AUDIO_TIMESCALE: u32 = 48_000;
+const AUDIO_TRACK_ID: u32 = 2;
+/// Samples per Opus frame at the default 20ms ptime — the duration fallback when a
+/// frame's RTP timestamp delta is unusable (first frame, reordering, discontinuity).
+pub const OPUS_DEFAULT_FRAME_TICKS: u32 = 960;
+/// Cap on buffered audio while no video part is closing (video stalls must not grow
+/// audio memory unboundedly): ~4s at 20ms frames.
+const MAX_PENDING_AUDIO: usize = 200;
 
 /// H.264 decoder configuration + display size, learned once from the encoder's codec-specific
 /// data (CSD: the SPS and PPS NAL units, WITHOUT Annex-B start codes or length prefixes).
@@ -39,6 +49,23 @@ struct Au {
     /// Sample duration in `TIMESCALE` ticks.
     duration: u32,
     keyframe: bool,
+}
+
+/// One Opus frame queued for the current fragment.
+struct AudioFrame {
+    /// A raw Opus packet (what came off the RTP payload / encoder) — Opus-in-ISOBMFF
+    /// samples are the bare packets, no framing.
+    data: Vec<u8>,
+    /// Sample duration in `AUDIO_TIMESCALE` (48 kHz) ticks.
+    duration: u32,
+}
+
+/// The audio side of the muxer, present when the ingest negotiated an Opus track.
+struct AudioTrack {
+    channels: u8,
+    pending: Vec<AudioFrame>,
+    /// `tfdt` base media decode time in 48 kHz ticks (sum of emitted durations).
+    base_decode_time: u64,
 }
 
 /// Accumulates encoded H.264 access units and emits one CMAF fragment per GOP.
@@ -63,11 +90,23 @@ pub struct FragmentBuilder {
     pending_ticks: u64,
     /// LL mode: close a part once `pending_ticks` reaches this. `None` = one fragment per GOP.
     part_ticks: Option<u32>,
+    /// Opus audio track, when the ingest negotiated one. Fragment cadence stays
+    /// video-driven; whatever audio accumulated rides in the same fragment as a
+    /// second `traf`.
+    audio: Option<AudioTrack>,
 }
 
 impl FragmentBuilder {
     pub fn new(params: H264Params) -> Self {
-        Self { params, seq: 0, base_decode_time: 0, pending: Vec::new(), pending_ticks: 0, part_ticks: None }
+        Self {
+            params,
+            seq: 0,
+            base_decode_time: 0,
+            pending: Vec::new(),
+            pending_ticks: 0,
+            part_ticks: None,
+            audio: None,
+        }
     }
 
     /// Low-latency builder: also close a fragment every `part_ms` of media (a CMAF *part*),
@@ -78,12 +117,29 @@ impl FragmentBuilder {
         Self { part_ticks: Some(part_ticks), ..Self::new(params) }
     }
 
+    /// Add an Opus audio track (48 kHz, `channels` — 2 for the WHIP/OBS default).
+    /// Must be decided BEFORE the first [`init_segment`](Self::init_segment) call: the
+    /// init advertises the track list, and every player configures its decoders from it.
+    pub fn with_opus_audio(mut self, channels: u8) -> Self {
+        self.audio = Some(AudioTrack {
+            channels: channels.max(1),
+            pending: Vec::new(),
+            base_decode_time: 0,
+        });
+        self
+    }
+
+    /// Whether this builder muxes an audio track (drives feeder-side frame routing).
+    pub fn has_audio(&self) -> bool {
+        self.audio.is_some()
+    }
+
     /// The CMAF init segment (`ftyp` + `moov`). Stable for the stream; push it once to the
     /// player (HLS `EXT-X-MAP`) and Bulletin before any media fragment.
     pub fn init_segment(&self) -> Bytes {
         let mut out = Vec::new();
         out.extend_from_slice(&ftyp());
-        out.extend_from_slice(&moov(&self.params));
+        out.extend_from_slice(&moov(&self.params, self.audio.as_ref().map(|a| a.channels)));
         Bytes::from(out)
     }
 
@@ -112,12 +168,32 @@ impl FragmentBuilder {
         closed
     }
 
+    /// Queue one Opus frame (a raw Opus packet). `duration` is in 48 kHz ticks —
+    /// derive it from RTP timestamp deltas, falling back to
+    /// [`OPUS_DEFAULT_FRAME_TICKS`]. No-op unless the builder was built
+    /// [`with_opus_audio`](Self::with_opus_audio). Never closes a fragment: the part
+    /// cadence stays video-driven so parts never straddle a keyframe.
+    pub fn push_opus(&mut self, frame: &[u8], duration: u32) {
+        let Some(audio) = self.audio.as_mut() else { return };
+        if frame.is_empty() {
+            return;
+        }
+        if audio.pending.len() >= MAX_PENDING_AUDIO {
+            // Video stalled (no part is closing): advance the audio timeline past the
+            // dropped frame so A/V stay aligned when video resumes.
+            let dropped = audio.pending.remove(0);
+            audio.base_decode_time += dropped.duration as u64;
+        }
+        audio.pending.push(AudioFrame { data: frame.to_vec(), duration: duration.max(1) });
+    }
+
     /// Emit any trailing accumulated AUs as a final fragment (e.g. on stop).
     pub fn flush(&mut self) -> Option<Segment> {
         if self.pending.is_empty() { None } else { self.emit() }
     }
 
-    /// Build a `moof` + `mdat` fragment from the pending AUs and advance the timeline.
+    /// Build a `moof` + `mdat` fragment from the pending AUs (+ any accumulated audio)
+    /// and advance the timeline.
     fn emit(&mut self) -> Option<Segment> {
         if self.pending.is_empty() {
             return None;
@@ -127,11 +203,29 @@ impl FragmentBuilder {
         let seq = self.seq;
         self.seq += 1;
 
-        let mut bytes = moof(seq, self.base_decode_time, &aus);
-        bytes.extend_from_slice(&mdat(&aus));
+        // Audio rides along: whatever frames accumulated since the last fragment, as a
+        // second traf. An empty accumulation (audio not started / gap) emits video-only —
+        // fragments may legally differ in track presence.
+        let audio_frames = match self.audio.as_mut() {
+            Some(a) if !a.pending.is_empty() => Some((std::mem::take(&mut a.pending), a.base_decode_time)),
+            _ => None,
+        };
+
+        let mut bytes = moof(
+            seq,
+            self.base_decode_time,
+            &aus,
+            audio_frames.as_ref().map(|(f, bdt)| (f.as_slice(), *bdt)),
+        );
+        bytes.extend_from_slice(&mdat(&aus, audio_frames.as_ref().map(|(f, _)| f.as_slice())));
 
         for au in &aus {
             self.base_decode_time += au.duration as u64;
+        }
+        if let (Some(a), Some((frames, _))) = (self.audio.as_mut(), audio_frames.as_ref()) {
+            for f in frames {
+                a.base_decode_time += f.duration as u64;
+            }
         }
 
         let bytes = Bytes::from(bytes);
@@ -317,12 +411,16 @@ fn ftyp() -> Vec<u8> {
     bx(b"ftyp", &b)
 }
 
-fn moov(p: &H264Params) -> Vec<u8> {
-    let body = concat(&[mvhd(), trak(p), mvex()]);
-    bx(b"moov", &body)
+fn moov(p: &H264Params, audio_channels: Option<u8>) -> Vec<u8> {
+    let mut parts = vec![mvhd(audio_channels.is_some()), trak(p)];
+    if let Some(ch) = audio_channels {
+        parts.push(audio_trak(ch));
+    }
+    parts.push(mvex(audio_channels.is_some()));
+    bx(b"moov", &concat(&parts))
 }
 
-fn mvhd() -> Vec<u8> {
+fn mvhd(with_audio: bool) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(&0u32.to_be_bytes()); // creation time
     b.extend_from_slice(&0u32.to_be_bytes()); // modification time
@@ -334,7 +432,8 @@ fn mvhd() -> Vec<u8> {
     b.extend_from_slice(&[0u8; 8]); // reserved
     b.extend_from_slice(&UNITY_MATRIX);
     b.extend_from_slice(&[0u8; 24]); // pre-defined
-    b.extend_from_slice(&2u32.to_be_bytes()); // next track id
+    let next_track = if with_audio { AUDIO_TRACK_ID + 1 } else { VIDEO_TRACK_ID + 1 };
+    b.extend_from_slice(&next_track.to_be_bytes());
     full_bx(b"mvhd", 0, 0, &b)
 }
 
@@ -458,36 +557,161 @@ fn avcc(p: &H264Params) -> Vec<u8> {
     bx(b"avcC", &b)
 }
 
-fn mvex() -> Vec<u8> {
-    // trex: default sample description index 1; per-sample duration/size/flags come from trun.
-    let mut trex_body = Vec::new();
-    trex_body.extend_from_slice(&VIDEO_TRACK_ID.to_be_bytes());
-    trex_body.extend_from_slice(&1u32.to_be_bytes()); // default sample description index
-    trex_body.extend_from_slice(&0u32.to_be_bytes()); // default sample duration
-    trex_body.extend_from_slice(&0u32.to_be_bytes()); // default sample size
-    trex_body.extend_from_slice(&0u32.to_be_bytes()); // default sample flags
-    let trex = full_bx(b"trex", 0, 0, &trex_body);
-    bx(b"mvex", &trex)
+fn mvex(with_audio: bool) -> Vec<u8> {
+    // trex per track: default sample description index 1; per-sample duration/size/flags
+    // come from trun.
+    let trex_for = |track_id: u32| {
+        let mut b = Vec::new();
+        b.extend_from_slice(&track_id.to_be_bytes());
+        b.extend_from_slice(&1u32.to_be_bytes()); // default sample description index
+        b.extend_from_slice(&0u32.to_be_bytes()); // default sample duration
+        b.extend_from_slice(&0u32.to_be_bytes()); // default sample size
+        b.extend_from_slice(&0u32.to_be_bytes()); // default sample flags
+        full_bx(b"trex", 0, 0, &b)
+    };
+    let mut body = trex_for(VIDEO_TRACK_ID);
+    if with_audio {
+        body.extend_from_slice(&trex_for(AUDIO_TRACK_ID));
+    }
+    bx(b"mvex", &body)
+}
+
+// ---- audio trak (Opus, RFC 7845 §4.3 / Opus-in-ISOBMFF) --------------------------------
+
+fn audio_trak(channels: u8) -> Vec<u8> {
+    let body = concat(&[audio_tkhd(), audio_mdia(channels)]);
+    bx(b"trak", &body)
+}
+
+fn audio_tkhd() -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&0u32.to_be_bytes()); // creation
+    b.extend_from_slice(&0u32.to_be_bytes()); // modification
+    b.extend_from_slice(&AUDIO_TRACK_ID.to_be_bytes());
+    b.extend_from_slice(&0u32.to_be_bytes()); // reserved
+    b.extend_from_slice(&0u32.to_be_bytes()); // duration
+    b.extend_from_slice(&[0u8; 8]); // reserved
+    b.extend_from_slice(&0u16.to_be_bytes()); // layer
+    b.extend_from_slice(&0u16.to_be_bytes()); // alternate group
+    b.extend_from_slice(&0x0100u16.to_be_bytes()); // volume 1.0 (audio)
+    b.extend_from_slice(&0u16.to_be_bytes()); // reserved
+    b.extend_from_slice(&UNITY_MATRIX);
+    b.extend_from_slice(&0u32.to_be_bytes()); // width (audio = 0)
+    b.extend_from_slice(&0u32.to_be_bytes()); // height
+    full_bx(b"tkhd", 0, 0x7, &b) // flags: enabled | in-movie | in-preview
+}
+
+fn audio_mdia(channels: u8) -> Vec<u8> {
+    let body = concat(&[audio_mdhd(), audio_hdlr(), audio_minf(channels)]);
+    bx(b"mdia", &body)
+}
+
+fn audio_mdhd() -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&0u32.to_be_bytes()); // creation
+    b.extend_from_slice(&0u32.to_be_bytes()); // modification
+    b.extend_from_slice(&AUDIO_TIMESCALE.to_be_bytes());
+    b.extend_from_slice(&0u32.to_be_bytes()); // duration
+    b.extend_from_slice(&0x55c4u16.to_be_bytes()); // language 'und'
+    b.extend_from_slice(&0u16.to_be_bytes()); // pre-defined
+    full_bx(b"mdhd", 0, 0, &b)
+}
+
+fn audio_hdlr() -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&0u32.to_be_bytes()); // pre-defined
+    b.extend_from_slice(b"soun"); // handler type
+    b.extend_from_slice(&[0u8; 12]); // reserved
+    b.extend_from_slice(b"SoundHandler\0");
+    full_bx(b"hdlr", 0, 0, &b)
+}
+
+fn audio_minf(channels: u8) -> Vec<u8> {
+    // smhd: balance (0) + reserved.
+    let smhd = full_bx(b"smhd", 0, 0, &[0u8; 4]);
+    let body = concat(&[smhd, dinf(), audio_stbl(channels)]);
+    bx(b"minf", &body)
+}
+
+fn audio_stbl(channels: u8) -> Vec<u8> {
+    let stsd = {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_be_bytes()); // entry count
+        body.extend_from_slice(&opus_sample_entry(channels));
+        full_bx(b"stsd", 0, 0, &body)
+    };
+    let stts = full_bx(b"stts", 0, 0, &0u32.to_be_bytes());
+    let stsc = full_bx(b"stsc", 0, 0, &0u32.to_be_bytes());
+    let stsz = full_bx(b"stsz", 0, 0, &[0u8; 8]); // sample size + count
+    let stco = full_bx(b"stco", 0, 0, &0u32.to_be_bytes());
+    bx(b"stbl", &concat(&[stsd, stts, stsc, stsz, stco]))
+}
+
+/// `Opus` AudioSampleEntry + `dOps` (Opus-in-ISOBMFF §4.3.2).
+fn opus_sample_entry(channels: u8) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&[0u8; 6]); // reserved
+    b.extend_from_slice(&1u16.to_be_bytes()); // data reference index
+    b.extend_from_slice(&[0u8; 8]); // version/revision/vendor (AudioSampleEntry v0)
+    b.extend_from_slice(&(channels as u16).to_be_bytes());
+    b.extend_from_slice(&16u16.to_be_bytes()); // sample size (bits)
+    b.extend_from_slice(&0u16.to_be_bytes()); // pre-defined
+    b.extend_from_slice(&0u16.to_be_bytes()); // reserved
+    b.extend_from_slice(&(AUDIO_TIMESCALE << 16).to_be_bytes()); // samplerate 16.16
+    b.extend_from_slice(&d_ops(channels));
+    bx(b"Opus", &b)
+}
+
+/// OpusSpecificBox. PreSkip = 312 (libopus's 6.5ms lookahead at 48 kHz — the value
+/// encoders conventionally stamp); players discard that many samples before the
+/// first audible one. ChannelMappingFamily 0 covers mono/stereo (all we ingest).
+fn d_ops(channels: u8) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.push(0); // Version
+    b.push(channels); // OutputChannelCount
+    b.extend_from_slice(&312u16.to_be_bytes()); // PreSkip
+    b.extend_from_slice(&AUDIO_TIMESCALE.to_be_bytes()); // InputSampleRate
+    b.extend_from_slice(&0i16.to_be_bytes()); // OutputGain (dB, 8.8 fixed)
+    b.push(0); // ChannelMappingFamily
+    bx(b"dOps", &b)
 }
 
 // ---- media fragment: moof + mdat ------------------------------------------------------
 
-fn moof(seq: Seq, base_decode_time: u64, aus: &[Au]) -> Vec<u8> {
+fn moof(
+    seq: Seq,
+    base_decode_time: u64,
+    aus: &[Au],
+    audio: Option<(&[AudioFrame], u64)>,
+) -> Vec<u8> {
     let mfhd = {
         let mut b = Vec::new();
         b.extend_from_slice(&((seq as u32).wrapping_add(1)).to_be_bytes()); // sequence >= 1
         full_bx(b"mfhd", 0, 0, &b)
     };
-    // Build traf with a placeholder trun data_offset, then patch it once the moof size is known.
-    let (traf_box, data_offset_pos_in_traf) = traf(base_decode_time, aus);
-    let mut moof_body = concat(&[mfhd.clone(), traf_box]);
-    let mut moof_box = bx(b"moof", &moof_body);
-    // data_offset (in trun) is measured from the start of the moof box; mdat data begins at
-    // moof_size + 8 (mdat header). Patch the 4-byte field in place.
-    let data_offset = (moof_box.len() as u32) + 8;
-    let pos = 8 + mfhd.len() + data_offset_pos_in_traf; // 8 = moof box header
-    moof_box[pos..pos + 4].copy_from_slice(&data_offset.to_be_bytes());
-    let _ = &mut moof_body;
+    // Build trafs with placeholder trun data_offsets, then patch them once the moof size
+    // is known. The VIDEO traf comes first — `fragment_info` (and through it the LL-HLS
+    // part-placement logic) reads the first traf for keyframe independence + duration.
+    let (video_traf, video_off_in_traf) = traf(base_decode_time, aus);
+    let audio_built = audio.map(|(frames, bdt)| audio_traf(bdt, frames));
+    let mut parts = vec![mfhd.clone(), video_traf.clone()];
+    if let Some((ref traf_box, _)) = audio_built {
+        parts.push(traf_box.clone());
+    }
+    let mut moof_box = bx(b"moof", &concat(&parts));
+
+    // mdat layout after the moof: [video samples ‖ audio samples]. Each trun's
+    // data_offset is measured from the start of the moof box.
+    let video_bytes: usize = aus.iter().map(|a| a.avcc.len()).sum();
+    let video_data_offset = (moof_box.len() as u32) + 8; // + mdat header
+    let vpos = 8 + mfhd.len() + video_off_in_traf; // 8 = moof box header
+    moof_box[vpos..vpos + 4].copy_from_slice(&video_data_offset.to_be_bytes());
+    if let Some((traf_box, audio_off_in_traf)) = audio_built {
+        let audio_data_offset = video_data_offset + video_bytes as u32;
+        let apos = 8 + mfhd.len() + video_traf.len() + audio_off_in_traf;
+        moof_box[apos..apos + 4].copy_from_slice(&audio_data_offset.to_be_bytes());
+        let _ = traf_box;
+    }
     moof_box
 }
 
@@ -525,12 +749,46 @@ fn traf(base_decode_time: u64, aus: &[Au]) -> (Vec<u8>, usize) {
     (traf_box, data_offset_pos)
 }
 
-fn mdat(aus: &[Au]) -> Vec<u8> {
+fn mdat(aus: &[Au], audio: Option<&[AudioFrame]>) -> Vec<u8> {
     let mut data = Vec::new();
     for au in aus {
         data.extend_from_slice(&au.avcc);
     }
+    if let Some(frames) = audio {
+        for f in frames {
+            data.extend_from_slice(&f.data);
+        }
+    }
     bx(b"mdat", &data)
+}
+
+/// Returns the audio `traf` box and the byte offset (within it) of its `trun`
+/// `data_offset` field. Mirrors [`traf`] with the audio track id, a 48 kHz `tfdt`,
+/// and all-sync sample flags (every Opus frame decodes independently).
+fn audio_traf(base_decode_time: u64, frames: &[AudioFrame]) -> (Vec<u8>, usize) {
+    let mut tfhd_body = Vec::new();
+    tfhd_body.extend_from_slice(&AUDIO_TRACK_ID.to_be_bytes());
+    let tfhd = full_bx(b"tfhd", 0, 0x02_0000, &tfhd_body); // default-base-is-moof
+
+    let tfdt = full_bx(b"tfdt", 1, 0, &base_decode_time.to_be_bytes());
+
+    // trun: data-offset + per-sample duration + size (no flags/cto — audio samples are
+    // uniform sync samples; tfhd defaults would need trex defaults, so keep per-sample
+    // duration/size explicit like the video trun).
+    let flags = 0x0001 | 0x0100 | 0x0200;
+    let mut trun_body = Vec::new();
+    trun_body.extend_from_slice(&(frames.len() as u32).to_be_bytes());
+    let data_offset_field = trun_body.len();
+    trun_body.extend_from_slice(&0u32.to_be_bytes()); // patched by moof()
+    for f in frames {
+        trun_body.extend_from_slice(&f.duration.to_be_bytes());
+        trun_body.extend_from_slice(&(f.data.len() as u32).to_be_bytes());
+    }
+    let trun = full_bx(b"trun", 0, flags, &trun_body);
+
+    let data_offset_pos = 8 + tfhd.len() + tfdt.len() + 8 + 4 + data_offset_field;
+    let traf_box = bx(b"traf", &concat(&[tfhd, tfdt, trun]));
+    (traf_box, data_offset_pos)
 }
 
 #[cfg(test)]
@@ -568,6 +826,137 @@ mod tests {
         assert_eq!(boxes[0].0, *b"ftyp");
         assert_eq!(boxes[1].0, *b"moov");
         assert_eq!(boxes.len(), 2);
+    }
+
+    #[test]
+    fn audio_builder_muxes_a_second_traf_and_video_only_bytes_are_unchanged() {
+        let idr = [0, 0, 0, 1, 0x65, 1, 2, 3, 4];
+        let p = [0, 0, 0, 1, 0x41, 9, 8, 7];
+        let opus_a = [0x0b, 1, 2, 3]; // raw Opus packets (content opaque to the muxer)
+        let opus_b = [0x0b, 4, 5];
+
+        // Video-only output must be byte-identical with and without the audio FEATURE
+        // compiled in — i.e. a builder without with_opus_audio changes nothing.
+        let run_video_only = || {
+            let mut fb = FragmentBuilder::new(params());
+            let init = fb.init_segment();
+            fb.push_au(&idr, 3000, true);
+            fb.push_au(&p, 3000, false);
+            let seg = fb.push_au(&idr, 3000, true).unwrap();
+            (init, seg.bytes)
+        };
+        let (init_a, seg_a) = run_video_only();
+        let (init_b, seg_b) = run_video_only();
+        assert_eq!(init_a, init_b);
+        assert_eq!(seg_a, seg_b);
+
+        // A/V builder: audio rides in the same fragment as a second traf.
+        let mut fb = FragmentBuilder::new(params()).with_opus_audio(2);
+        assert!(fb.has_audio());
+        let init = fb.init_segment();
+        assert!(init.len() > init_a.len(), "init advertises the audio trak");
+        // The init must contain the Opus sample entry + dOps.
+        let hay = init.as_ref();
+        assert!(hay.windows(4).any(|w| w == b"Opus"), "Opus sample entry present");
+        assert!(hay.windows(4).any(|w| w == b"dOps"), "dOps present");
+        assert!(hay.windows(4).any(|w| w == b"soun"), "sound handler present");
+
+        fb.push_au(&idr, 3000, true);
+        fb.push_opus(&opus_a, 960);
+        fb.push_opus(&opus_b, 960);
+        fb.push_au(&p, 3000, false);
+        let seg = fb.push_au(&idr, 3000, true).expect("GOP closes");
+        let boxes = top_boxes(&seg.bytes);
+        assert_eq!(boxes[0].0, *b"moof");
+        assert_eq!(boxes[1].0, *b"mdat");
+        // Two trafs inside the moof.
+        let moof_body = &seg.bytes[8..boxes[0].1];
+        let mut trafs = 0;
+        let mut i = 0;
+        while i + 8 <= moof_body.len() {
+            let size = u32::from_be_bytes([moof_body[i], moof_body[i+1], moof_body[i+2], moof_body[i+3]]) as usize;
+            if &moof_body[i+4..i+8] == b"traf" { trafs += 1; }
+            i += size;
+        }
+        assert_eq!(trafs, 2, "video + audio trafs");
+        // fragment_info still reads the VIDEO traf: keyframe-led, 6000 video ticks.
+        let info = fragment_info(&seg.bytes).unwrap();
+        assert!(info.independent);
+        assert_eq!(info.duration_ticks, 6000);
+        // mdat = video samples then audio packets, byte-exact.
+        let mdat_body = &seg.bytes[boxes[0].1 + 8..];
+        let video_len: usize = mdat_body.len() - (opus_a.len() + opus_b.len());
+        assert_eq!(&mdat_body[video_len..video_len + opus_a.len()], &opus_a);
+        assert_eq!(&mdat_body[video_len + opus_a.len()..], &opus_b);
+
+        // The NEXT fragment's audio tfdt advances by the emitted durations (1920 ticks):
+        // audio pushed after the close lands in the following fragment.
+        fb.push_opus(&opus_a, 960);
+        let seg2 = fb.flush().expect("trailing fragment");
+        // Find the audio traf's tfdt (version 1, 8-byte time) inside the second moof.
+        let moof2 = find_box(&seg2.bytes, b"moof").unwrap();
+        let mut times = Vec::new();
+        let mut j = 0;
+        while j + 8 <= moof2.len() {
+            let size = u32::from_be_bytes([moof2[j], moof2[j+1], moof2[j+2], moof2[j+3]]) as usize;
+            if &moof2[j+4..j+8] == b"traf" {
+                let traf_body = &moof2[j+8..j+size];
+                let tfdt = find_box(traf_body, b"tfdt").unwrap();
+                times.push(u64::from_be_bytes(tfdt[4..12].try_into().unwrap()));
+            }
+            j += size;
+        }
+        assert_eq!(times, vec![6000, 1920], "video then audio decode times advance independently");
+    }
+
+    #[test]
+    fn audio_backpressure_drops_oldest_but_keeps_the_timeline() {
+        let mut fb = FragmentBuilder::new(params()).with_opus_audio(2);
+        let idr = [0, 0, 0, 1, 0x65, 1, 2, 3, 4];
+        // Overfill the audio buffer with no video part closing.
+        for i in 0..(MAX_PENDING_AUDIO + 50) {
+            fb.push_opus(&[i as u8, 1, 2], 960);
+        }
+        fb.push_au(&idr, 3000, true);
+        let seg = fb.push_au(&idr, 3000, true).expect("GOP closes");
+        // The fragment carries exactly the cap; the audio tfdt of the NEXT fragment
+        // accounts for the 50 dropped + 200 kept frames (timeline never rewinds).
+        let moof1 = find_box(&seg.bytes, b"moof").unwrap();
+        let mut count = 0u32;
+        let mut j = 0;
+        let mut audio_seen = 0;
+        while j + 8 <= moof1.len() {
+            let size = u32::from_be_bytes([moof1[j], moof1[j+1], moof1[j+2], moof1[j+3]]) as usize;
+            if &moof1[j+4..j+8] == b"traf" {
+                audio_seen += 1;
+                if audio_seen == 2 {
+                    let traf_body = &moof1[j+8..j+size];
+                    let trun = find_box(traf_body, b"trun").unwrap();
+                    count = u32::from_be_bytes(trun[4..8].try_into().unwrap());
+                }
+            }
+            j += size;
+        }
+        assert_eq!(count as usize, MAX_PENDING_AUDIO);
+        fb.push_opus(&[9, 9], 960);
+        let seg2 = fb.flush().unwrap();
+        let moof2 = find_box(&seg2.bytes, b"moof").unwrap();
+        let mut audio_tfdt = 0u64;
+        let mut seen = 0;
+        let mut k = 0;
+        while k + 8 <= moof2.len() {
+            let size = u32::from_be_bytes([moof2[k], moof2[k+1], moof2[k+2], moof2[k+3]]) as usize;
+            if &moof2[k+4..k+8] == b"traf" {
+                seen += 1;
+                if seen == 2 {
+                    let traf_body = &moof2[k+8..k+size];
+                    let tfdt = find_box(traf_body, b"tfdt").unwrap();
+                    audio_tfdt = u64::from_be_bytes(tfdt[4..12].try_into().unwrap());
+                }
+            }
+            k += size;
+        }
+        assert_eq!(audio_tfdt, (MAX_PENDING_AUDIO as u64 + 50) * 960, "dropped frames still advance the clock");
     }
 
     #[test]

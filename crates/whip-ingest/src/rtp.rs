@@ -258,6 +258,91 @@ impl H264Depacketizer {
     }
 }
 
+/// One Opus frame off the wire, with its position on the 48 kHz clock.
+#[derive(Debug)]
+pub struct OpusFrame {
+    /// The raw Opus packet — exactly what an fMP4 `Opus` track stores as a sample.
+    pub data: Vec<u8>,
+    /// Monotonic 48 kHz ticks since the first frame (RTP timestamp, wrap-unwrapped).
+    pub ts48: u64,
+}
+
+/// Opus RTP depacketization (RFC 7587): each RTP payload is one complete Opus packet —
+/// no fragmentation, no aggregation, nothing to reassemble. Loss needs no keyframe
+/// recovery either (every Opus frame decodes independently; the decoder conceals a
+/// gap), so this only strips headers and unwraps the 48 kHz timestamp.
+pub struct OpusDepacketizer {
+    last_ts: Option<u32>,
+    ts_unwrapped: u64,
+    base_ts: Option<u64>,
+}
+
+impl Default for OpusDepacketizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OpusDepacketizer {
+    pub fn new() -> Self {
+        Self { last_ts: None, ts_unwrapped: 0, base_ts: None }
+    }
+
+    /// Feed one RTP packet; returns the Opus frame it carries. Malformed input (and
+    /// RTCP on the muxed transport, RFC 5761) is dropped, never fatal.
+    pub fn push(&mut self, pkt: &[u8]) -> Option<OpusFrame> {
+        if pkt.len() < 12 || pkt.len() > MAX_RTP_LEN || (pkt[0] >> 6) != 2 {
+            return None;
+        }
+        if (192..=223).contains(&pkt[1]) {
+            return None; // RTCP (see H264Depacketizer — same demux rule)
+        }
+        let has_padding = pkt[0] & 0x20 != 0;
+        let has_ext = pkt[0] & 0x10 != 0;
+        let csrc_count = (pkt[0] & 0x0F) as usize;
+        let ts = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
+
+        let mut off = 12 + csrc_count * 4;
+        if has_ext {
+            if pkt.len() < off + 4 {
+                return None;
+            }
+            let ext_words = u16::from_be_bytes([pkt[off + 2], pkt[off + 3]]) as usize;
+            off += 4 + ext_words * 4;
+        }
+        let mut end = pkt.len();
+        if has_padding {
+            let pad = *pkt.last()? as usize;
+            if pad == 0 || pad > end.saturating_sub(off) {
+                return None;
+            }
+            end -= pad;
+        }
+        if off >= end {
+            return None;
+        }
+
+        // Unwrap the 48 kHz timestamp exactly like the video path: reordering across a
+        // wrap and encoder-reconnect discontinuities become zero advance.
+        if let Some(last) = self.last_ts {
+            let delta = ts.wrapping_sub(last);
+            const MAX_TS_JUMP: u32 = 10 * 48_000; // 10s
+            if delta < 1 << 31 && delta <= MAX_TS_JUMP {
+                self.ts_unwrapped += delta as u64;
+            }
+        }
+        self.last_ts = Some(ts);
+        if self.base_ts.is_none() {
+            self.base_ts = Some(self.ts_unwrapped);
+        }
+
+        Some(OpusFrame {
+            data: pkt[off..end].to_vec(),
+            ts48: self.ts_unwrapped - self.base_ts.unwrap_or(0),
+        })
+    }
+}
+
 /// H.264 RTP packetization (RFC 6184) — the inverse of [`H264Depacketizer`]. Turns one
 /// Annex-B access unit into RTP packets for the WebRTC media fast tier (W3): the publisher
 /// writes these onto a sendonly track that browser viewers hardware-decode directly. Emits
@@ -448,6 +533,25 @@ mod tests {
             au.data,
             [&[0, 0, 0, 1, 0x67, 1][..], &[0, 0, 0, 1, 0x68, 2], &[0, 0, 0, 1, 0x65, 3]].concat()
         );
+    }
+
+    #[test]
+    fn opus_frames_pass_through_with_a_monotonic_48k_clock() {
+        let mut d = OpusDepacketizer::new();
+        let f0 = d.push(&rtp(1, 1000, false, &[0x78, 1, 2, 3])).expect("frame");
+        assert_eq!(f0.data, vec![0x78, 1, 2, 3]);
+        assert_eq!(f0.ts48, 0, "first frame anchors the clock");
+        let f1 = d.push(&rtp(2, 1960, false, &[0x78, 4])).expect("frame");
+        assert_eq!(f1.ts48, 960, "20ms at 48kHz");
+        // RTCP on the muxed transport is ignored and doesn't advance the clock.
+        let mut sr = vec![0x80u8, 200, 0, 6];
+        sr.extend_from_slice(&[0; 24]);
+        assert!(d.push(&sr).is_none());
+        let f2 = d.push(&rtp(3, 2920, false, &[0x78, 5])).expect("frame");
+        assert_eq!(f2.ts48, 1920);
+        // A reconnect's timebase jump becomes zero advance, not an hours-long gap.
+        let f3 = d.push(&rtp(4, 2920 + 1_000_000_000, false, &[0x78, 6])).expect("frame");
+        assert_eq!(f3.ts48, 1920);
     }
 
     #[test]

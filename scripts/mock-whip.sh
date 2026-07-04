@@ -61,15 +61,17 @@ if [ -n "$FILE" ]; then
   [ -f "$FILE" ] || { echo "file not found: $FILE"; exit 1; }
   INPUTS=(-stream_loop -1 -re -i "$FILE")
 else
-  INPUTS=(-re -f lavfi -i "testsrc=size=${SIZE}:rate=${FPS}")
+  # Test pattern + a 440 Hz tone, so the audio path is exercised end-to-end too.
+  INPUTS=(-re -f lavfi -i "testsrc=size=${SIZE}:rate=${FPS}" -f lavfi -i "sine=frequency=440:sample_rate=48000")
 fi
 
-# H.264 only (the WHIP endpoint receives a single recvonly video track). zerolatency +
-# no B-frames matches the low-latency contribution profile.
+# H.264 + Opus — what OBS 30's WHIP output sends. zerolatency + no B-frames matches
+# the low-latency contribution profile; Opus is muxed by the app as fMP4 track 2.
 ENCODE=(
   -c:v libx264 -preset veryfast -tune zerolatency -profile:v baseline -pix_fmt yuv420p
   -bf 0 -g "$GOP" -keyint_min "$GOP" -sc_threshold 0
   -b:v "${BV}k" -maxrate "${BV}k" -bufsize "$(( BV * 2 ))k"
+  -c:a libopus -b:a 96k -application lowdelay -ac 2  # whip muxer requires stereo
   -f whip
 )
 

@@ -118,7 +118,7 @@ fn ffmpeg_whip_publisher_delivers_verified_access_units() {
     let mut got_keyframe = false;
     while Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(ingest) => {
+            Ok(whip_ingest::server::IngestEvent::Video(ingest)) => {
                 units += 1;
                 got_config |= ingest.config.is_some();
                 got_keyframe |= ingest.au.keyframe;
@@ -126,6 +126,7 @@ fn ffmpeg_whip_publisher_delivers_verified_access_units() {
                     break;
                 }
             }
+            Ok(_) => {} // audio events — this publisher is video-only
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if pubr.try_wait().ok().flatten().is_some() {
                     break; // publisher exited (finished its 6s or errored)

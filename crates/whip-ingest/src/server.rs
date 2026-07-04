@@ -17,7 +17,7 @@
 //! only been validated at the type level — they need a pass against real OBS WHIP
 //! output (no headless WHIP client here). See `docs/WHIP.md`.
 
-use crate::rtp::{AccessUnit, H264Depacketizer};
+use crate::rtp::{AccessUnit, H264Depacketizer, OpusDepacketizer, OpusFrame};
 use datachannel::{
     ConnectionState, DataChannelHandler, DataChannelInfo, GatheringState, PeerConnectionHandler,
     RtcConfig, RtcPeerConnection, SessionDescription, TrackHandler, TrackInit,
@@ -33,6 +33,16 @@ use std::time::Duration;
 pub struct IngestAu {
     pub au: AccessUnit,
     pub config: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+/// Everything the WHIP session delivers, in arrival order on ONE channel — so the
+/// feeder learns whether audio exists BEFORE any media (`AudioNegotiated` is sent at
+/// answer time, media only flows after ICE) and A/V stay in relative order.
+pub enum IngestEvent {
+    /// The publisher's offer carried an Opus audio m-line and we answered it.
+    AudioNegotiated { channels: u8 },
+    Video(IngestAu),
+    Audio(OpusFrame),
 }
 
 /// A running WHIP endpoint. Drop it to stop the HTTP server + tear down the session.
@@ -68,13 +78,26 @@ impl WhipServer {
 /// here directly.
 struct Track {
     depack: H264Depacketizer,
-    out: Sender<IngestAu>,
+    out: Sender<IngestEvent>,
 }
 impl TrackHandler for Track {
     fn on_message(&mut self, msg: &[u8]) {
         if let Some(au) = self.depack.push(msg) {
             let config = self.depack.take_config();
-            let _ = self.out.send(IngestAu { au, config });
+            let _ = self.out.send(IngestEvent::Video(IngestAu { au, config }));
+        }
+    }
+}
+
+/// The audio counterpart: Opus frames straight through (RFC 7587 — no reassembly).
+struct AudioTrack {
+    depack: OpusDepacketizer,
+    out: Sender<IngestEvent>,
+}
+impl TrackHandler for AudioTrack {
+    fn on_message(&mut self, msg: &[u8]) {
+        if let Some(frame) = self.depack.push(msg) {
+            let _ = self.out.send(IngestEvent::Audio(frame));
         }
     }
 }
@@ -105,7 +128,7 @@ impl PeerConnectionHandler for Conn {
 
 /// Start a WHIP endpoint on an ephemeral localhost port. Access units (with codec
 /// config on change) arrive on `out`. `stun` mirrors the mesh transport's ICE config.
-pub fn start(out: Sender<IngestAu>, stun: Vec<String>) -> std::io::Result<WhipServer> {
+pub fn start(out: Sender<IngestEvent>, stun: Vec<String>) -> std::io::Result<WhipServer> {
     let server = Arc::new(
         tiny_http::Server::http("127.0.0.1:0").map_err(|e| std::io::Error::other(e.to_string()))?,
     );
@@ -141,7 +164,7 @@ pub fn start(out: Sender<IngestAu>, stun: Vec<String>) -> std::io::Result<WhipSe
 
 fn handle_offer(
     mut req: tiny_http::Request,
-    out: &Sender<IngestAu>,
+    out: &Sender<IngestEvent>,
     stun: &[String],
     pc_slot: &Arc<Mutex<Option<Box<RtcPeerConnection<Conn>>>>>,
 ) {
@@ -168,15 +191,17 @@ fn handle_offer(
     }
 }
 
-/// Build a recvonly H.264 transport matching the offer's video m-line, apply the
-/// offer, wait for ICE gathering, and return our answer SDP.
+/// Build a recvonly transport matching the offer's H.264 video m-line (and its Opus
+/// audio m-line when present), apply the offer, wait for ICE gathering, and return
+/// our answer SDP.
 fn negotiate(
     offer_sdp: &str,
-    out: Sender<IngestAu>,
+    out: Sender<IngestEvent>,
     stun: &[String],
 ) -> Result<(Box<RtcPeerConnection<Conn>>, String), String> {
     let (mid, pt) = video_mline(offer_sdp)
         .ok_or_else(|| "offer has no H.264 video m-line".to_string())?;
+    let audio = audio_mline(offer_sdp);
 
     // The wire form the safe wrapper (de)serializes is JSON `{type, sdp}`.
     let offer: SessionDescription =
@@ -202,11 +227,35 @@ fn negotiate(
         profile: None,
     };
     let track = pc
-        .add_track_ex(&track_init, Track { depack: H264Depacketizer::new(), out })
+        .add_track_ex(&track_init, Track { depack: H264Depacketizer::new(), out: out.clone() })
         .map_err(|e| format!("add_track: {e}"))?;
     // The track lives as long as the PC (which we return + hold); leak the box so the
     // handler keeps receiving without us threading it through the endpoint state.
     std::mem::forget(track);
+
+    // Audio is optional: OBS/ffmpeg offer Opus alongside H.264; a video-only publisher
+    // (mock scripts, screen shares) simply has no audio m-line and we answer without one.
+    // AudioNegotiated goes down the SAME channel as media, at answer time — media only
+    // flows after ICE completes, so the consumer always learns about audio first.
+    if let Some((amid, apt, channels)) = &audio {
+        let audio_init = TrackInit {
+            direction: datachannel::Direction::RecvOnly,
+            codec: datachannel::Codec::Opus,
+            payload_type: *apt,
+            ssrc: 2,
+            mid: CString::new(amid.as_str()).map_err(|e| format!("audio mid: {e}"))?,
+            name: None,
+            msid: None,
+            track_id: None,
+            profile: None,
+        };
+        let atrack = pc
+            .add_track_ex(&audio_init, AudioTrack { depack: OpusDepacketizer::new(), out: out.clone() })
+            .map_err(|e| format!("add audio track: {e}"))?;
+        std::mem::forget(atrack);
+        let _ = out.send(IngestEvent::AudioNegotiated { channels: *channels });
+        log::info!("[whip] audio negotiated (opus, {channels}ch, pt={apt})");
+    }
 
     // Setting the remote offer makes libdatachannel generate the answer + start ICE.
     pc.set_remote_description(&offer).map_err(|e| format!("set offer: {e}"))?;
@@ -270,6 +319,44 @@ pub(crate) fn video_mline(sdp: &str) -> Option<(String, i32)> {
         .find(|p| mode1_pts.contains(p))
         .or_else(|| h264_pts.first().copied())?;
     Some((mid?, pt))
+}
+
+/// Extract `(mid, payload_type, channels)` of the offer's Opus audio m-line, or `None`
+/// for a video-only offer. Same text-scan approach as [`video_mline`]; the channel
+/// count comes from the rtpmap's `opus/48000/<ch>` (2 unless stated otherwise —
+/// RFC 7587 registers opus/48000/2 as the canonical form).
+pub(crate) fn audio_mline(sdp: &str) -> Option<(String, i32, u8)> {
+    let mut in_audio = false;
+    let mut mid: Option<String> = None;
+    let mut opus: Option<(i32, u8)> = None;
+    for line in sdp.lines() {
+        if let Some(rest) = line.strip_prefix("m=") {
+            if in_audio {
+                break; // end of the (first) audio section
+            }
+            in_audio = rest.starts_with("audio");
+            continue;
+        }
+        if !in_audio {
+            continue;
+        }
+        if let Some(m) = line.strip_prefix("a=mid:") {
+            mid = Some(m.trim().to_string());
+        } else if let Some(r) = line.strip_prefix("a=rtpmap:") {
+            // "<pt> opus/48000/2"
+            if let Some((p, codec)) = r.split_once(' ') {
+                let c = codec.trim().to_ascii_lowercase();
+                if c.starts_with("opus/") && opus.is_none() {
+                    if let Ok(n) = p.trim().parse::<i32>() {
+                        let channels = c.split('/').nth(2).and_then(|s| s.parse().ok()).unwrap_or(2);
+                        opus = Some((n, channels));
+                    }
+                }
+            }
+        }
+    }
+    let (pt, channels) = opus?;
+    Some((mid?, pt, channels))
 }
 
 fn header(k: &str, v: &str) -> tiny_http::Header {
