@@ -15,7 +15,8 @@ import { startWatch } from './watch.js';
 // consumes the stash; later ones must not yank an already-started watch back to entry.
 export function resumeAfterSignIn(){
   const target = S.pendingWatch; S.pendingWatch = '';
-  if(target){ startWatch(target); return; }
+  const key = S.pendingWatchKey; S.pendingWatchKey = undefined;
+  if(target){ startWatch(target, key); return; }
   if(['finding','live','seed','catchup'].includes(S.curState)) return;
   go('entry');
 }

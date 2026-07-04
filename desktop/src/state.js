@@ -63,6 +63,7 @@ export const S = {
   publishing: false,
   pubActive: false,     // a publish session exists in the backend (live or waiting)
   pubName: '',
+  pubKey: '',            // invite-only stream key (hex) for the current publish; embedded in the share link's #k=
   pubHlsUrl: null,
   pubLive: false,
   pubLiveSince: 0,
@@ -77,6 +78,8 @@ export const S = {
   bulletinReady: false, // Bulletin allowance installed → durable-origin (manifest) writes sponsored
   fsOn: false,
   watchTarget: '',      // the stream name last submitted to start_watch — Rejoin/Try-again re-submit it
+  watchKey: undefined,  // invite-only key from the watched link's #k= fragment (for decrypt + rejoin)
+  pendingWatchKey: undefined, // invite key stashed with pendingWatch until sign-in completes
   pendingWatch: '',     // invite deep-link received before sign-in finished — resumed by resumeAfterSignIn
   fastFor: '',          // canonical stream name a fast-connect invite unlocked ('' = none)
   fastEligible: false,  // the CURRENT watch arrived via a fast-connect invite (set by startWatch)

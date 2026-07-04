@@ -126,6 +126,7 @@ async fn best_effort_bulletin(me: unstation_core::types::PeerId) {
         tracks: vec![Track { id: "v".into(), bitrate: 0, w: 0, h: 0 }],
         publisher: pk,
         created_at: 0,
+            encrypted: false,
     };
     let Some(sig_bytes) = unstation_chain::sign_with_identity(&manifest.signing_payload()) else {
         eprintln!("[paseo] no identity to sign a manifest — skipping Bulletin");

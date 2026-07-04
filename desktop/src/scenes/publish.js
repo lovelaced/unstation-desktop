@@ -152,7 +152,7 @@ async function switchIngest(){
   ingestMode = ingestMode === 'whip' ? 'rtmp' : 'whip';
   try{
     await invoke('stop_publish');
-    const info = await invoke('start_publish', { title: S.pubName, ingestMode });
+    const info = await invoke('start_publish', { title: S.pubName, ingestMode, key: S.pubKey || undefined });
     S.pubHlsUrl = info.hls_url;
     renderIngestCard(info);
   }catch(err){ publishStartFailed(err); }
@@ -164,17 +164,17 @@ async function switchIngest(){
    The fast-connect invite is a separate ONE-SHOT copy/share of the ?fast link — no mode
    toggle whose state a broadcaster could misread. */
 function refreshInviteUi(){
-  const link = S.pubName ? makeInviteLink(S.pubName) : '';
+  const link = S.pubName ? makeInviteLink(S.pubName, false, S.pubKey) : '';
   const el=document.getElementById('inviteLink'); if(el) el.textContent = link || '—';
   const fl=document.getElementById('fastInviteLink');
-  if(fl) fl.textContent = S.pubName ? makeInviteLink(S.pubName, true) : '';
+  if(fl) fl.textContent = S.pubName ? makeInviteLink(S.pubName, true, S.pubKey) : '';
   return link;
 }
 { const d=document.getElementById('fastInviteDesc'); if(d) d.textContent = STRINGS.fastInviteDesc; }
 { const b=document.getElementById('shareFastInvite');
   if(b) b.addEventListener('click', async ()=>{
     if(!S.pubName) return;
-    const link = makeInviteLink(S.pubName, true);
+    const link = makeInviteLink(S.pubName, true, S.pubKey);
     if(navigator.share){ try{ await navigator.share({ url: link, title: S.pubName }); return; }catch(e){ if(e && e.name==='AbortError') return; } }
     try{ await navigator.clipboard.writeText(link); }catch(e){}
     const old=b.textContent; b.textContent=STRINGS.copied; b.classList.add('done');
@@ -249,6 +249,19 @@ export const shareName = t => slugify(t);
 const titleEl = document.getElementById('streamTitle');
 const startStreamBtn = document.getElementById('startStream');
 const unlistedToggle = document.getElementById('unlistedToggle');
+const encryptedToggle = document.getElementById('encryptedToggle');
+
+// A 256-bit invite-only stream key as 64 hex chars. Generated when the broadcaster
+// enables encryption; it rides in the share link's #k= fragment (never on the chain),
+// and the backend seals every segment with it. Held stable while the toggle stays on.
+function freshStreamKey(){
+  const bytes = new Uint8Array(32);
+  (crypto || window.crypto).getRandomValues(bytes);
+  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+}
+if(encryptedToggle) encryptedToggle.addEventListener('change', ()=>{
+  S.pubKey = encryptedToggle.checked ? (S.pubKey || freshStreamKey()) : '';
+});
 
 // A capability token for an unlisted stream: ~72 bits of base32 (no ambiguous
 // 0/1/l/o), appended to the slug so the discovery topic — blake2b(stream name) —
@@ -310,6 +323,8 @@ async function goLiveStartInner(){
   if(!ensureSignedIn()) return;
   try{ titleEl.blur(); }catch(e){} // drop the phone keyboard before the console appears
   S.pubName = effectiveName();
+  // Lock the invite-only key if encryption is on (else clear it).
+  S.pubKey = (encryptedToggle && encryptedToggle.checked) ? (S.pubKey || freshStreamKey()) : '';
   titleEl.value = S.pubName;
   titleEl.readOnly = true;
   document.getElementById('shareLink').textContent = S.pubName;
@@ -322,7 +337,7 @@ async function goLiveStartInner(){
   applyPublishState(false); // enter the console in the waiting state
   if(NATIVE && invoke){
     try {
-      const info = await invoke('start_publish', { title: S.pubName, ingestMode });
+      const info = await invoke('start_publish', { title: S.pubName, ingestMode, key: S.pubKey || undefined });
       S.pubHlsUrl = info.hls_url; S.pubActive = true; refreshGoLiveBadge();
       renderIngestCard(info);
       // Android: start_publish has opened the AU intake; now start the camera capture

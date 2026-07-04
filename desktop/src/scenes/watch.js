@@ -135,15 +135,18 @@ export function selfWatch(name){
 // the ended scene's Rejoin, and the give-up card's Try again. On native we STAY on
 // the finding scene until the `live` watch-phase arrives — but the player warms up
 // behind it (setVideo + the stall ladder start as soon as start_watch resolves).
-export async function startWatch(target){
+export async function startWatch(target, key){
   target=(target||'').trim(); if(!target) return;
   if(!ensureSignedIn()) return;
   if(NATIVE && S.publishing && S.pubName && shareName(target)===S.pubName){ selfWatch(S.pubName); return; }
   S.watchTarget=target;
+  // Invite-only stream key (from the link's #k= fragment) — kept for rejoin, passed to
+  // the backend which decrypts on-device. Undefined for a plain stream.
+  S.watchKey = key || undefined;
   // Fast connect is unlocked per-stream by the broadcaster's invite, never by default.
   S.fastEligible = !!S.fastFor && S.fastFor === shareName(target);
   go('finding');
-  if(NATIVE && invoke){ try{ const info=await invoke('start_watch',{ target }); document.getElementById('mPub').textContent=info.publisher; S.lastPeers=0; setTitle(target,true); applyStats({peers:0,rho:0,mode:'p2p',from_seed:0,from_chain:0,latency_s:0,ice:'connecting'}); startWatchWatchdog(); setVideo(info.hls_url); }catch(err){ console.error('start_watch failed',err); findingCopy('Problem','Couldn’t start watching',((err&&err.message)||(''+err))); clearSeq(); } }
+  if(NATIVE && invoke){ try{ const info=await invoke('start_watch',{ target, key: S.watchKey }); document.getElementById('mPub').textContent=info.publisher; S.lastPeers=0; setTitle(target,true); applyStats({peers:0,rho:0,mode:'p2p',from_seed:0,from_chain:0,latency_s:0,ice:'connecting'}); startWatchWatchdog(); setVideo(info.hls_url); }catch(err){ console.error('start_watch failed',err); findingCopy('Problem','Couldn’t start watching',((err&&err.message)||(''+err))); clearSeq(); } }
   else { setTimeout(()=>go('live'),1200); }
 }
 
@@ -152,7 +155,7 @@ document.getElementById('watchForm').addEventListener('submit', (e)=>{ e.prevent
 // The give-up card's buttons are injected HTML (player.js's 45s rung) — delegate.
 document.getElementById('catchup').addEventListener('click', async (e)=>{
   const b=e.target && e.target.closest ? e.target.closest('button') : null; if(!b) return;
-  if(b.id==='retryWatchBtn'){ if(NATIVE && invoke){ try{ await invoke('stop_watch'); }catch(err){} } if(S.watchTarget) startWatch(S.watchTarget); else go('entry'); }
+  if(b.id==='retryWatchBtn'){ if(NATIVE && invoke){ try{ await invoke('stop_watch'); }catch(err){} } if(S.watchTarget) startWatch(S.watchTarget, S.watchKey); else go('entry'); }
   else if(b.id==='giveUpLeaveBtn'){ leaveWatch(); }
 });
 

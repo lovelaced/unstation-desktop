@@ -36,6 +36,12 @@ pub struct Manifest {
     /// Publisher sr25519 public key — the trust anchor.
     pub publisher: [u8; 32],
     pub created_at: u64,
+    /// Invite-only encryption (Tier 1 privacy): when true, every segment and the init
+    /// are sealed with a stream key that travels ONLY in the invite link — the mesh,
+    /// seeds, and Bulletin hold ciphertext. A viewer without the key cannot play. The
+    /// flag is inside the SIGNED manifest, so a relay can't strip it to trick a viewer
+    /// into treating ciphertext as plaintext.
+    pub encrypted: bool,
 }
 
 impl Manifest {
@@ -103,6 +109,7 @@ mod tests {
             tracks: vec![Track { id: "v1080".into(), bitrate: 5_000_000, w: 1920, h: 1080 }],
             publisher,
             created_at: 1_734_820_000,
+            encrypted: false,
         }
     }
 

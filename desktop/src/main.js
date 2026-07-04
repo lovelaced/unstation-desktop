@@ -26,7 +26,9 @@ function handleInviteUrl(url){
   // A fast-connect invite unlocks the publisher-direct attempt for THIS stream only;
   // the verified path is unchanged and remains the fallback.
   S.fastFor = inv.fast ? name : '';
-  if(!NATIVE || S.chainReady){ startWatch(name); return; }
+  // Invite-only key (from #k=): held so a not-signed-in open resumes with it too.
+  S.pendingWatchKey = inv.key;
+  if(!NATIVE || S.chainReady){ startWatch(name, inv.key); return; }
   S.pendingWatch = name;
   // Not signed in: surface the sign-in flow (a cached session coalesces onto the
   // in-flight allowance bridge). If onboarding/pairing is ALREADY on screen, leave it
@@ -71,7 +73,7 @@ document.getElementById('leaveWatchBtn').addEventListener('click', leaveWatch);
 document.getElementById('fsBtn').addEventListener('click', toggleFullscreen);
 // Ended scene → Rejoin: re-submit the stored target through the same path as the
 // watch form (a full start_watch). No target (e.g. preview dock) → back to entry.
-{ const rj=document.getElementById('rejoinBtn'); if(rj) rj.addEventListener('click', ()=>{ if(S.watchTarget) startWatch(S.watchTarget); else go('entry'); }); }
+{ const rj=document.getElementById('rejoinBtn'); if(rj) rj.addEventListener('click', ()=>{ if(S.watchTarget) startWatch(S.watchTarget, S.watchKey); else go('entry'); }); }
 { const pv=document.getElementById('previewSelf'); if(pv) pv.addEventListener('click', ()=>{ if(S.pubName) selfWatch(S.pubName); }); }
 { const sb=document.getElementById('stopSeedBtn'); if(sb) sb.addEventListener('click', ()=>{ if(NATIVE && invoke) invoke('stop_seed').catch(()=>{}); sb.style.display='none'; const l=document.getElementById('setLend'); if(l) l.textContent='Off \u2014 not watching anything right now.'; }); }
   document.getElementById('rePairBtn').addEventListener('click', ()=>{ S.chainReady=false; try{ sso.resetPairing(); }catch(e){} const pb=document.getElementById('pairedBtn'); if(pb) pb.style.display=''; go('onboarding'); beginPairing(); });

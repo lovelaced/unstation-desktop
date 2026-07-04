@@ -39,6 +39,7 @@ fn vod_plays_from_origin_with_verification() {
         tracks: vec![Track { id: "v1080".into(), bitrate: 5_000_000, w: 1920, h: 1080 }],
         publisher: pubkey,
         created_at: 1,
+            encrypted: false,
     };
     let sig = crypto::sign_sr25519(&kp, &manifest.signing_payload());
     let cid = block_on(origin.put_manifest(SignedManifest { manifest, sig })).unwrap();

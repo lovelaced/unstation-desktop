@@ -148,6 +148,50 @@ pub fn open(sender_pub: &[u8; 32], recipient_secret: &[u8; 32], sealed: &[u8]) -
         .ok()
 }
 
+// ---- invite-only stream content encryption (Tier 1 privacy) ---------------------------
+//
+// An encrypted stream's segments (and init) are sealed with a 32-byte stream key K that
+// travels ONLY in the invite link's fragment — never on the chain or the mesh. Relays,
+// seeds, and Bulletin carry ciphertext; the content-id is the hash of the CIPHERTEXT, so
+// mesh dedup + the publisher-signed live edge are unchanged. Only the publisher's local
+// self-view and an authorized viewer (post-decrypt, on device) ever see plaintext.
+//
+// XChaCha20-Poly1305 with a fresh random 24-byte nonce per segment, prepended to the
+// output — so a static K never reuses a nonce and every segment is self-describing.
+
+const SEGMENT_KDF_LABEL: &[u8] = b"unstation-segment-v1";
+
+/// Seal a segment (or init) with stream key `k`. Output: `nonce(24) ‖ ciphertext+tag`.
+/// The content-id of an encrypted segment is `segment_id` of THIS output.
+pub fn seal_segment(k: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
+    // Domain-separate the AEAD key from any other use of the same 32 bytes.
+    let mut material = Vec::with_capacity(SEGMENT_KDF_LABEL.len() + 32);
+    material.extend_from_slice(SEGMENT_KDF_LABEL);
+    material.extend_from_slice(k);
+    let key = blake2b256(&material);
+    let cipher = XChaCha20Poly1305::new(key.as_slice().into());
+    let mut nonce = [0u8; 24];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    let mut out = Vec::with_capacity(24 + plaintext.len() + 16);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&cipher.encrypt(XNonce::from_slice(&nonce), plaintext).expect("aead encrypt"));
+    out
+}
+
+/// Open a [`seal_segment`]ed blob with stream key `k`. `None` on wrong key / tamper /
+/// truncation — a viewer without the invite key simply cannot play the stream.
+pub fn open_segment(k: &[u8; 32], sealed: &[u8]) -> Option<Vec<u8>> {
+    if sealed.len() < 24 + 16 {
+        return None;
+    }
+    let mut material = Vec::with_capacity(SEGMENT_KDF_LABEL.len() + 32);
+    material.extend_from_slice(SEGMENT_KDF_LABEL);
+    material.extend_from_slice(k);
+    let key = blake2b256(&material);
+    let cipher = XChaCha20Poly1305::new(key.as_slice().into());
+    cipher.decrypt(XNonce::from_slice(&sealed[..24]), &sealed[24..]).ok()
+}
+
 /// Lowercase hex of a 32-byte id (for CIDs / disk filenames).
 pub fn hex32(b: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
@@ -206,6 +250,28 @@ mod tests {
         assert_eq!(enc_keypair_from_seed(&[1u8; 32]), (a_sec, a_pub));
         // Two seals of the same message differ (fresh nonce).
         assert_ne!(seal(&b_pub, &a_sec, msg), seal(&b_pub, &a_sec, msg));
+    }
+
+    #[test]
+    fn segment_seal_roundtrips_and_hides_plaintext() {
+        let k = [0x42u8; 32];
+        let frag = b"\x00\x00\x00\x18moof....mdat....H.264 samples";
+        let sealed = seal_segment(&k, frag);
+        // The content-id is the CIPHERTEXT hash — mesh verification is over what the
+        // relay actually carries.
+        assert_ne!(&sealed[24..], &frag[..], "ciphertext is not plaintext");
+        assert!(sealed.windows(4).all(|w| w != b"moof"), "box structure hidden");
+        assert_eq!(open_segment(&k, &sealed).as_deref(), Some(&frag[..]));
+        // Wrong key, tamper, truncation all fail closed (a keyless viewer can't play).
+        let mut wrong = k;
+        wrong[0] ^= 1;
+        assert!(open_segment(&wrong, &sealed).is_none());
+        let mut bad = sealed.clone();
+        *bad.last_mut().unwrap() ^= 1;
+        assert!(open_segment(&k, &bad).is_none());
+        assert!(open_segment(&k, &sealed[..20]).is_none());
+        // Fresh nonce each call.
+        assert_ne!(seal_segment(&k, frag), seal_segment(&k, frag));
     }
 
     #[test]

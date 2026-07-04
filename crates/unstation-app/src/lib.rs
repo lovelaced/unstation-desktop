@@ -143,6 +143,50 @@ impl MediaSink for NullSink {
     }
 }
 
+/// Decode a 64-char hex stream key (the invite link's `#k=`) into 32 bytes. `None` for
+/// absent/malformed — an encrypted stream then simply doesn't play (no key, no video).
+fn decode_stream_key(k: Option<&str>) -> Option<[u8; 32]> {
+    let s = k?.trim();
+    let raw = s.strip_prefix("0x").unwrap_or(s);
+    if raw.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in raw.as_bytes().chunks(2).enumerate() {
+        out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// A [`MediaSink`] that decrypts each segment/init with the stream key BEFORE handing it
+/// to the real (local HLS) sink — the on-device boundary between the ciphertext the mesh
+/// carries and the plaintext the player sees. Decryption runs AFTER the node has
+/// hash-verified the ciphertext against the signed live edge, so a tampered segment never
+/// reaches here; a segment that fails to decrypt (wrong key) is dropped, not forwarded.
+/// Encryption never touches the player, MSE, or the muxer — just this wrapper.
+struct DecryptingSink {
+    inner: Arc<dyn MediaSink>,
+    key: [u8; 32],
+}
+impl MediaSink for DecryptingSink {
+    fn push_init(&self, bytes: Bytes) {
+        if let Some(plain) = crypto::open_segment(&self.key, &bytes) {
+            self.inner.push_init(Bytes::from(plain));
+        } else {
+            log::warn!("[watch] init decryption failed — wrong or missing invite key");
+        }
+    }
+    fn push_segment(&self, seq: u64, bytes: Bytes) {
+        match crypto::open_segment(&self.key, &bytes) {
+            Some(plain) => self.inner.push_segment(seq, Bytes::from(plain)),
+            None => log::warn!("[watch] segment {seq} decryption failed — wrong invite key?"),
+        }
+    }
+    fn on_play_head(&self) -> u64 {
+        self.inner.on_play_head()
+    }
+}
+
 #[derive(Serialize, Clone)]
 struct SigninInfo {
     uri: String,
@@ -408,10 +452,13 @@ async fn start_watch(
     app: AppHandle,
     state: State<'_, AppState>,
     target: String,
+    // Invite-only stream key (hex) from the invite link's `#k=` fragment, if any.
+    key: Option<String>,
 ) -> Result<WatchInfo, String> {
     if !*state.chain_ready.lock().unwrap() {
         return Err("Sign in with the Polkadot app to watch — peers need a verified identity.".into());
     }
+    let stream_key = decode_stream_key(key.as_deref());
     let stream = stream_id_from(&target);
     log::info!("[watch] target={target:?} → stream_id={}", crypto::hex32(&stream.0));
 
@@ -446,9 +493,19 @@ async fn start_watch(
     let hls = HlsServer::start(1000).map_err(|e| e.to_string())?;
     let hls_url = hls.url();
     let hls_sink = hls.sink();
-    let sink: Arc<dyn MediaSink> = Arc::new(hls_sink.clone());
+    // Invite-only streams: decrypt on-device (after the node hash-verifies the ciphertext)
+    // just before the local player. Unencrypted watches use the raw sink unchanged — this
+    // wrapper only exists when the invite carried a key.
+    let sink: Arc<dyn MediaSink> = match stream_key {
+        Some(k) => {
+            log::info!("[watch] invite key present — decrypting on device");
+            Arc::new(DecryptingSink { inner: Arc::new(hls_sink.clone()), key: k })
+        }
+        None => Arc::new(hls_sink.clone()),
+    };
     // A second handle to the SAME local HLS server so the dial loop can install the CMAF
     // init segment it fetches from Bulletin, alongside the media segments the node feeds.
+    // (When encrypted, this is the SAME DecryptingSink, so the Bulletin init is decrypted too.)
     let sink_for_init = sink.clone();
 
     // Viewer node inbox; the transport posts PeerConnected/Inbound here.
@@ -642,6 +699,8 @@ async fn start_watch(
         let phase = emit_phase.clone();
         let started = watch_started;
         let pub_peer = publisher_peer.clone();
+        // Whether the viewer supplied an invite key (drives the "needs a key" warning).
+        let have_key = stream_key.is_some();
         let filter: Arc<dyn Fn(Presence) -> BoxFuture<'static, bool> + Send + Sync> =
             Arc::new(move |cand: Presence| {
                 let vtx = vtx.clone();
@@ -658,6 +717,15 @@ async fn start_watch(
                     phase("verifying", "", &started);
                     match BulletinOrigin.fetch_manifest(cid).await {
                         Ok(m) if m.verify(&cand.publisher).is_ok() => {
+                            // Invite-only stream but no key in this link → we'd feed the
+                            // player ciphertext. Refuse with a clear message instead.
+                            if m.manifest.encrypted && !have_key {
+                                let _ = appc.emit(
+                                    "mesh-status",
+                                    MeshStatusMsg { state: "error".into(), detail: "This stream is invite-only — open it with the full invite link.".into() },
+                                );
+                                return false;
+                            }
                             // Verified publisher → its personhood key is the trust
                             // anchor for gossiped live-edge announcements (#17).
                             let _ = vtx.send(EngineEvent::SetPublisherKey { key: cand.publisher });
@@ -1270,6 +1338,31 @@ fn spawn_publish_stats(
     })
 }
 
+/// The mesh form of a freshly-muxed segment: for an encrypted stream, seal the bytes and
+/// re-key the content-id to the CIPHERTEXT hash (so mesh dedup + the signed edge cover
+/// exactly what relays carry); for a plain stream, the muxer's `(id, bytes)` unchanged.
+/// The publisher's local self-view keeps the plaintext regardless.
+#[cfg(feature = "publish")]
+fn mesh_segment(key: Option<[u8; 32]>, seg: &segmenter::Segment) -> (SegmentId, Bytes) {
+    match key {
+        Some(k) => {
+            let ct = crypto::seal_segment(&k, &seg.bytes);
+            (crypto::segment_id(&ct), Bytes::from(ct))
+        }
+        None => (seg.id, seg.bytes.clone()),
+    }
+}
+
+/// The mesh/Bulletin form of the init segment: sealed for an encrypted stream, raw
+/// otherwise. (The local preview always gets the plaintext init.)
+#[cfg(feature = "publish")]
+fn mesh_init(key: Option<[u8; 32]>, init: &Bytes) -> Bytes {
+    match key {
+        Some(k) => Bytes::from(crypto::seal_segment(&k, init)),
+        None => init.clone(),
+    }
+}
+
 /// CMAF part duration for the low-latency (LL-HLS) tier — the in-process muxer emits a part
 /// this often, and it's the `target_segment_ms` we advertise in the manifest so viewers run
 /// their local HLS re-server in LL mode too. ~250ms trades a little mesh overhead (more,
@@ -1291,6 +1384,9 @@ fn spawn_manifest_publish(
     init_slot: Arc<Mutex<Option<Bytes>>>,
     // `Some(part_ms)` → advertise low-latency (LL-HLS) so viewers serve parts; `None` → standard.
     ll_part_ms: Option<u32>,
+    // Invite-only: sealed segments + init. Stamped into the SIGNED manifest so a viewer
+    // knows a key is required and a relay can't strip the flag.
+    encrypted: bool,
 ) -> JoinHandle<()> {
     let session_mc = session.clone();
     tokio::spawn(async move {
@@ -1341,6 +1437,7 @@ fn spawn_manifest_publish(
             tracks: vec![Track { id: "v".into(), bitrate: 0, w: 0, h: 0 }],
             publisher,
             created_at,
+            encrypted,
         };
         let Some(sig) = unstation_chain::sign_with_identity(&manifest.signing_payload()) else {
             log::warn!("[publish] could not sign manifest");
@@ -1368,11 +1465,16 @@ async fn start_publish(
     state: State<'_, AppState>,
     title: Option<String>,
     ingest_mode: Option<String>,
+    // Invite-only stream key (hex) generated by the UI and embedded in the share link's
+    // `#k=` fragment. Present → every segment + init is sealed with it; the mesh/seeds/
+    // Bulletin carry only ciphertext.
+    key: Option<String>,
 ) -> Result<PublishInfo, String> {
     let _busy = claim_pub_busy(&state)?; // one setup at a time — see AppState::pub_busy
     if !*state.chain_ready.lock().unwrap() {
         return Err("Sign in with the Polkadot app to go live — your stream is announced under your verified identity.".into());
     }
+    let stream_key = decode_stream_key(key.as_deref());
     // WHIP ingest (RFC 9725, sub-second) takes WebRTC media straight from OBS 30+ and
     // needs no ffmpeg; RTMP does. Default to RTMP.
     let whip = ingest_mode.as_deref() == Some("whip");
@@ -1484,6 +1586,7 @@ async fn start_publish(
         stream,
         init_slot.clone(),
         whip.then_some(LL_PART_MS),
+        stream_key.is_some(),
     ));
     let (edge_tx, edge_rx) = unbounded_channel::<(Seq, SegmentId)>();
     tasks.push(session.spawn_edge_publisher(edge_rx));
@@ -1535,6 +1638,7 @@ async fn start_publish(
                 }
             }
         });
+        let feed_key = stream_key; // captured by the feeder for encryption
         let feeder = tokio::spawn(async move {
             let _server = server; // hold the endpoint alive for the feeder's lifetime
             let mut fb: Option<segmenter::FragmentBuilder> = None;
@@ -1620,8 +1724,10 @@ async fn start_publish(
                             log::info!("[publish] whip audio: opus {ch}ch muxed as track 2");
                         }
                         let init = builder.init_segment();
+                        // Encrypted: Bulletin gets the sealed init; the local preview gets
+                        // the plaintext (the publisher watches its own stream in the clear).
                         *init_slot_feeder.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(init.clone());
+                            Some(mesh_init(feed_key, &init));
                         preview.push_init(init);
                         fb = Some(builder);
                     } else {
@@ -1640,7 +1746,9 @@ async fn start_publish(
                 };
                 last_pts = Some(iu.au.pts_us);
                 // Fan the raw access unit onto any fast-tier viewers' WebRTC tracks (before
-                // muxing — the fast tier is the un-segmented, sub-second path).
+                // muxing — the fast tier is the un-segmented, sub-second path). The fast tier
+                // is publisher-direct to an already-invited viewer (who holds the key), so it
+                // stays plaintext — no relay ever sees it.
                 fast_feed.broadcast(
                     &iu.au.data,
                     fasttier::pts_us_to_rtp90k(iu.au.pts_us),
@@ -1648,10 +1756,12 @@ async fn start_publish(
                 );
                 if let Some(seg) = builder.push_au(&iu.au.data, dur.max(1), iu.au.keyframe) {
                     ingest_w.fetch_add(seg.bytes.len() as u64, Ordering::Relaxed);
+                    // Plaintext to the local preview; ciphertext (+ ciphertext-id) to the mesh.
+                    let (mesh_id, mesh_bytes) = mesh_segment(feed_key, &seg);
                     preview.push_segment(seg.seq, seg.bytes.clone());
-                    let _ = dur_tx.send((seg.seq, seg.bytes.clone()));
-                    let _ = ptx.send(EngineEvent::Produced { seq: seg.seq, id: seg.id, bytes: seg.bytes });
-                    let _ = edge_tx.send((seg.seq, seg.id));
+                    let _ = dur_tx.send((seg.seq, mesh_bytes.clone()));
+                    let _ = ptx.send(EngineEvent::Produced { seq: seg.seq, id: mesh_id, bytes: mesh_bytes });
+                    let _ = edge_tx.send((seg.seq, mesh_id));
                     last_fresh = std::time::Instant::now();
                     if !live {
                         live = true;
@@ -1679,6 +1789,7 @@ async fn start_publish(
         let init_slot_feeder = init_slot.clone();
         let live_w = live_flag.clone();
         let ingest_w = ingest_bytes.clone();
+        let feed_key = stream_key; // captured by the feeder for encryption
         let feeder = tokio::spawn(async move {
         // Keep an ingest listener available AT ALL TIMES so the encoder can connect or
         // reconnect whenever — no ordering required. ffmpeg's RTMP `-listen` is one-shot,
@@ -1724,7 +1835,7 @@ async fn start_publish(
                             // Hand the init to the manifest publisher (→ Bulletin → viewers)
                             // and feed our own self-preview. (Bytes clone is cheap.)
                             *init_slot_feeder.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some(init.clone());
+                                Some(mesh_init(feed_key, &init));
                             preview.push_init(init);
                             init_sent = true;
                         }
@@ -1732,10 +1843,11 @@ async fn start_publish(
                     if init_sent {
                         for s in news {
                             ingest_w.fetch_add(s.bytes.len() as u64, Ordering::Relaxed);
+                            let (mesh_id, mesh_bytes) = mesh_segment(feed_key, &s);
                             preview.push_segment(s.seq, s.bytes.clone());
-                            let _ = dur_tx.send((s.seq, s.bytes.clone())); // sparse durable floor
-                            let _ = ptx.send(EngineEvent::Produced { seq: s.seq, id: s.id, bytes: s.bytes });
-                            let _ = edge_tx.send((s.seq, s.id));
+                            let _ = dur_tx.send((s.seq, mesh_bytes.clone())); // sparse durable floor
+                            let _ = ptx.send(EngineEvent::Produced { seq: s.seq, id: mesh_id, bytes: mesh_bytes });
+                            let _ = edge_tx.send((s.seq, mesh_id));
                             seen = s.seq + 1;
                         }
                         last_fresh = std::time::Instant::now();
@@ -1794,11 +1906,14 @@ async fn start_publish(
     app: AppHandle,
     state: State<'_, AppState>,
     title: Option<String>,
+    // Invite-only stream key (hex) from the UI; seals every camera segment + init.
+    key: Option<String>,
 ) -> Result<PublishInfo, String> {
     let _busy = claim_pub_busy(&state)?; // one setup at a time — see AppState::pub_busy
     if !*state.chain_ready.lock().unwrap() {
         return Err("Sign in with the Polkadot app to go live — your stream is announced under your verified identity.".into());
     }
+    let stream_key = decode_stream_key(key.as_deref());
     let name = title.unwrap_or_else(|| "unstation".into());
     let canon = canonical_stream_name(&name);
     let stream = stream_id_from(&name);
@@ -1872,6 +1987,7 @@ async fn start_publish(
         stream,
         init_slot.clone(),
         Some(LL_PART_MS),
+        stream_key.is_some(),
     ));
 
     let (edge_tx, edge_rx) = unbounded_channel::<(Seq, SegmentId)>();
@@ -1895,6 +2011,7 @@ async fn start_publish(
     // plugin) — so the encoder's config/frames aren't dropped, nor its config cleared by a late
     // open_stream racing the plugin's `nativeConfig`.
     let mut rx = camera::open_stream();
+    let feed_key = stream_key; // captured by the feeder for encryption
     let feeder = tokio::spawn(async move {
         // Wait for the encoder's codec-specific data (SPS/PPS) before building the muxer.
         let config = loop {
@@ -1917,9 +2034,10 @@ async fn start_publish(
             },
             LL_PART_MS,
         );
-        // Init segment → self-preview + the manifest publisher (Bulletin, via `init_slot`).
+        // Init segment → self-preview (plaintext) + the manifest publisher (Bulletin, via
+        // `init_slot`; sealed when encrypted).
         let init = fb.init_segment();
-        *init_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(init.clone());
+        *init_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(mesh_init(feed_key, &init));
         preview.push_init(init);
         live_w.store(true, Ordering::Relaxed);
         let _ = appc.emit("publish-state", PublishStateMsg { live: true });
@@ -1940,10 +2058,11 @@ async fn start_publish(
             if let Some(seg) = fb.push_au(&au.data, dur.max(1), au.keyframe) {
                 log::info!("[publish] fragment seq={} ({} B)", seg.seq, seg.bytes.len());
                 ingest_w.fetch_add(seg.bytes.len() as u64, Ordering::Relaxed);
+                let (mesh_id, mesh_bytes) = mesh_segment(feed_key, &seg);
                 preview.push_segment(seg.seq, seg.bytes.clone());
-                let _ = dur_tx.send((seg.seq, seg.bytes.clone())); // sparse durable floor
-                let _ = ptx.send(EngineEvent::Produced { seq: seg.seq, id: seg.id, bytes: seg.bytes });
-                let _ = edge_tx.send((seg.seq, seg.id));
+                let _ = dur_tx.send((seg.seq, mesh_bytes.clone())); // sparse durable floor
+                let _ = ptx.send(EngineEvent::Produced { seq: seg.seq, id: mesh_id, bytes: mesh_bytes });
+                let _ = edge_tx.send((seg.seq, mesh_id));
             }
         }
     });
