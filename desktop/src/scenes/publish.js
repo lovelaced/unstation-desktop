@@ -5,7 +5,7 @@ import { invoke, NATIVE } from '../tauri.js';
 import { S, go, refreshGoLiveBadge, netLabel } from '../state.js';
 import { STRINGS } from '../copy.js';
 import { makeInviteLink } from '../invite.js';
-import { nativeUrl } from '../player.js';
+import { playNativeHlsWithRetry, stopNativeHls } from '../player.js';
 import { updateSettingsStatus } from './settings.js';
 import { ensureSignedIn } from './onboarding.js';
 
@@ -384,17 +384,20 @@ export function applyPublishState(live){
       // (the same seam the watch path uses). Desktop (WKWebView) plays natively — via the
       // parts-free /std.m3u8 view (AVPlayer rejects the LL playlist; see player.js nativeUrl).
       if(window.__hlsPlay){ window.__hlsPlay(v, S.pubHlsUrl, null); }
-      // Desktop native HLS. updatePubHealth() ticks ~1×/s, so guard like the watch path
-      // (setVideo): only (re)load when we're NOT already playing cleanly. Without this the
-      // preview reloaded every tick — and the FIRST segments aren't decodable the instant we
-      // go live (encoder warm-up / B-frame reorder priming), so an early error would just
-      // re-fire forever. Re-arming until it plays (then leaving it) is what makes it stick.
-      else if(!(v.readyState >= 3 && !v.paused && !v.error)){
-        try{ if(v.canPlayType('application/vnd.apple.mpegurl')){ const u=nativeUrl(S.pubHlsUrl); v.src=u + (u.includes('?')?'&':'?') + 't=' + Date.now(); v.style.display='block'; v.load(); v.play().catch(()=>{}); } }catch(e){}
+      // Desktop native HLS. updatePubHealth() ticks ~1×/s; start the SELF-preview through the
+      // watch path's retry-until-playing helper ONCE per live session (its own 1.5s loop then
+      // re-joins with a fresh cache-buster until the live window is wide enough — the instant
+      // we go live it's only a segment or two, and AVFoundation errors rather than wait). The
+      // `previewOn` latch stops us restarting the loop every tick.
+      else if(v.dataset.previewOn !== '1'){
+        v.dataset.previewOn = '1';
+        playNativeHlsWithRetry(v, S.pubHlsUrl);
       }
     }
   } else {
-    try{ v.pause(); }catch(e){} v.removeAttribute('src'); v.style.display='none';
+    v.dataset.previewOn = '0';
+    stopNativeHls(v); // also clears the retry loop
+    v.style.display='none';
   }
 }
 
@@ -441,7 +444,7 @@ export function endPublish(){
   titleEl.readOnly = false;
   document.getElementById('pubLive').hidden = true;
   const tag=document.getElementById('pubLiveTag'); if(tag) tag.style.display='none';
-  const v=document.getElementById('pubVid'); try{ v.pause(); }catch(e){} v.removeAttribute('src'); v.style.display='none';
+  const v=document.getElementById('pubVid'); v.dataset.previewOn='0'; stopNativeHls(v); v.style.display='none';
   go('entry');
   if(NATIVE && invoke){ invoke('stop_publish').catch(()=>{}); }
   if(window.__onPublishStopped){ Promise.resolve(window.__onPublishStopped()).catch(()=>{}); }

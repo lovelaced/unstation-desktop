@@ -70,11 +70,27 @@ export function setVideo(url){
   if(window.__hlsPlay){ window.__hlsPlay(v, url, catchup); return; }  // Android: play via hls.js (no native HLS)
   url = nativeUrl(url);
   if(!(v.canPlayType('application/vnd.apple.mpegurl'))){ if(catchup){ catchup.textContent=STRINGS.formatUnsupported; catchup.style.display='grid'; } return; }
-  const attempt=()=>{ if(v.readyState>=3 && !v.paused) return; try{ v.src=url+(url.includes('?')?'&':'?')+'t='+Date.now(); v.style.display='block'; v.load(); v.play().catch(()=>{}); }catch(e){} };
+  playNativeHlsWithRetry(v, url, ()=>{ if(catchup && S.curState!=='catchup') catchup.style.display='none'; cancelStallLadder(); });
+}
+
+// Native HLS (Safari/WKWebView) with retry-until-playing — the proven pattern the watch
+// path relies on, factored out so the Go-Live self-preview can use it too. The FIRST attempt
+// to join a FRESH live stream routinely fails (the live window is only a segment or two wide
+// the instant the encoder goes live, and AVFoundation can error rather than wait); each retry
+// carries a new cache-buster so AVFoundation treats it as a fresh resource and re-joins with
+// a wider window, until it sticks. `url` is pre-`nativeUrl` (LL→std swap happens here).
+export function playNativeHlsWithRetry(v, url, onPlaying){
+  if(!v || !url) return;
+  const src = nativeUrl(url);
+  if(!(v.canPlayType('application/vnd.apple.mpegurl'))) return;
+  const attempt=()=>{ if(v.readyState>=3 && !v.paused) return; try{ v.src=src+(src.includes('?')?'&':'?')+'t='+Date.now(); v.style.display='block'; v.load(); v.play().catch(()=>{}); }catch(e){} };
   attempt();
   clearInterval(v._retry);
-  v._retry=setInterval(()=>{ const playing=v.readyState>=3 && !v.paused; if(playing){ if(catchup && S.curState!=='catchup') catchup.style.display='none'; clearInterval(v._retry); cancelStallLadder(); } else attempt(); }, 1500);
+  v._retry=setInterval(()=>{ if(v.readyState>=3 && !v.paused){ clearInterval(v._retry); if(onPlaying) onPlaying(); } else attempt(); }, 1500);
 }
+
+// Tear down a native-HLS element started by playNativeHlsWithRetry (stops the retry loop too).
+export function stopNativeHls(v){ if(!v) return; clearInterval(v._retry); v._retry=null; try{ v.pause(); }catch(e){} v.removeAttribute('src'); }
 
 // Surface real media ERRORS on-screen (the bundled DMG has no devtools). We only
 // show genuine `error` events — `stalled`/`waiting` fire routinely at the live edge
