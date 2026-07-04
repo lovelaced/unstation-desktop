@@ -131,18 +131,20 @@ impl H264Depacketizer {
         }
         self.last_seq = Some(seq);
 
-        // Unwrap the 90 kHz timestamp into a monotonic tick count.
+        // Unwrap the 90 kHz RTP timestamp. It may step BACKWARD by a small amount — a
+        // B-frame presents before the reference frame decoded just before it, so its
+        // presentation timestamp dips — and the presentation timeline must preserve that
+        // dip (else the muxer can't write composition offsets and a B-frame stream plays
+        // in the wrong order / fails to decode). We interpret the delta as SIGNED: forward
+        // steps, small backward reorder steps, and clock wraps (folded in by wrapping_sub)
+        // all pass; only a jump larger than any real reorder — an encoder reconnect's new
+        // random RTP timebase (RFC 3550 §5.1), which once produced a ~6h part duration —
+        // is rejected (zero advance; continuity resumes at the next keyframe).
         if let Some(last) = self.last_ts {
-            let delta = ts.wrapping_sub(last);
-            // Deltas ≥ 2^31 mean the clock went "backwards" (reordering across a wrap);
-            // and a "forward" jump beyond any real inter-packet gap is a discontinuity —
-            // an encoder reconnect starts a new random RTP timebase (RFC 3550 §5.1), and
-            // swallowing that jump once produced a part claiming a ~6h duration, which
-            // poisons EXTINF/TARGETDURATION for every viewer. Both cases: zero advance
-            // (playback continuity resumes at the next keyframe anyway).
-            const MAX_TS_JUMP: u32 = 10 * 90_000; // 10s
-            if delta < 1 << 31 && delta <= MAX_TS_JUMP {
-                self.ts_unwrapped += delta as u64;
+            let signed = ts.wrapping_sub(last) as i32;
+            const MAX_TS_JUMP: i32 = 10 * 90_000; // 10s — beyond this is a discontinuity, not a reorder
+            if signed.abs() <= MAX_TS_JUMP {
+                self.ts_unwrapped = self.ts_unwrapped.saturating_add_signed(signed as i64);
             }
         }
         self.last_ts = Some(ts);
@@ -215,12 +217,13 @@ impl H264Depacketizer {
             }
             self.wait_keyframe = false;
         }
-        let pts_ticks = self.ts_unwrapped - self.base_ts.unwrap_or(0);
+        // Signed: a B-frame early in the stream can present just before `base_ts`.
+        let pts_ticks = self.ts_unwrapped as i64 - self.base_ts.unwrap_or(0) as i64;
         Some(AccessUnit {
             data,
             // 90 kHz ticks → µs (multiply first: sub-ms precision, no overflow at
             // any realistic stream length inside i64).
-            pts_us: (pts_ticks as i64) * 1000 / 90,
+            pts_us: pts_ticks * 1000 / 90,
             keyframe,
         })
     }
@@ -516,6 +519,27 @@ mod tests {
         assert!(!au.keyframe);
         assert_eq!(au.data, vec![0, 0, 0, 1, 0x41, 10, 11, 12, 13]);
         assert_eq!(au.pts_us, 3000 * 1000 / 90, "90 kHz ticks → µs");
+    }
+
+    #[test]
+    fn bframe_reorder_preserves_backward_pts() {
+        // Decode order I, P, B where the B-frame presents BETWEEN I and P (its RTP
+        // timestamp steps BACKWARD from the P frame just decoded). The depacketizer must
+        // keep that dip so the muxer can reconstruct presentation order — clamping it to a
+        // monotonic clock (the old behavior) is exactly what broke OBS High-profile decode.
+        let mut d = H264Depacketizer::new();
+        for p in idr_packets(1, 0) {
+            d.push(&p); // I, ts=0
+        }
+        let p_au = d.push(&rtp(4, 6000, true, &[0x41, 1, 2])).expect("P frame"); // presents 2 later
+        let b_au = d.push(&rtp(5, 3000, true, &[0x41, 3, 4])).expect("B frame"); // ts steps BACK
+        assert_eq!(p_au.pts_us, 6000 * 1000 / 90, "P frame PTS");
+        assert_eq!(b_au.pts_us, 3000 * 1000 / 90, "B frame PTS steps back, not clamped to the P frame");
+        assert!(b_au.pts_us < p_au.pts_us, "B-frame reorder preserved through the depacketizer");
+        // A genuine reconnect jump (> 10s) is still swallowed: the frame keeps the last
+        // valid time (the B-frame's 3000), not treated as a reorder or an hours-long gap.
+        let after = d.push(&rtp(6, 3000 + 20 * 90_000, true, &[0x41, 5])).expect("frame");
+        assert_eq!(after.pts_us, 3000 * 1000 / 90, "reconnect timebase jump → no advance");
     }
 
     #[test]
