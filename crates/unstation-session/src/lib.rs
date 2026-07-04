@@ -85,6 +85,12 @@ pub struct Session {
     ///
     /// [`MeshNode::with_ban_list`]: unstation_core::node::MeshNode::with_ban_list
     bans: BanList,
+    /// Origin-shield (privacy): when set, this session ANSWERS inbound offers only from
+    /// relay-advertising peers (volunteer seeds), refusing plain viewers — so the
+    /// publisher's IP is exposed only to the seed tier it feeds, never to the audience.
+    /// Viewers refused here fall back to dialing seeds via the normal maintainer. Off by
+    /// default; a publisher opts in. Shared so it can be toggled after `start`.
+    shield: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Session {
@@ -121,8 +127,17 @@ impl Session {
         let signaling = ChainSignaling::new(stream, n_shards);
 
         let bans = BanList::new();
+        let book = PresenceBook::new();
+        let shield = Arc::new(std::sync::atomic::AtomicBool::new(false));
         tokio::spawn(relay_outbound(sig_rx, signaling.clone(), my_peer));
-        tokio::spawn(relay_inbound(signaling.clone(), my_peer, transport.clone(), bans.clone()));
+        tokio::spawn(relay_inbound(
+            signaling.clone(),
+            my_peer,
+            transport.clone(),
+            bans.clone(),
+            book.clone(),
+            shield.clone(),
+        ));
 
         Ok(Self {
             stream,
@@ -130,8 +145,9 @@ impl Session {
             n_shards: n_shards.max(1),
             signaling,
             transport,
+            shield,
             manifest_cid: Arc::new(Mutex::new(None)),
-            book: PresenceBook::new(),
+            book,
             bans,
         })
     }
@@ -142,6 +158,12 @@ impl Session {
     /// [`MeshNode::with_ban_list`]: unstation_core::node::MeshNode::with_ban_list
     pub fn ban_list(&self) -> BanList {
         self.bans.clone()
+    }
+
+    /// Enable/disable origin-shield (see [`Session::shield`]). A publisher turns this on
+    /// to answer only relay volunteers, keeping its IP off the audience's peer list.
+    pub fn set_shield(&self, on: bool) {
+        self.shield.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// A clone of the chain signaling handle — for the opt-in WebRTC media fast tier (W3),
@@ -254,6 +276,36 @@ impl Session {
                         window.iter().map(|(s, i)| (*s, *i)).collect();
                     if let Err(e) = signaling.publish_edge(entries).await {
                         log::warn!("[session] publish_edge: {e}");
+                    }
+                }
+            }
+        })
+    }
+
+    /// Origin-shield support: periodically read the stream's discovery shards and admit
+    /// relay-capable anchors (the volunteer seeds) into the presence book, so
+    /// [`relay_inbound`]'s shield gate can recognize a seed's offer. A publisher does not
+    /// otherwise do discovery (it is the answerer), so without this its book holds only
+    /// itself and shield would refuse everyone. Also caches each seed's signaling key.
+    /// Only needed while shielded; spawn it alongside `set_shield(true)`.
+    pub fn spawn_relay_discovery(&self) -> tokio::task::JoinHandle<()> {
+        let signaling = self.signaling.clone();
+        let book = self.book.clone();
+        let stream = self.stream;
+        let n_shards = self.n_shards;
+        tokio::spawn(async move {
+            let mut tick = interval(DISCOVERY_POLL);
+            loop {
+                tick.tick().await;
+                for shard in 0..n_shards {
+                    let topic = discovery_topic(&stream, shard);
+                    if let Ok(list) = signaling.read_presence(topic, 32).await {
+                        for p in list {
+                            if p.relay {
+                                signaling.note_enc_key(p.peer_id, p.enc_pub);
+                                book.insert(PresenceRecord::from(&p));
+                            }
+                        }
                     }
                 }
             }
@@ -546,6 +598,8 @@ async fn relay_inbound(
     me: PeerId,
     transport: LibDcTransport,
     bans: BanList,
+    book: PresenceBook,
+    shield: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     // Push-based signaling: an SDP/ICE statement addressed to us wakes the read
@@ -578,7 +632,20 @@ async fn relay_inbound(
                 continue;
             }
             match msg {
-                SignalMsg::Offer { sdp } => { log::info!("[session] ← Offer from {from:?}"); transport.accept(from, sdp); }
+                SignalMsg::Offer { sdp } => {
+                    // Origin-shield: a shielded publisher answers only relay-advertising
+                    // peers (its seed tier), so its IP never reaches an ordinary viewer.
+                    // A refused viewer's dial simply times out and it connects to a seed
+                    // instead (the maintainer already prefers relay peers). Relay status
+                    // is read from presence — a hint, so this is a privacy control, not a
+                    // trust boundary (the seed still hash-verifies everything it serves).
+                    if shield.load(std::sync::atomic::Ordering::Relaxed) && !book.is_relay(&from) {
+                        log::info!("[session] ⊘ Offer from {from:?} refused (origin-shield: not a relay)");
+                        continue;
+                    }
+                    log::info!("[session] ← Offer from {from:?}");
+                    transport.accept(from, sdp);
+                }
                 SignalMsg::Answer { sdp, .. } => { log::info!("[session] ← Answer from {from:?}"); transport.remote_description(from, sdp); }
                 SignalMsg::IceCandidate { sdp, .. } => { log::debug!("[session] ← IceCandidate from {from:?}"); transport.remote_candidate(from, sdp); }
                 SignalMsg::Closed { .. } => { log::info!("[session] ← Closed from {from:?}"); transport.close(from); }

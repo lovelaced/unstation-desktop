@@ -167,6 +167,13 @@ impl PresenceBook {
         self.guard().values().filter(|e| is_live(e)).map(|(r, _)| r.clone()).collect()
     }
 
+    /// Whether `peer` currently advertises relay capability (a live record with
+    /// `relay = true`). Used by origin-shield to admit only volunteer seeds. An unknown
+    /// or expired peer is not a relay.
+    pub fn is_relay(&self, peer: &PeerId) -> bool {
+        self.guard().get(peer).is_some_and(|e| is_live(e) && e.0.relay)
+    }
+
     /// Up to `max` live records to gossip onward, relay-capable peers first so reachable
     /// volunteers propagate fastest (bounds per-message size at scale).
     pub fn sample(&self, max: usize) -> Vec<PresenceRecord> {
@@ -316,6 +323,16 @@ mod tests {
 
     fn rec(id: u8, relay: bool) -> PresenceRecord {
         PresenceRecord { peer_id: [id; 32], publisher: [id; 32], caps_upload_bps: 1, ttl_s: 30, manifest_cid: None, relay, enc_pub: None }
+    }
+
+    #[test]
+    fn is_relay_gates_origin_shield() {
+        let book = PresenceBook::new();
+        book.insert(rec(1, false)); // plain viewer
+        book.insert(rec(2, true)); // relay volunteer
+        assert!(!book.is_relay(&PeerId([1; 32])), "a plain viewer is not a relay");
+        assert!(book.is_relay(&PeerId([2; 32])), "a relay-advertiser is admitted");
+        assert!(!book.is_relay(&PeerId([9; 32])), "an unknown peer is not a relay");
     }
 
     #[test]

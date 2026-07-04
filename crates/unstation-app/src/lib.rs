@@ -876,6 +876,14 @@ fn seed_by_default() -> bool {
     std::env::var("UNSTATION_SEED").map(|v| v != "0").unwrap_or(true)
 }
 
+/// Origin-shield publishing (privacy): only serve relay volunteers, never the audience,
+/// so the publisher's IP stays off ordinary viewers' peer lists. Off by default (it needs
+/// a seed tier to relay the stream); `UNSTATION_SHIELD=1` opts in.
+#[cfg(feature = "publish")]
+fn shield_publish() -> bool {
+    std::env::var("UNSTATION_SHIELD").map(|v| v == "1" || v == "true").unwrap_or(false)
+}
+
 /// Background-seed contribution ceiling (bits/sec) once the player is gone.
 const SEED_BUDGET_BPS: u64 = 10_000_000;
 
@@ -1412,6 +1420,13 @@ async fn start_publish(
     // inbound viewers than a plain viewer's default admission cap allows.
     let session = Session::start(stream, 1, stun(), pub_tx.clone())?;
     session.set_max_inbound(128);
+    // Origin-shield (privacy, opt-in): answer only relay volunteers so the publisher's
+    // IP never reaches the audience. Env for now (a Settings toggle can push it via a
+    // command later); requires seeds to exist to carry the stream — an honest trade.
+    if shield_publish() {
+        session.set_shield(true);
+        log::info!("[publish] origin-shield ON — serving only relay volunteers");
+    }
     // Preflight (spec §10.4): identity is already proven (chain_ready gated above).
     let _ = app.emit(
         "publish-progress",
@@ -1452,6 +1467,10 @@ async fn start_publish(
     // into `tasks` so teardown really ends the stream (a surviving presence loop would
     // keep announcing it to the chain forever).
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+    // Origin-shield: learn the relay seeds we're allowed to answer (see set_shield).
+    if shield_publish() {
+        tasks.push(session.spawn_relay_discovery());
+    }
     tasks.push(session.spawn_presence(80_000_000, true, Arc::new(AtomicBool::new(true))));
 
     // M2 — publish the signed manifest to Bulletin + announce its CID in presence (the durable
@@ -1808,6 +1827,12 @@ async fn start_publish(
     // Phone uplinks fan out to fewer directly-served viewers than desktop, but the
     // origin still shouldn't sit at the viewer default.
     session.set_max_inbound(64);
+    // Origin-shield (privacy): a phone publisher is exactly who most wants its IP off
+    // the audience's peer list — serve only relay volunteers when opted in.
+    if shield_publish() {
+        session.set_shield(true);
+        log::info!("[publish] origin-shield ON — serving only relay volunteers");
+    }
     let _ = app.emit(
         "publish-progress",
         PublishProgressMsg { step: "identity".into(), ok: true, detail: String::new() },
@@ -1834,6 +1859,10 @@ async fn start_publish(
     });
     // Track every spawned task so teardown really ends the stream (see the desktop path).
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+    // Origin-shield: learn the relay seeds we're allowed to answer (see set_shield).
+    if shield_publish() {
+        tasks.push(session.spawn_relay_discovery());
+    }
     tasks.push(session.spawn_presence(80_000_000, true, Arc::new(AtomicBool::new(true))));
 
     let init_slot: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
