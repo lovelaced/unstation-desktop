@@ -59,15 +59,12 @@ struct PocMapper {
     /// the GCD of the GOP's POC values. Converges within the first GOP; offsets are computed
     /// at emit so no fragment is built before it's known. 0 until the first non-zero POC.
     poc_step: i64,
+    /// The stream's actual reorder depth (max `decode_index − presentation_index`), locked
+    /// from the first emitted fragment. Used as the composition-offset baseline so the
+    /// smallest `ctts` is ~0 — a spec-normal B-frame timeline, not a large uniform shift.
+    /// `-1` until locked.
+    reorder_delay: i64,
 }
-
-/// Fixed presentation delay (in frames) baked into every composition offset so a B-frame,
-/// which is decoded after — but presented before — its reference, still has a NON-negative
-/// offset. A uniform constant keeps offsets consistent across fragments (a per-fragment
-/// delay drifts and breaks low-latency parts); it just shifts the whole presentation
-/// timeline by a fixed amount, which is invisible for a continuous live stream. 8 frames
-/// covers any realistic B-frame / b-pyramid reorder depth.
-const POC_REORDER_DELAY_FRAMES: i64 = 8;
 
 /// Frames to accumulate before the FIRST low-latency part may close, so the encoder's POC
 /// step (§`PocMapper::poc_step`) has converged — a step-1 stream doesn't reveal an odd POC
@@ -325,6 +322,7 @@ impl FragmentBuilder {
                     frame_dur_ticks: 0,
                     last_rtp_us: None,
                     poc_step: 0,
+                    reorder_delay: -1,
                 });
             }
         }
@@ -401,12 +399,34 @@ impl FragmentBuilder {
         // at push) so every fragment uses the same, by-now-converged POC step — consistent
         // across low-latency parts. No-POC PTS path: per-fragment `compute_timing`.
         if self.poc_active {
-            let m = self.poc.as_ref();
-            let fd = m.map(|m| m.frame_dur_ticks).filter(|d| *d > 0).unwrap_or(3000);
-            let step = m.map(|m| m.poc_step).filter(|s| *s > 0).unwrap_or(2);
+            let (fd, step) = {
+                let m = self.poc.as_ref();
+                (
+                    m.map(|m| m.frame_dur_ticks).filter(|d| *d > 0).unwrap_or(3000),
+                    m.map(|m| m.poc_step).filter(|s| *s > 0).unwrap_or(2),
+                )
+            };
+            // Reorder delay = the stream's actual max reorder depth, locked from the first
+            // fragment (warm-up guarantees the deepest B-frame is present). Baseline so the
+            // minimum ctts is ~0 — a normal B-frame timeline, not a big uniform offset.
+            let delay = match self.poc.as_ref().map(|m| m.reorder_delay) {
+                Some(d) if d >= 0 => d,
+                _ => {
+                    let d = aus
+                        .iter()
+                        .map(|au| au.poc_dec - (au.poc_gop + au.poc_val / step))
+                        .max()
+                        .unwrap_or(0)
+                        .max(0);
+                    if let Some(m) = self.poc.as_mut() {
+                        m.reorder_delay = d;
+                    }
+                    d
+                }
+            };
             for au in aus.iter_mut() {
                 let presentation_index = au.poc_gop + au.poc_val / step;
-                let comp = (presentation_index - au.poc_dec + POC_REORDER_DELAY_FRAMES) * fd;
+                let comp = (presentation_index - au.poc_dec + delay) * fd;
                 au.duration = fd as u32;
                 au.comp_offset = comp.max(0) as u32;
             }
