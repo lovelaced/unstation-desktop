@@ -817,7 +817,19 @@ impl MeshNode {
         // cache is bounded by the store's own capacity instead.
         if matches!(self.eng.cfg.mode, Mode::Live) && !matches!(self.eng.cfg.role, Role::Publisher)
         {
-            let floor = self.eng.play_seq.saturating_sub(self.eng.cfg.window as Seq);
+            // Cap the floor at what we've actually DELIVERED, not the play cursor: when the
+            // fetch lags a live-edge snap (a peer drops, so `play_seq` races to the chain
+            // edge while delivery stalls behind it), pruning to `play_seq − window` would
+            // wipe the fetched tail and hand the player an EMPTY playlist. Keeping a window
+            // below the delivered head leaves it the most-recent contiguous content to show
+            // while the fetch recovers. When delivery is keeping up (`highest ≥ play_seq`)
+            // this is exactly the old `play_seq − window`.
+            let anchor = self
+                .eng
+                .local
+                .highest()
+                .map_or(self.eng.play_seq, |h| self.eng.play_seq.min(h));
+            let floor = anchor.saturating_sub(self.eng.cfg.window as Seq);
             if floor > self.last_prune_floor {
                 self.last_prune_floor = floor;
                 self.eng.store.prune_below(floor);
