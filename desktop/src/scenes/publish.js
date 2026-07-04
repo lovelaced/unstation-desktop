@@ -384,7 +384,14 @@ export function applyPublishState(live){
       // (the same seam the watch path uses). Desktop (WKWebView) plays natively — via the
       // parts-free /std.m3u8 view (AVPlayer rejects the LL playlist; see player.js nativeUrl).
       if(window.__hlsPlay){ window.__hlsPlay(v, S.pubHlsUrl, null); }
-      else { try{ if(v.canPlayType('application/vnd.apple.mpegurl')){ const u=nativeUrl(S.pubHlsUrl); v.src=u + (u.includes('?')?'&':'?') + 't=' + Date.now(); v.style.display='block'; v.load(); v.play().catch(()=>{}); } }catch(e){} }
+      // Desktop native HLS. updatePubHealth() ticks ~1×/s, so guard like the watch path
+      // (setVideo): only (re)load when we're NOT already playing cleanly. Without this the
+      // preview reloaded every tick — and the FIRST segments aren't decodable the instant we
+      // go live (encoder warm-up / B-frame reorder priming), so an early error would just
+      // re-fire forever. Re-arming until it plays (then leaving it) is what makes it stick.
+      else if(!(v.readyState >= 3 && !v.paused && !v.error)){
+        try{ if(v.canPlayType('application/vnd.apple.mpegurl')){ const u=nativeUrl(S.pubHlsUrl); v.src=u + (u.includes('?')?'&':'?') + 't=' + Date.now(); v.style.display='block'; v.load(); v.play().catch(()=>{}); } }catch(e){}
+      }
     }
   } else {
     try{ v.pause(); }catch(e){} v.removeAttribute('src'); v.style.display='none';
