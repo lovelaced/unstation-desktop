@@ -81,6 +81,20 @@ const REASM_TTL_MS: u64 = 2 * PENDING_TIMEOUT_MS;
 /// hop or two ahead of the verified edge; anything further out is a spray).
 const PUSH_AHEAD: Seq = 16;
 const MAX_WANT_SEQS: usize = 32;
+/// Paced serving (TECH_SPEC §8.5). A `Want` enqueues onto the peer's `serve_queue`
+/// and each tick drains at most this many bytes to that peer. Serving a whole
+/// catch-up window inline the instant a viewer connects blasts several MB into a
+/// just-connected SCTP association (still in slow-start) — its send buffer overruns
+/// and the association resets (`SCTP disconnected` ~1 s after join on a 6 Mbps
+/// stream; the low-bitrate RTMP path only dodged it because its segments were ~10×
+/// smaller). At the 100 ms production tick this caps a single peer near ~20 Mbps —
+/// far above any stream's bitrate so catch-up and live-follow stay fast — while
+/// keeping the in-flight burst well under the transport's 1 MiB bulk-buffer drop
+/// threshold, so we pace the connection instead of drowning it.
+const SERVE_BYTES_PER_TICK: usize = 256 * 1024;
+/// Cap a peer's pending serve backlog: dedup keeps it near the live window, but bound
+/// it so a peer spamming `Want`s can't grow it without limit.
+const SERVE_QUEUE_MAX: usize = 64;
 const MAX_GOSSIP_PEERS: usize = 256;
 const MAX_GOSSIP_RECORDS: usize = 64;
 /// 8 KiB of bitfield = a 64k-segment window — far beyond any honest live window.
@@ -822,6 +836,77 @@ impl MeshNode {
             self.upload_tokens = (self.upload_tokens + refill).min(burst);
         }
 
+        // Paced serve: drain each peer's `serve_queue` at up to SERVE_BYTES_PER_TICK,
+        // easing segments into the connection over successive ticks instead of blasting
+        // a whole catch-up window into a just-connected association (which overruns its
+        // SCTP send buffer and resets it). The token bucket above still caps aggregate
+        // upload across all peers; this caps the per-peer, per-tick burst.
+        let peer_ids: Vec<PeerId> = self.eng.peers.keys().copied().collect();
+        for pid in peer_ids {
+            // Honor choking here too, not just at enqueue: a peer we started withholding
+            // upload from after it queued must stop being served (its backlog resumes
+            // when we unchoke it). Publishers/seeds never choke, so they always drain.
+            if self.eng.peers.get(&pid).map(|p| p.choked).unwrap_or(true) {
+                continue;
+            }
+            let mut served = 0usize;
+            while served < SERVE_BYTES_PER_TICK {
+                let Some(seq) = self
+                    .eng
+                    .peers
+                    .get(&pid)
+                    .and_then(|p| p.serve_queue.front().copied())
+                else {
+                    break;
+                };
+                match self.eng.store.location(seq) {
+                    SegmentLocation::Memory => {
+                        let Some(b) = self.eng.store.get_mem(seq) else {
+                            // Pruned out from under the queue — drop it, keep draining.
+                            self.pop_serve(pid);
+                            continue;
+                        };
+                        let cost = b.len() as f64;
+                        if self.eng.cfg.upload_budget_bps > 0 {
+                            if self.upload_tokens < cost {
+                                break; // out of budget this tick — leave it queued
+                            }
+                            self.upload_tokens -= cost;
+                        }
+                        self.pop_serve(pid);
+                        served += b.len();
+                        if let Some(link) = self.links.get(&pid).cloned() {
+                            self.send_segment(&link, seq, &b);
+                        }
+                    }
+                    // Spilled to disk: never `fs::read` inline (a cold read stalls the
+                    // whole actor loop). Charge the nominal size, then hash-verify +
+                    // chunk it out off-loop over the thread-safe link.
+                    SegmentLocation::Disk { id, path } => {
+                        let cost = self.eng.seg_bytes as f64;
+                        if self.eng.cfg.upload_budget_bps > 0 {
+                            if self.upload_tokens < cost {
+                                break;
+                            }
+                            self.upload_tokens -= cost;
+                        }
+                        self.pop_serve(pid);
+                        served += self.eng.seg_bytes as usize;
+                        let Some(link) = self.links.get(&pid).cloned() else { continue };
+                        tokio::task::spawn_blocking(move || {
+                            let Ok(data) = std::fs::read(&path) else { return };
+                            if !crypto::verify_segment(&data, &id) {
+                                return;
+                            }
+                            send_segment_on(&link, seq, &data);
+                        });
+                    }
+                    // We don't have it (never did, or it was pruned) — drop from queue.
+                    SegmentLocation::Absent => self.pop_serve(pid),
+                }
+            }
+        }
+
         // Expire stale in-flight requests (a lost chunk on the unreliable bulk channel
         // never completes and never hash-fails) so the picker re-requests them.
         let now = self.now_ms;
@@ -1064,50 +1149,20 @@ impl MeshNode {
                 if self.eng.peers.get(&peer).map(|p| p.choked).unwrap_or(false) {
                     return;
                 }
-                for seq in segment_seqs {
-                    match self.eng.store.location(seq) {
-                        SegmentLocation::Memory => {
-                            let Some(b) = self.eng.store.get_mem(seq) else { continue };
-                            // Stay within the upload budget: skip if we can't afford
-                            // this segment now (the requester re-asks; tokens refill
-                            // each tick).
-                            let cost = b.len() as f64;
-                            if self.eng.cfg.upload_budget_bps > 0 {
-                                if self.upload_tokens < cost {
-                                    continue;
-                                }
-                                self.upload_tokens -= cost;
-                            }
-                            if let Some(link) = self.links.get(&peer).cloned() {
-                                self.send_segment(&link, seq, &b);
-                            }
+                // Enqueue rather than serve inline: the tick drains `serve_queue` at a
+                // paced rate (SERVE_BYTES_PER_TICK) so a fresh connection isn't blasted
+                // with a whole catch-up window at once (see the constant's rationale).
+                // Dedup so a re-`Want` (its pending timed out) doesn't double-queue, and
+                // bound the backlog. Absent seqs are dropped by the drain, not here — a
+                // viewer only asks for what our buffer-map advertises anyway.
+                if let Some(p) = self.eng.peers.get_mut(&peer) {
+                    for seq in segment_seqs {
+                        if p.serve_queue.len() >= SERVE_QUEUE_MAX {
+                            break;
                         }
-                        // A spilled segment: the read must NOT run inline — a cold
-                        // `fs::read` on the actor loop stalls every peer and the
-                        // picker for the duration. Deduct the budget by the nominal
-                        // size now, hash-verify the file off-loop, then chunk it out
-                        // over the (thread-safe, channel-backed) link.
-                        SegmentLocation::Disk { id, path } => {
-                            if self.eng.cfg.upload_budget_bps > 0 {
-                                let cost = self.eng.seg_bytes as f64;
-                                if self.upload_tokens < cost {
-                                    continue;
-                                }
-                                self.upload_tokens -= cost;
-                            }
-                            let Some(link) = self.links.get(&peer).cloned() else { continue };
-                            tokio::task::spawn_blocking(move || {
-                                let Ok(data) = std::fs::read(&path) else { return };
-                                // Disk contents are outside our control (crash-torn
-                                // writes, other processes): never relay bytes that
-                                // no longer match their content address.
-                                if !crypto::verify_segment(&data, &id) {
-                                    return;
-                                }
-                                send_segment_on(&link, seq, &data);
-                            });
+                        if !p.serve_queue.contains(&seq) {
+                            p.serve_queue.push_back(seq);
                         }
-                        SegmentLocation::Absent => {}
                     }
                 }
             }
@@ -1240,6 +1295,13 @@ impl MeshNode {
     fn send_segment(&mut self, link: &Arc<dyn Link>, seq: Seq, bytes: &[u8]) {
         self.stats.sent_bytes += bytes.len() as u64;
         send_segment_on(link, seq, bytes);
+    }
+
+    /// Drop the head of a peer's paced serve queue (no-op if peer/queue is gone).
+    fn pop_serve(&mut self, pid: PeerId) {
+        if let Some(p) = self.eng.peers.get_mut(&pid) {
+            p.serve_queue.pop_front();
+        }
     }
 
     fn on_segment_data(&mut self, peer: PeerId, seq: Seq, total_len: u32, offset: u32, bytes: &[u8]) {

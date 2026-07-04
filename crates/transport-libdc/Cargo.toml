@@ -23,3 +23,4 @@ log = "0.4"
 [dev-dependencies]
 parity-scale-codec.workspace = true
 bytes.workspace = true
+env_logger = "0.11"

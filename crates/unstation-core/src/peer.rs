@@ -1,7 +1,8 @@
 //! Per-peer state and EWMA throughput/RTT estimators (TECH_SPEC §8.4).
 
 use crate::buffermap::BufferMap;
-use crate::types::PeerId;
+use crate::types::{PeerId, Seq};
+use std::collections::VecDeque;
 
 /// Exponentially-weighted moving average, seeded on first sample.
 #[derive(Clone, Copy, Debug)]
@@ -54,6 +55,13 @@ pub struct PeerState {
     /// us (so the picker shouldn't waste `Want`s on them). Both default to "open".
     pub choked: bool,
     pub choked_by: bool,
+    /// Segments this peer has asked for but we haven't served yet. A `Want` enqueues
+    /// here rather than serving inline, and the tick drains it at a paced rate
+    /// (TECH_SPEC §8.5): blasting a whole catch-up window into a just-connected SCTP
+    /// association at once overruns its send buffer / cold-start window and the
+    /// association resets (observed as `SCTP disconnected` ~1 s after a viewer joins a
+    /// high-bitrate stream). Paced serving eases into the connection instead.
+    pub serve_queue: VecDeque<Seq>,
 }
 
 impl PeerState {
@@ -69,6 +77,7 @@ impl PeerState {
             banned: false,
             choked: false,
             choked_by: false,
+            serve_queue: VecDeque::new(),
         }
     }
 }
