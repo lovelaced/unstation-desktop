@@ -26,18 +26,28 @@ use datachannel::{
     PeerConnectionHandler, Reliability, RtcConfig, RtcDataChannel, RtcPeerConnection,
     SessionDescription,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use unstation_core::transport::EngineEvent;
 use unstation_core::types::PeerId;
 
-/// Drop bulk (video) sends when the channel's send buffer exceeds this. For a live
-/// stream skipping stale frames is correct — buffering them just grows latency and
-/// memory, and the bulk channel is lossy anyway (the receiver re-requests on
-/// timeout). The reliable `ctrl` channel is never dropped.
-const BULK_BUFFER_MAX: usize = 1024 * 1024; // 1 MiB
+/// Chunk pacing (the fix for join-time connection drops): keep the bulk channel's
+/// in-flight send buffer at/below this by holding excess chunks in `bulk_pending` and
+/// releasing them from the `buffered_amount_low` callback (which fires as the network
+/// drains). A whole 200 KiB segment fired as 13 back-to-back chunks otherwise floods
+/// the path, and the queued ICE keepalive/consent packets miss their deadline — the
+/// association resets ~1-2 s after a viewer joins a 6 Mbps stream (reproduced under a
+/// delay+bandwidth-shaped loopback; small-segment fan-out over the same link is fine).
+/// Kept below a typical hop's queue so control packets are never starved, yet a full
+/// bandwidth-delay product so throughput stays well ahead of any stream's bitrate.
+const BULK_PACE_TARGET: usize = 64 * 1024;
+/// Bound the paced-send backlog: if the node serves faster than the link drains for
+/// long enough to pile up this many bytes, drop the OLDEST queued chunks (stalest, and
+/// on the lossy bulk channel the receiver re-requests) rather than grow latency/memory
+/// without limit. A generous few segments — normal pacing stays far below it.
+const BULK_PENDING_MAX: usize = 3 * 1024 * 1024;
 
 /// Locally-generated signaling the orchestrator must relay to the peer over the
 /// statement store (as `SignalMsg::Offer/Answer/IceCandidate`). The `sdp`/`cand`
@@ -73,6 +83,9 @@ enum Cmd {
     DcArrived(PeerId, String, Box<RtcDataChannel<DcSink>>),
     DcOpen(PeerId, Channel),
     StateChange(PeerId, ConnectionState),
+    /// The bulk channel's send buffer drained below `BULK_PACE_TARGET` (fired by
+    /// libdatachannel's `buffered_amount_low` callback) — release more paced chunks.
+    BulkDrain(PeerId),
     Close(PeerId),
     /// Close every peer connection and stop the reactor. Sent when a `Session` is torn
     /// down (stop/re-watch): the reactor is otherwise kept alive forever by detached
@@ -100,6 +113,12 @@ impl DataChannelHandler for DcSink {
             channel: self.channel,
             bytes: msg.to_vec(),
         });
+    }
+    fn on_buffered_amount_low(&mut self) {
+        // Only the bulk channel is paced; ctrl sends go straight through.
+        if matches!(self.channel, Channel::Bulk) {
+            let _ = self.cmd.send(Cmd::BulkDrain(self.peer));
+        }
     }
 }
 
@@ -180,6 +199,12 @@ struct Peer {
     ctrl_open: bool,
     bulk_open: bool,
     announced: bool,
+    /// Paced bulk chunks awaiting send: filled when the bulk buffer is at/above
+    /// `BULK_PACE_TARGET`, drained from the `buffered_amount_low` callback as the
+    /// network makes room, so a segment's chunks trickle out at the link's rate
+    /// instead of flooding it. `bulk_pending_bytes` tracks its size for bounding.
+    bulk_pending: VecDeque<Vec<u8>>,
+    bulk_pending_bytes: usize,
     /// libdatachannel rejects remote candidates added before the remote
     /// description is set, and (with trickle ICE) candidates can arrive in any
     /// order. Buffer them until `remote_set`, then flush.
@@ -483,6 +508,8 @@ fn handle_cmd(
                     ctrl_open: false,
                     bulk_open: false,
                     announced: false,
+                    bulk_pending: VecDeque::new(),
+                    bulk_pending_bytes: 0,
                     // Remote answer not applied yet; candidates wait for it.
                     remote_set: false,
                     pending_cands: orphan_cands.remove(&peer).unwrap_or_default(),
@@ -529,6 +556,8 @@ fn handle_cmd(
                 ctrl_open: false,
                 bulk_open: false,
                 announced: false,
+                bulk_pending: VecDeque::new(),
+                bulk_pending_bytes: 0,
                 remote_set,
                 pending_cands: orphan_cands.remove(&peer).unwrap_or_default(),
                 inbound: true, // a peer reached IN to us (Accept) — proves reachability.
@@ -563,24 +592,62 @@ fn handle_cmd(
             }
         }
         Cmd::Send(peer, channel, bytes) => {
-            if let Some(p) = peers.get_mut(&peer) {
-                let dc = match channel {
-                    Channel::Ctrl => p.ctrl.as_mut(),
-                    Channel::Bulk => p.bulk.as_mut(),
-                };
-                if let Some(dc) = dc {
-                    // Backpressure: never let the bulk send buffer grow without bound.
-                    // For live video, drop the chunk (receiver re-requests on timeout)
-                    // rather than buffer stale frames and balloon latency/memory.
-                    if matches!(channel, Channel::Bulk) && dc.buffered_amount() > BULK_BUFFER_MAX {
-                        log::debug!(
-                            "[libdc] {peer:?}: bulk buffer {}B over limit — dropping chunk",
-                            dc.buffered_amount()
-                        );
-                        return;
+            let Some(p) = peers.get_mut(&peer) else { return };
+            match channel {
+                // Ctrl is low-volume and must be timely (buffer-maps, wants, edge) — send
+                // straight through, never paced, so it can't be starved behind bulk video.
+                Channel::Ctrl => {
+                    if let Some(dc) = p.ctrl.as_mut() {
+                        if let Err(e) = dc.send(&bytes) {
+                            log::debug!("[libdc] {peer:?}: send on Ctrl failed: {e}");
+                        }
                     }
-                    if let Err(e) = dc.send(&bytes) {
-                        log::debug!("[libdc] {peer:?}: send on {channel:?} failed: {e}");
+                }
+                Channel::Bulk => {
+                    let Some(buffered) = p.bulk.as_ref().map(|d| d.buffered_amount()) else {
+                        return;
+                    };
+                    // Send only while the buffer is below the pace target AND nothing is
+                    // already queued ahead (preserve order). Otherwise hold the chunk in
+                    // bulk_pending; the buffered_amount_low callback (BulkDrain) releases
+                    // it as the network drains — so a segment's chunks trickle out at the
+                    // link's rate instead of flooding it and starving ICE control.
+                    if p.bulk_pending.is_empty() && buffered < BULK_PACE_TARGET {
+                        if let Some(dc) = p.bulk.as_mut() {
+                            if let Err(e) = dc.send(&bytes) {
+                                log::debug!("[libdc] {peer:?}: send on Bulk failed: {e}");
+                            }
+                        }
+                    } else {
+                        // Bound the backlog: drop the OLDEST (stalest) chunks to make room
+                        // — on the lossy bulk channel the receiver re-requests them.
+                        while p.bulk_pending_bytes + bytes.len() > BULK_PENDING_MAX {
+                            match p.bulk_pending.pop_front() {
+                                Some(old) => p.bulk_pending_bytes -= old.len(),
+                                None => break,
+                            }
+                        }
+                        p.bulk_pending_bytes += bytes.len();
+                        p.bulk_pending.push_back(bytes);
+                    }
+                }
+            }
+        }
+        Cmd::BulkDrain(peer) => {
+            if let Some(p) = peers.get_mut(&peer) {
+                // Release queued chunks up to the pace target, then wait for the next
+                // low-water callback. Re-checking buffered each chunk keeps us honest.
+                while !p.bulk_pending.is_empty() {
+                    let buffered = p.bulk.as_ref().map_or(usize::MAX, |d| d.buffered_amount());
+                    if buffered >= BULK_PACE_TARGET {
+                        break;
+                    }
+                    let Some(chunk) = p.bulk_pending.pop_front() else { break };
+                    p.bulk_pending_bytes -= chunk.len();
+                    if let Some(dc) = p.bulk.as_mut() {
+                        if let Err(e) = dc.send(&chunk) {
+                            log::debug!("[libdc] {peer:?}: paced bulk send failed: {e}");
+                        }
                     }
                 }
             }
@@ -595,6 +662,15 @@ fn handle_cmd(
         }
         Cmd::DcOpen(peer, channel) => {
             if let Some(p) = peers.get_mut(&peer) {
+                // Arm the pacing callback: fire BulkDrain when the bulk buffer falls to
+                // the pace target, so queued chunks release at the network's drain rate.
+                if matches!(channel, Channel::Bulk) {
+                    if let Some(dc) = p.bulk.as_mut() {
+                        if let Err(e) = dc.set_buffered_amount_low_threshold(BULK_PACE_TARGET) {
+                            log::warn!("[libdc] {peer:?}: set bulk low-water threshold failed: {e}");
+                        }
+                    }
+                }
                 match channel {
                     Channel::Ctrl => p.ctrl_open = true,
                     Channel::Bulk => p.bulk_open = true,
