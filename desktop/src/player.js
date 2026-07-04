@@ -98,13 +98,21 @@ export function stopNativeHls(v){ if(!v) return; clearInterval(v._retry); v._ret
 // `onScreen=false` (the viewer) logs to console only — a transient "error 4" is
 // EXPECTED while the mesh spins up (handled by setVideo's retry + the catchup
 // overlay), so flashing it on screen would just be alarming. The publisher's local
-// ingest, by contrast, has no retry, so its errors are shown.
+// ingest, by contrast, retries (playNativeHlsWithRetry), so a STARTUP decode error is
+// transient — the first join fires before the live window is wide enough and self-clears in
+// a second or two. So on-screen errors are shown only if they PERSIST (~4s without a
+// `playing`/`timeupdate`), never the flash-and-clear ones that would just confuse people.
 export function wireVideoDiag(vidId, diagId, onScreen){
   const el=document.getElementById(vidId), diag=document.getElementById(diagId);
   if(!el) return;
   const CODES={1:'aborted',2:'network/blocked',3:'decode',4:'src unsupported'};
-  const hide=()=>{ if(diag) diag.hidden=true; };
-  el.addEventListener('error', ()=>{ const e=el.error; const m='video error '+((e&&e.code)||'?')+' ('+((e&&CODES[e.code])||'?')+')'+(e&&e.message?': '+e.message:'')+' — '+(el.currentSrc||'no src'); console.error('[video]',vidId,m); if(onScreen && diag){ diag.textContent=m; diag.hidden=false; } });
+  let showTimer=null;
+  const hide=()=>{ if(showTimer){ clearTimeout(showTimer); showTimer=null; } if(diag) diag.hidden=true; };
+  el.addEventListener('error', ()=>{ const e=el.error; const m='video error '+((e&&e.code)||'?')+' ('+((e&&CODES[e.code])||'?')+')'+(e&&e.message?': '+e.message:'')+' — '+(el.currentSrc||'no src'); console.error('[video]',vidId,m);
+    // Arm once (retry re-fires `error` every ~1.5s — don't keep resetting the timer, or a
+    // genuine persistent failure would never surface); `playing`/`timeupdate` cancels it.
+    if(onScreen && diag && !showTimer && diag.hidden){ showTimer=setTimeout(()=>{ diag.textContent=m; diag.hidden=false; showTimer=null; }, 4000); }
+  });
   el.addEventListener('playing', hide);
   el.addEventListener('loadeddata', hide);
   el.addEventListener('timeupdate', hide);
