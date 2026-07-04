@@ -124,6 +124,7 @@ mod tests {
                 ttl_s: 30,
                 manifest_cid: Some("bafy-cid".into()),
                 relay: true,
+                enc_pub: None,
             }],
         };
         let bytes = msg.encode();
@@ -143,6 +144,7 @@ mod tests {
             ttl_s: 30,
             manifest_cid: Some("cid".into()),
             relay: false,
+            enc_pub: None,
         };
         let variants: Vec<(u8, MeshMsg)> = vec![
             (0, MeshMsg::Hello { peer_id: [1; 32], stream_id: [2; 32], version: 3, caps: Caps { upload_bps: 4, relay: true }, base_seq: 5, bitfield: vec![0xAB] }),

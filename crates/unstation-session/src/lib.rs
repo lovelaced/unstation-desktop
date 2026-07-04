@@ -200,7 +200,11 @@ impl Session {
                 // against. Splitting them lets two devices of the same person coexist in
                 // the mesh (they share `publisher` but differ in `peer_id`).
                 let publisher = unstation_chain::identity_public().unwrap_or(me.0);
-                let p = Presence { peer_id: me, publisher, caps_upload_bps, ttl_s: PRESENCE_TTL_S, manifest_cid: mc, relay };
+                // Advertise our X25519 signaling key so peers seal SDP/ICE to us (Tier 0
+                // privacy). Zero if no identity yet — a dialer then can't seal to us and
+                // won't leak; but presence is only written once signed in, so this is set.
+                let enc_pub = unstation_chain::identity_enc_public().unwrap_or([0u8; 32]);
+                let p = Presence { peer_id: me, publisher, caps_upload_bps, ttl_s: PRESENCE_TTL_S, manifest_cid: mc, relay, enc_pub };
                 // Off-chain presence (TECH_SPEC §7.3): always refresh our own entry in the
                 // in-mesh book so neighbors gossip us onward. Only ANCHORS (publishers +
                 // reachable relay volunteers) ALSO write to the chain — the bootstrap set a
@@ -349,6 +353,12 @@ impl Session {
         // Never hand back a peer the node has convicted — a banned peer that keeps
         // announcing presence would otherwise be redialed forever.
         out.retain(|p| !self.bans.contains(&p.peer_id));
+        // Cache each candidate's signaling key BEFORE we dial it: the offer we send is
+        // sealed to this key (Tier 0). Learned here (from presence) for the outbound
+        // direction; the answerer learns ours from the offer envelope it opens.
+        for p in &out {
+            self.signaling.note_enc_key(p.peer_id, p.enc_pub);
+        }
         // Relay-capable volunteers first: a NAT-restricted node should try the reliable
         // bridges before random peers (the decentralized stand-in for a TURN server).
         out.sort_by_key(|p| !p.relay);

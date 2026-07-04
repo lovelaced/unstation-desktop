@@ -145,6 +145,7 @@ proptest! {
                         ttl_s: ttl,
                         manifest_cid: if cid_len == 0 { None } else { Some("x".repeat(cid_len)) },
                         relay: b0 % 2 == 0,
+                        enc_pub: None,
                     }
                 })
                 .collect();

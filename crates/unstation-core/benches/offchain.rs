@@ -17,6 +17,7 @@ fn rec(i: u64) -> PresenceRecord {
         ttl_s: 30,
         manifest_cid: if i % 5 == 0 { Some("bafy-some-manifest-cid-placeholder".into()) } else { None },
         relay: i % 4 == 0,
+        enc_pub: None,
     }
 }
 

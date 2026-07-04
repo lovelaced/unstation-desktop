@@ -543,6 +543,7 @@ async fn presence_gossip_populates_the_book_and_is_rebroadcast() {
         ttl_s: 30,
         manifest_cid: None,
         relay: true,
+        enc_pub: None,
     };
     let gossip = MeshMsg::PresenceGossip { records: vec![rec] }.encode();
     tx.send(EngineEvent::Inbound { peer: peerx, channel: Channel::Ctrl, bytes: gossip }).unwrap();

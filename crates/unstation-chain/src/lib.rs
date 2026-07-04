@@ -59,13 +59,25 @@ fn keypair_from_secret(secret: &[u8]) -> Result<schnorrkel::Keypair, String> {
     }
 }
 
+/// The host identity secret, from whichever init path was used: the explicit-secret
+/// paths retain it in `IDENTITY_SECRET`; the persisted/generated path keeps it inside
+/// the SDK, so fall back to `ss::secret_key_bytes()`. Centralizing this is what lets the
+/// persisted path (the volunteer seed node) both sign manifests AND derive its X25519
+/// signaling key — previously it could do neither.
+fn identity_secret_bytes() -> Option<Vec<u8>> {
+    if let Some(s) = IDENTITY_SECRET.get() {
+        return Some(s.clone());
+    }
+    ss::secret_key_bytes().map(|b| b.to_vec())
+}
+
 /// Sign `payload` with the host identity (the same key as presence/statements) — for
 /// the stream manifest. Uses the manifest signing context, so
 /// [`unstation_core::manifest::SignedManifest::verify`] accepts it. `None` if no
 /// identity has been initialized.
 pub fn sign_with_identity(payload: &[u8]) -> Option<[u8; 64]> {
-    let secret = IDENTITY_SECRET.get()?;
-    let kp = keypair_from_secret(secret).ok()?;
+    let secret = identity_secret_bytes()?;
+    let kp = keypair_from_secret(&secret).ok()?;
     Some(unstation_core::crypto::sign_sr25519(&kp, payload))
 }
 
@@ -210,6 +222,13 @@ pub struct ChainSignaling {
     outbox: Arc<Mutex<HashMap<[u8; 32], Vec<Vec<u8>>>>>,
     /// Monotonic statement priority so each rewritten bundle supersedes the previous.
     prio: Arc<AtomicU32>,
+    /// `peer_id → X25519 signaling key`, so an outbound envelope can be SEALED to its
+    /// recipient (Tier 0 privacy). Populated from two sources: discovery presence
+    /// records (a dialer learns the publisher/relay key before it offers) and the
+    /// sender key carried in every opened envelope (an answerer learns the viewer key
+    /// — viewers never publish presence). Without a recipient key we cannot seal, and
+    /// signaling is dropped rather than sent in the clear.
+    enc_keys: Arc<Mutex<HashMap<[u8; 32], [u8; 32]>>>,
 }
 
 impl ChainSignaling {
@@ -219,7 +238,21 @@ impl ChainSignaling {
             n_shards: n_shards.max(1),
             outbox: Arc::new(Mutex::new(HashMap::new())),
             prio: Arc::new(AtomicU32::new(1)),
+            enc_keys: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Cache a peer's X25519 signaling key (from a discovery presence record), so a
+    /// dialer can seal its offer to the publisher/relay it is about to dial. A zero key
+    /// ("not advertised") is ignored.
+    pub fn note_enc_key(&self, peer_id: PeerId, enc_pub: [u8; 32]) {
+        if enc_pub != [0u8; 32] {
+            self.enc_keys.lock().unwrap_or_else(|e| e.into_inner()).insert(peer_id.0, enc_pub);
+        }
+    }
+
+    fn recipient_enc_key(&self, to: &PeerId) -> Option<[u8; 32]> {
+        self.enc_keys.lock().unwrap_or_else(|e| e.into_inner()).get(&to.0).copied()
     }
 }
 
@@ -348,21 +381,59 @@ impl ChainSignaling {
 /// know *which* peer to route its answer/candidates back to. Rather than mutate
 /// the app-compatible `chat_codec` wire layout, unstation↔unstation signaling
 /// wraps the message in this envelope on its own (`"sig"`) topic.
-fn encode_envelope(from: PeerId, msg: &SignalMsg) -> Vec<u8> {
-    let mut out = Vec::with_capacity(32 + 96);
-    out.extend_from_slice(&from.0);
-    out.extend_from_slice(&chat_codec::encode_signal(msg));
-    out
+/// Sealed-envelope tag. The body (`from ‖ chat_codec(msg)` — the same layout the old
+/// plaintext envelope used) is SEALED to the recipient's X25519 key; only the sender's
+/// X25519 public travels in the clear (it's needed to open, and reveals no IP). There is
+/// deliberately NO plaintext fallback: SDP/ICE must never reach the public statement
+/// store unsealed, so an envelope we cannot seal is dropped by the caller instead.
+const ENVELOPE_SEALED: u8 = 0x02;
+
+/// The local X25519 signaling keypair `(secret, public)`, derived deterministically from
+/// the identity secret (domain-separated, so it is unrelated to the signing key). `None`
+/// until an identity is initialized.
+fn identity_enc_keypair() -> Option<([u8; 32], [u8; 32])> {
+    let secret = identity_secret_bytes()?;
+    let seed = unstation_core::crypto::blake2b256(&secret);
+    Some(unstation_core::crypto::enc_keypair_from_seed(&seed))
 }
 
-fn decode_envelope(bytes: &[u8]) -> Option<(PeerId, SignalMsg)> {
-    if bytes.len() < 32 {
+/// The local X25519 signaling public key — advertised in our presence record so peers
+/// can seal their offers to us. `None` until an identity is initialized.
+pub fn identity_enc_public() -> Option<[u8; 32]> {
+    identity_enc_keypair().map(|(_, public)| public)
+}
+
+/// Seal a signaling message to `recipient_enc_pub`. `None` if no identity is initialized
+/// (nothing to seal with) — the caller then declines to publish rather than leak.
+fn encode_envelope(from: PeerId, msg: &SignalMsg, recipient_enc_pub: &[u8; 32]) -> Option<Vec<u8>> {
+    let (secret, public) = identity_enc_keypair()?;
+    let mut body = Vec::with_capacity(32 + 96);
+    body.extend_from_slice(&from.0);
+    body.extend_from_slice(&chat_codec::encode_signal(msg));
+    let sealed = unstation_core::crypto::seal(recipient_enc_pub, &secret, &body);
+    let mut out = Vec::with_capacity(1 + 32 + sealed.len());
+    out.push(ENVELOPE_SEALED);
+    out.extend_from_slice(&public);
+    out.extend_from_slice(&sealed);
+    Some(out)
+}
+
+/// Open a sealed envelope. Returns `(from, msg, sender_enc_pub)` — the sender key so the
+/// reader can cache it and seal replies. `None` on any malformed/undecryptable input.
+fn decode_envelope(bytes: &[u8]) -> Option<(PeerId, SignalMsg, [u8; 32])> {
+    if bytes.first() != Some(&ENVELOPE_SEALED) || bytes.len() < 1 + 32 {
+        return None;
+    }
+    let sender_enc_pub: [u8; 32] = bytes[1..33].try_into().ok()?;
+    let (secret, _) = identity_enc_keypair()?;
+    let body = unstation_core::crypto::open(&sender_enc_pub, &secret, &bytes[33..])?;
+    if body.len() < 32 {
         return None;
     }
     let mut id = [0u8; 32];
-    id.copy_from_slice(&bytes[..32]);
-    let msg = chat_codec::decode_signal(&bytes[32..])?;
-    Some((PeerId(id), msg))
+    id.copy_from_slice(&body[..32]);
+    let msg = chat_codec::decode_signal(&body[32..])?;
+    Some((PeerId(id), msg, sender_enc_pub))
 }
 
 /// Signaling bundle codec. The statement store keeps only the highest-priority statement per
@@ -389,7 +460,12 @@ impl ChainSignaling {
         msg: SignalMsg,
     ) -> unstation_core::Result<()> {
         let topic = signaling_topic(&self.stream, &to);
-        let envelope = encode_envelope(from, &msg);
+        let Some(recipient_key) = self.recipient_enc_key(&to) else {
+            return Err(err("no signaling key for recipient — refusing to send SDP/ICE in the clear"));
+        };
+        let Some(envelope) = encode_envelope(from, &msg, &recipient_key) else {
+            return Err(err("no local identity — cannot seal signaling"));
+        };
         // The statement store keeps only ONE statement per (account, channel=topic) —
         // last-write-wins — so an offer/answer and its trickled ICE candidates would evict
         // one another (only the newest survives). Instead ACCUMULATE every signal we've sent
@@ -423,8 +499,11 @@ impl ChainSignaling {
         for st in statements {
             // Each statement is a bundle of envelopes (see `publish_signal`).
             for env in decode_bundle(&st.data) {
-                if let Some(pair) = decode_envelope(&env) {
-                    out.push(pair);
+                if let Some((from, msg, sender_key)) = decode_envelope(&env) {
+                    // Cache the sender's signaling key so we can seal our reply — the
+                    // only way we learn a plain viewer's key (they publish no presence).
+                    self.note_enc_key(from, sender_key);
+                    out.push((from, msg));
                 }
             }
         }
@@ -452,7 +531,13 @@ impl ChainSignaling {
         msg: SignalMsg,
     ) -> unstation_core::Result<()> {
         let topic = fast_signaling_topic(&self.stream, &to);
-        let data = encode_bundle(&[encode_envelope(from, &msg)]);
+        let Some(recipient_key) = self.recipient_enc_key(&to) else {
+            return Err(err("no signaling key for recipient — refusing to send fast-tier SDP/ICE in the clear"));
+        };
+        let Some(envelope) = encode_envelope(from, &msg, &recipient_key) else {
+            return Err(err("no local identity — cannot seal fast-tier signaling"));
+        };
+        let data = encode_bundle(&[envelope]);
         let prio = self.prio.fetch_add(1, Ordering::SeqCst);
         tokio::task::spawn_blocking(move || ss::submit_fixed_topic(topic, &[topic], &data, prio))
             .await
@@ -474,8 +559,9 @@ impl ChainSignaling {
         let mut out = Vec::new();
         for st in statements {
             for env in decode_bundle(&st.data) {
-                if let Some(pair) = decode_envelope(&env) {
-                    out.push(pair);
+                if let Some((from, msg, sender_key)) = decode_envelope(&env) {
+                    self.note_enc_key(from, sender_key);
+                    out.push((from, msg));
                 }
             }
         }
@@ -563,18 +649,38 @@ mod envelope_tests {
     use super::*;
 
     #[test]
-    fn envelope_round_trips_sender_and_message() {
+    fn sealed_envelope_round_trips_and_hides_the_sdp() {
+        // A local identity gives us the X25519 keypair encode/decode derive from.
+        // (IDENTITY_SECRET is this crate's private OnceLock — set it directly, no network.)
+        let _ = IDENTITY_SECRET.set(vec![0x11u8; 64]);
+        let our_pub = identity_enc_public().expect("enc key");
+
         let from = PeerId::from_u64(99);
-        let msg = SignalMsg::Answer { offer_id: "abc".into(), sdp: vec![1, 2, 3, 4] };
-        let bytes = encode_envelope(from, &msg);
-        let (got_from, got_msg) = decode_envelope(&bytes).expect("decodes");
+        let sdp = b"v=0\r\na=candidate 203.0.113.9 typ host".to_vec();
+        let msg = SignalMsg::Answer { offer_id: "abc".into(), sdp: sdp.clone() };
+
+        // Seal to ourselves (single identity: static-static ECDH is symmetric, so a
+        // self-addressed envelope opens with the same key).
+        let bytes = encode_envelope(from, &msg, &our_pub).expect("seal");
+        let (got_from, got_msg, sender_key) = decode_envelope(&bytes).expect("open");
         assert_eq!(got_from, from);
         assert_eq!(got_msg, msg);
+        assert_eq!(sender_key, our_pub, "opener learns the sender key for replies");
+
+        // The SDP (with its IP) must NOT appear anywhere in the on-wire bytes.
+        assert!(
+            bytes.windows(sdp.len()).all(|w| w != &sdp[..]),
+            "plaintext SDP leaked into the sealed envelope"
+        );
     }
 
     #[test]
-    fn decode_rejects_short_input() {
+    fn decode_rejects_short_and_unsealed_input() {
         assert!(decode_envelope(&[0u8; 10]).is_none());
+        // A v1-style plaintext envelope (no seal tag) is rejected — no downgrade path.
+        let mut plain = vec![0u8; 40];
+        plain[0] = 0x00;
+        assert!(decode_envelope(&plain).is_none());
     }
 }
 
@@ -607,7 +713,7 @@ mod tests {
         let stream = StreamId([7u8; 32]);
         let sig = ChainSignaling::new(stream, 1);
         let me = PeerId::from_u64(42);
-        let pres = Presence { peer_id: me, publisher: me.0, caps_upload_bps: 5_000_000, ttl_s: 30, manifest_cid: None, relay: false };
+        let pres = Presence { peer_id: me, publisher: me.0, caps_upload_bps: 5_000_000, ttl_s: 30, manifest_cid: None, relay: false, enc_pub: identity_enc_public().unwrap_or([0u8;32]) };
 
         // Best-effort: a fresh ephemeral key has no allowance until provisioned,
         // so a `noAllowance` here is an environment skip, not a code failure.

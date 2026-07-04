@@ -26,6 +26,7 @@ fuzz_target!(|batches: Vec<Vec<([u8; 32], u32, u64, u16, bool)>>| {
                     Some("c".repeat((cid_len as usize).min(4096)))
                 },
                 relay,
+                enc_pub: None,
             })
             .collect();
         book.merge(recs, &me);

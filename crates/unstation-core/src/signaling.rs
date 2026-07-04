@@ -53,6 +53,11 @@ pub struct Presence {
     /// NAT-restricted peers preferentially dial it — the decentralized stand-in for
     /// a TURN server (publishers + seed/relay nodes set it; plain viewers don't).
     pub relay: bool,
+    /// X25519 public key this peer's SIGNALING is sealed to (Tier 0 privacy). A dialer
+    /// seals its offer to this; the answerer learns the dialer's key from the offer
+    /// envelope. `[0u8; 32]` means "not advertised" (a pre-privacy peer) — the sender
+    /// then cannot seal and drops the exchange rather than leak IPs in the clear.
+    pub enc_pub: [u8; 32],
 }
 
 /// SCALE wire form of a presence record (the statement `data` payload).
@@ -65,6 +70,9 @@ pub struct PresenceRecord {
     pub ttl_s: u32,
     pub manifest_cid: Option<String>,
     pub relay: bool,
+    /// X25519 signaling key (see [`Presence::enc_pub`]). `Option` for wire
+    /// back-compat: a record from a pre-privacy peer decodes with `None`.
+    pub enc_pub: Option<[u8; 32]>,
 }
 
 impl From<&Presence> for PresenceRecord {
@@ -76,6 +84,7 @@ impl From<&Presence> for PresenceRecord {
             ttl_s: p.ttl_s,
             manifest_cid: p.manifest_cid.clone(),
             relay: p.relay,
+            enc_pub: (p.enc_pub != [0u8; 32]).then_some(p.enc_pub),
         }
     }
 }
@@ -88,6 +97,7 @@ impl From<PresenceRecord> for Presence {
             ttl_s: r.ttl_s,
             manifest_cid: r.manifest_cid,
             relay: r.relay,
+            enc_pub: r.enc_pub.unwrap_or([0u8; 32]),
         }
     }
 }
@@ -278,6 +288,7 @@ mod tests {
             ttl_s: 30,
             manifest_cid: Some("bafy-manifest-cid".into()),
             relay: true,
+            enc_pub: Some([9u8; 32]),
         };
         let bytes = rec.encode();
         assert_eq!(PresenceRecord::decode(&mut &bytes[..]).unwrap(), rec);
@@ -296,6 +307,7 @@ mod tests {
             ttl_s: 30,
             manifest_cid: Some("cid".into()),
             relay: true,
+            enc_pub: [11u8; 32],
         };
         let rec = PresenceRecord::from(&p);
         let back: Presence = rec.into();
@@ -303,7 +315,7 @@ mod tests {
     }
 
     fn rec(id: u8, relay: bool) -> PresenceRecord {
-        PresenceRecord { peer_id: [id; 32], publisher: [id; 32], caps_upload_bps: 1, ttl_s: 30, manifest_cid: None, relay }
+        PresenceRecord { peer_id: [id; 32], publisher: [id; 32], caps_upload_bps: 1, ttl_s: 30, manifest_cid: None, relay, enc_pub: None }
     }
 
     #[test]
@@ -358,6 +370,7 @@ mod tests {
                 ttl_s: 30,
                 manifest_cid: None,
                 relay: false,
+                enc_pub: None,
             });
         }
         assert!(book.len() <= PRESENCE_BOOK_MAX, "cap held: {}", book.len());

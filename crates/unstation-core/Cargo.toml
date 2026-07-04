@@ -15,6 +15,11 @@ thiserror.workspace = true
 tracing.workspace = true
 blake2 = "0.10"
 schnorrkel = "0.11"
+# Signaling-envelope confidentiality (Tier 0 privacy): X25519 ECDH + XChaCha20-Poly1305,
+# so SDP/ICE (peer IPs) never hit the public statement store in the clear. Handshake-only
+# — nothing on the media path. curve25519-dalek 4.x is already in-tree via schnorrkel.
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 tokio.workspace = true
 # Lightweight logging facade for mesh observability (discovery, edge, Want/segment flow).
 # Calls are no-ops unless the host installs a logger, so the deterministic simulator is

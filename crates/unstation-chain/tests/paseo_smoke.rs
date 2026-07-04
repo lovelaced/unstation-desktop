@@ -94,7 +94,7 @@ async fn paseo_presence_smoke() {
 
     // WRITE path — only a personhood-provisioned key can write. Best-effort.
     let publisher = unstation_chain::identity_public().unwrap_or(me.0);
-    let pres = Presence { peer_id: me, publisher, caps_upload_bps: 20_000_000, ttl_s: 30, manifest_cid: None, relay: false };
+    let pres = Presence { peer_id: me, publisher, caps_upload_bps: 20_000_000, ttl_s: 30, manifest_cid: None, relay: false, enc_pub: unstation_chain::identity_enc_public().unwrap_or([0u8;32]) };
     match sig.publish_presence(pres).await {
         Ok(()) => {
             tokio::time::sleep(Duration::from_secs(4)).await;
