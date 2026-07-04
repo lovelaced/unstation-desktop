@@ -55,6 +55,10 @@ struct PocMapper {
     /// clock and composition offsets stay consistent across low-latency parts.
     frame_dur_ticks: i64,
     last_rtp_us: Option<i64>,
+    /// Per-frame POC increment (encoder-dependent: x264 = 2, some builds = 1), detected as
+    /// the GCD of the GOP's POC values. Converges within the first GOP; offsets are computed
+    /// at emit so no fragment is built before it's known. 0 until the first non-zero POC.
+    poc_step: i64,
 }
 
 /// Fixed presentation delay (in frames) baked into every composition offset so a B-frame,
@@ -64,6 +68,12 @@ struct PocMapper {
 /// timeline by a fixed amount, which is invisible for a continuous live stream. 8 frames
 /// covers any realistic B-frame / b-pyramid reorder depth.
 const POC_REORDER_DELAY_FRAMES: i64 = 8;
+
+/// Frames to accumulate before the FIRST low-latency part may close, so the encoder's POC
+/// step (§`PocMapper::poc_step`) has converged — a step-1 stream doesn't reveal an odd POC
+/// until a few frames in, and every fragment must use the same step to stay consistent.
+/// One-time (~0.3s) startup cost; whole-GOP fragments and later parts are unaffected.
+const POC_STEP_WARMUP_FRAMES: i64 = 12;
 
 /// The first coded-slice NAL (type 1/5) in an Annex-B access unit — where the POC lives.
 fn first_slice_nal(annexb: &[u8]) -> Option<&[u8]> {
@@ -86,6 +96,22 @@ struct Au {
     /// B-frame stream reorders presentation vs decode order; [`compute_timing`] fills it.
     comp_offset: u32,
     keyframe: bool,
+    /// POC-path bookkeeping (global decode index, this GOP's IDR decode index, and the
+    /// frame's POC). Duration + `comp_offset` are computed from these at emit, once the POC
+    /// step has converged — see [`FragmentBuilder::emit`]. Zero on the non-POC paths.
+    poc_dec: i64,
+    poc_gop: i64,
+    poc_val: i64,
+}
+
+/// Greatest common divisor (for detecting the encoder's per-frame POC step: x264 uses 2,
+/// OBS's build uses 1 — the step is `gcd` of the GOP's POC values).
+fn gcd(a: i64, b: i64) -> i64 {
+    let (mut a, mut b) = (a.abs(), b.abs());
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
 }
 
 /// One Opus frame queued for the current fragment.
@@ -219,7 +245,7 @@ impl FragmentBuilder {
         let closed = if keyframe && !self.pending.is_empty() { self.emit() } else { None };
         let avcc = annexb_to_avcc(nal);
         if !avcc.is_empty() {
-            self.pending.push(Au { avcc, pts: 0, duration, comp_offset: 0, keyframe });
+            self.pending.push(Au { avcc, pts: 0, duration, comp_offset: 0, keyframe, poc_dec: 0, poc_gop: 0, poc_val: 0 });
             self.pending_ticks += duration as u64;
         }
         // LL mode: once the pending part reaches its target duration, close it mid-GOP. Skip
@@ -244,34 +270,38 @@ impl FragmentBuilder {
     pub fn push_au_pts(&mut self, nal: &[u8], pts_us: i64, keyframe: bool) -> Option<Segment> {
         self.pts_mode = true;
         // Timing: for a B-frame stream (encoder ships monotonic decode-order timestamps and
-        // hides the reorder in the bitstream POC) we compute this AU's decode duration +
-        // composition offset directly on a GLOBAL clock — consistent across low-latency
-        // parts. Otherwise the AU carries its RTP timestamp and `compute_timing` derives the
-        // per-fragment timing at emit (correct for a no-reorder stream).
-        let poc_timing = self.poc_frame_timing(nal, pts_us, keyframe);
+        // hides the reorder in the bitstream POC) we RECORD this AU's global decode index +
+        // GOP anchor + POC now, and turn them into a duration + composition offset at emit —
+        // once the encoder's POC step has converged. Otherwise the AU carries its RTP
+        // timestamp and `compute_timing` derives per-fragment timing (no-reorder streams).
+        self.poc_note_rtp(pts_us);
+        let poc = self.poc_record(nal, keyframe);
         let pts = pts_us.saturating_mul(TIMESCALE as i64) / 1_000_000;
         let closed = if keyframe && !self.pending.is_empty() { self.emit() } else { None };
         let avcc = annexb_to_avcc(nal);
         if !avcc.is_empty() {
-            let (duration, comp_offset) = poc_timing.unwrap_or((0, 0));
-            if poc_timing.is_some() {
+            let (poc_dec, poc_gop, poc_val) = poc.unwrap_or((0, 0, 0));
+            if poc.is_some() {
                 self.poc_active = true;
             }
-            self.pending.push(Au { avcc, pts, duration, comp_offset, keyframe });
+            self.pending.push(Au { avcc, pts, duration: 0, comp_offset: 0, keyframe, poc_dec, poc_gop, poc_val });
             self.pending_pts_lo = self.pending_pts_lo.min(pts);
             self.pending_pts_hi = self.pending_pts_hi.max(pts);
-            self.pending_ticks += duration as u64;
         }
-        // LL part cadence: prefer the decode-duration sum (POC path — monotonic and exact);
-        // fall back to the PTS SPAN for the no-POC path (PTS may arrive out of order).
+        // LL part cadence: in the POC path count frames (one frame_dur each — decode order is
+        // exact); otherwise use the PTS SPAN (PTS may arrive out of order). Hold the FIRST
+        // part until the POC step has converged (warm-up) so no fragment is built with a
+        // premature step.
         if closed.is_none() {
             if let Some(pt) = self.part_ticks {
+                let warmed = self.poc.as_ref().map_or(true, |m| m.decode_index >= POC_STEP_WARMUP_FRAMES);
+                let fd = self.poc.as_ref().map(|m| m.frame_dur_ticks).filter(|d| *d > 0).unwrap_or(3000);
                 let span = if self.poc_active {
-                    self.pending_ticks as i64
+                    self.pending.len() as i64 * fd
                 } else {
                     (self.pending_pts_hi - self.pending_pts_lo).max(0)
                 };
-                if !self.pending.is_empty() && span >= pt as i64 {
+                if warmed && !self.pending.is_empty() && span >= pt as i64 {
                     return self.emit();
                 }
             }
@@ -279,17 +309,11 @@ impl FragmentBuilder {
         closed
     }
 
-    /// For a B-frame stream, this AU's `(decode_duration, composition_offset)` in TIMESCALE
-    /// ticks, computed on a GLOBAL clock from the H.264 POC so offsets stay consistent across
-    /// fragments (a per-fragment anchoring drifts and breaks low-latency parts). `None` when
-    /// there's no usable POC (SPS won't parse / unsupported type / no slice) — the caller then
-    /// uses the RTP timestamp + `compute_timing`, which is right for a no-reorder stream.
-    ///
-    /// DTS is a uniform decode clock (`decode_index · frame_dur`); the composition offset is
-    /// `(presentation_index − decode_index + DELAY) · frame_dur`, where `presentation_index =
-    /// gop_start + POC/2`. So PTS = DTS + ctts = `(presentation_index + DELAY) · frame_dur` —
-    /// monotonic in presentation order, a constant `DELAY` shift, identical across fragments.
-    fn poc_frame_timing(&mut self, nal: &[u8], pts_us: i64, keyframe: bool) -> Option<(u32, u32)> {
+    /// Record a B-frame AU's `(decode_index, gop_start_index, poc)` and advance the POC state
+    /// — WITHOUT computing timing yet (that waits for emit, when the POC step is known).
+    /// `None` when there's no usable POC (SPS won't parse / unsupported type / no slice); the
+    /// caller then uses the RTP timestamp + `compute_timing`, right for a no-reorder stream.
+    fn poc_record(&mut self, nal: &[u8], keyframe: bool) -> Option<(i64, i64, i64)> {
         if !self.poc_init {
             self.poc_init = true;
             if let Some(sps) = crate::h264_poc::parse_sps(&self.params.sps) {
@@ -298,35 +322,43 @@ impl FragmentBuilder {
                     tracker: crate::h264_poc::PocTracker::new(&sps),
                     decode_index: 0,
                     gop_start_index: 0,
-                    frame_dur_ticks: 0, // locked on first measurement below
+                    frame_dur_ticks: 0,
                     last_rtp_us: None,
+                    poc_step: 0,
                 });
             }
         }
         let m = self.poc.as_mut()?;
-        // Lock the frame duration on the first clean decode-order delta (guard reconnects).
-        if m.frame_dur_ticks == 0 {
-            if let Some(last) = m.last_rtp_us {
-                let d_us = pts_us - last;
-                if (1_000..=200_000).contains(&d_us) {
-                    m.frame_dur_ticks = (d_us * TIMESCALE as i64 / 1_000_000).max(1);
-                }
-            }
-            m.last_rtp_us = Some(pts_us);
-        }
-        let fd = if m.frame_dur_ticks == 0 { 3000 } else { m.frame_dur_ticks };
         let slice = first_slice_nal(nal)?;
         let (is_idr, lsb) = crate::h264_poc::slice_poc_lsb(slice, &m.sps)?;
         let d = m.decode_index;
         if is_idr || keyframe {
             m.gop_start_index = d;
         }
-        let poc = m.tracker.poc(is_idr, lsb, crate::h264_poc::nal_ref_idc(slice[0]));
-        // Frame coding: POC advances by 2 per frame, so POC/2 is the presentation offset.
-        let presentation_index = m.gop_start_index + poc as i64 / 2;
+        let poc = m.tracker.poc(is_idr, lsb, crate::h264_poc::nal_ref_idc(slice[0])) as i64;
+        // POC is relative to this GOP's IDR (POC 0); its step is the GCD of positive values.
+        if poc > 0 {
+            m.poc_step = gcd(m.poc_step, poc);
+        }
+        let gop = m.gop_start_index;
         m.decode_index += 1;
-        let comp = ((presentation_index - d + POC_REORDER_DELAY_FRAMES) * fd).max(0);
-        Some((fd as u32, comp as u32))
+        Some((d, gop, poc))
+    }
+
+    /// Lock the frame duration in ticks from the AU's decode-order RTP timestamp (call once
+    /// per push, before recording, so the clock is stable). Guards against reconnect jumps.
+    fn poc_note_rtp(&mut self, pts_us: i64) {
+        if let Some(m) = self.poc.as_mut() {
+            if m.frame_dur_ticks == 0 {
+                if let Some(last) = m.last_rtp_us {
+                    let d_us = pts_us - last;
+                    if (1_000..=200_000).contains(&d_us) {
+                        m.frame_dur_ticks = (d_us * TIMESCALE as i64 / 1_000_000).max(1);
+                    }
+                }
+                m.last_rtp_us = Some(pts_us);
+            }
+        }
     }
 
     /// Queue one Opus frame (a raw Opus packet). `duration` is in 48 kHz ticks —
@@ -363,10 +395,22 @@ impl FragmentBuilder {
         self.pending_ticks = 0;
         self.pending_pts_lo = i64::MAX;
         self.pending_pts_hi = i64::MIN;
-        // PTS path WITHOUT POC (no reorder): derive per-fragment durations + composition
-        // offsets from the buffered presentation timestamps. When POC is driving timing, each
-        // AU already has its global-clock duration + composition offset — leave them.
-        if self.pts_mode && !self.poc_active {
+        // Fill decode duration + composition offset for this fragment. POC path: on a GLOBAL
+        // clock — DTS = decode_index·frame_dur, ctts = (presentation_index − decode_index +
+        // DELAY)·frame_dur with presentation_index = gop_start + POC/step. Computed HERE (not
+        // at push) so every fragment uses the same, by-now-converged POC step — consistent
+        // across low-latency parts. No-POC PTS path: per-fragment `compute_timing`.
+        if self.poc_active {
+            let m = self.poc.as_ref();
+            let fd = m.map(|m| m.frame_dur_ticks).filter(|d| *d > 0).unwrap_or(3000);
+            let step = m.map(|m| m.poc_step).filter(|s| *s > 0).unwrap_or(2);
+            for au in aus.iter_mut() {
+                let presentation_index = au.poc_gop + au.poc_val / step;
+                let comp = (presentation_index - au.poc_dec + POC_REORDER_DELAY_FRAMES) * fd;
+                au.duration = fd as u32;
+                au.comp_offset = comp.max(0) as u32;
+            }
+        } else if self.pts_mode {
             self.last_frame_dur = compute_timing(&mut aus, self.last_frame_dur);
         }
         let seq = self.seq;
@@ -1061,6 +1105,20 @@ mod tests {
         eprintln!("wrote /tmp/poc_init.mp4 + {segn} segments");
     }
 
+    /// POC step detection: x264 numbers frames 0,2,4,… (step 2); other encoders (e.g. Apple
+    /// VideoToolbox, which OBS-on-Mac uses) number 0,1,2,… (step 1). Assuming step 2 for a
+    /// step-1 stream collides two frames into each presentation slot — the OBS decode bug.
+    /// The step is the GCD of the GOP's POC values.
+    #[test]
+    fn poc_step_is_the_gcd_of_poc_values() {
+        // x264-style even POCs → step 2.
+        assert_eq!([0i64, 6, 2, 4, 10, 8].iter().fold(0, |g, &p| gcd(g, p)), 2);
+        // VT/OBS-style consecutive POCs (an odd value appears) → step 1.
+        assert_eq!([0i64, 4, 2, 1, 3, 8].iter().fold(0, |g, &p| gcd(g, p)), 1);
+        assert_eq!(gcd(0, 5), 5);
+        assert_eq!(gcd(12, 8), 4);
+    }
+
     /// B-frame reorder: decode order `I P B B` presents as `I B B P`. `compute_timing` must
     /// yield a monotonic DTS (constant frame duration) and composition offsets that reproduce
     /// the presentation timeline exactly — the fix for OBS/High-profile decode failures.
@@ -1071,7 +1129,7 @@ mod tests {
         let pts_decode = [0i64, 3 * fd, 1 * fd, 2 * fd];
         let mut aus: Vec<Au> = pts_decode
             .iter()
-            .map(|&p| Au { avcc: vec![0], pts: p, duration: 0, comp_offset: 0, keyframe: false })
+            .map(|&p| Au { avcc: vec![0], pts: p, duration: 0, comp_offset: 0, keyframe: false, poc_dec: 0, poc_gop: 0, poc_val: 0 })
             .collect();
         let frame_dur = compute_timing(&mut aus, 3000);
         assert_eq!(frame_dur, fd as u32, "measures 30fps frame duration");
@@ -1095,7 +1153,7 @@ mod tests {
     fn compute_timing_no_bframes_is_offsetless() {
         let fd = 3000i64;
         let mut aus: Vec<Au> = (0..5)
-            .map(|i| Au { avcc: vec![0], pts: i * fd, duration: 0, comp_offset: 0, keyframe: i == 0 })
+            .map(|i| Au { avcc: vec![0], pts: i * fd, duration: 0, comp_offset: 0, keyframe: i == 0, poc_dec: 0, poc_gop: 0, poc_val: 0 })
             .collect();
         compute_timing(&mut aus, 3000);
         assert!(aus.iter().all(|a| a.comp_offset == 0), "no reorder ⇒ no composition offsets");
