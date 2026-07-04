@@ -40,6 +40,11 @@ pub enum EngineEvent {
     /// Publisher-side, locally injected: the segmenter produced a content-addressed
     /// segment. The node stores it and starts serving it to the mesh.
     Produced { seq: Seq, id: SegmentId, bytes: Bytes },
+    /// Publisher-side, locally injected: the muxer's init segment (CMAF `ftyp`+`moov`).
+    /// The node holds it and serves it over the mesh (`WantInit`/`InitData`) so a viewer
+    /// bootstraps playback from the peer, not the Bulletin gateway. For an encrypted
+    /// stream these are the SEALED init bytes (same form the mesh + Bulletin carry).
+    InitSegment { bytes: Bytes },
     /// Viewer-side, locally injected: the signed live-edge announced a segment's
     /// content id, so the node knows it exists and how to verify it (TECH_SPEC §6.4).
     LiveEdge { seq: Seq, id: SegmentId },

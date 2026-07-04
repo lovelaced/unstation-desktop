@@ -326,6 +326,11 @@ pub struct MeshNode {
     /// (store + id map + buffer map) when the play head actually advanced.
     last_prune_floor: Seq,
     stats: NodeStats,
+    /// The stream's init segment (CMAF `ftyp`+`moov`). A publisher receives it via
+    /// [`EngineEvent::InitSegment`]; a viewer fills it from a peer's `InitData` (and then
+    /// installs it into its sink + can reshare it). Serving this over the mesh decouples
+    /// playback bootstrap from the Bulletin gateway. `None` until known.
+    init: Option<Bytes>,
 }
 
 impl MeshNode {
@@ -451,6 +456,7 @@ impl MeshNode {
             fallback_rx: Some(fallback_rx),
             last_prune_floor: 0,
             stats: NodeStats::default(),
+            init: None,
         }
     }
 
@@ -614,6 +620,18 @@ impl MeshNode {
                 if !matches!(self.eng.cfg.role, Role::Publisher) {
                     link.send(Channel::Ctrl, MeshMsg::Subscribe.encode());
                 }
+                // Init-segment bootstrap over the mesh (not the Bulletin gateway). If we
+                // hold the init, push it straight to the new peer — a viewer needs it
+                // before any fragment plays. If we DON'T have it yet, ask (the peer may be
+                // the publisher or a seed that has it); the on-tick retry covers races.
+                match &self.init {
+                    Some(bytes) => {
+                        link.send(Channel::Ctrl, MeshMsg::InitData { bytes: bytes.to_vec() }.encode());
+                    }
+                    None => {
+                        link.send(Channel::Ctrl, MeshMsg::WantInit.encode());
+                    }
+                }
             }
             EngineEvent::PeerDisconnected { peer } => {
                 self.links.remove(&peer);
@@ -657,6 +675,18 @@ impl MeshNode {
                 }
                 // Push-pull: push it straight to subscribers (don't wait for their Want).
                 self.push_to_subscribers(seq);
+            }
+            EngineEvent::InitSegment { bytes } => {
+                // Publisher learned its init segment — hold it and push to everyone already
+                // connected (a viewer that connected before the encoder was up now gets it).
+                let is_new = self.init.is_none();
+                self.init = Some(bytes.clone());
+                if is_new {
+                    let msg = MeshMsg::InitData { bytes: bytes.to_vec() }.encode();
+                    for link in self.links.values() {
+                        link.send(Channel::Ctrl, msg.clone());
+                    }
+                }
             }
             EngineEvent::LiveEdge { seq, id } => {
                 // Learn a segment's content id from the chain edge poll (the fallback path).
@@ -1087,6 +1117,31 @@ impl MeshNode {
             MeshMsg::Have { seq } => {
                 if let Some(p) = self.eng.peers.get_mut(&peer) {
                     p.buffer.set(seq);
+                }
+            }
+            MeshMsg::WantInit => {
+                // A peer needs the bootstrap init and we may hold it — serve it directly.
+                if let (Some(bytes), Some(link)) = (self.init.clone(), self.links.get(&peer).cloned()) {
+                    link.send(Channel::Ctrl, MeshMsg::InitData { bytes: bytes.to_vec() }.encode());
+                }
+            }
+            MeshMsg::InitData { bytes } => {
+                // Received the init from a peer: install it into the sink so playback can
+                // start (the decrypting sink opens it if the stream is encrypted), hold it
+                // so we can serve it onward, and forward to our OTHER links — so a seed that
+                // just learned the init immediately hands it to its downstream viewers
+                // (covers a viewer that asked a peer which didn't have it yet). Install once.
+                if self.init.is_none() && !bytes.is_empty() {
+                    let b = Bytes::from(bytes);
+                    self.init = Some(b.clone());
+                    self.sink.push_init(b.clone());
+                    log::info!("[init] installed init segment from peer {peer:?} over the mesh");
+                    let msg = MeshMsg::InitData { bytes: b.to_vec() }.encode();
+                    for (p, link) in self.links.iter() {
+                        if *p != peer {
+                            link.send(Channel::Ctrl, msg.clone());
+                        }
+                    }
                 }
             }
             MeshMsg::Ping { nonce, t_send_ms } => {

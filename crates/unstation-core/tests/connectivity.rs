@@ -57,6 +57,21 @@ impl MediaSink for NullSink {
     }
 }
 
+/// Records the init segment the node installs — proving mesh-delivered init reaches the sink.
+#[derive(Default)]
+struct InitRec {
+    init: Mutex<Option<Bytes>>,
+}
+impl MediaSink for InitRec {
+    fn push_init(&self, bytes: Bytes) {
+        *self.init.lock().unwrap() = Some(bytes);
+    }
+    fn push_segment(&self, _: u64, _: Bytes) {}
+    fn on_play_head(&self) -> u64 {
+        0
+    }
+}
+
 /// A `Link` that records every `send` instead of delivering it — lets a test observe
 /// exactly what a node chose to transmit (used to prove a push happened with no `Want`).
 struct RecordingLink {
@@ -148,6 +163,36 @@ async fn viewer_fetches_from_two_publishers() {
     assert_eq!(rec.count(), n, "all fed to the player");
     let _ = p1.send(EngineEvent::Stop);
     let _ = p2.send(EngineEvent::Stop);
+}
+
+/// The init segment (playback-bootstrap blob) must reach the viewer over the MESH, not
+/// only via the Bulletin gateway — the gap the first device pass exposed (gateway 504 →
+/// no init → nothing plays, even though every media segment arrived P2P).
+#[tokio::test]
+async fn init_segment_bootstraps_over_the_mesh() {
+    let (n, seg_len) = (6usize, 8_000usize);
+    let (segs, ids) = make_vod(n, seg_len);
+    let viewid = PeerId::from_u64(100);
+    let (vtx, vrx) = mpsc::unbounded_channel::<EngineEvent>();
+
+    let pub_tx = spawn_publisher(PeerId::from_u64(1), viewid, &vtx, segs.clone(), seg_len);
+    // The publisher's muxer emits its init segment — it must propagate to the viewer.
+    let init_bytes = Bytes::from_static(b"\x00\x00\x00\x18ftypcmfc....moov....");
+    pub_tx.send(EngineEvent::InitSegment { bytes: init_bytes.clone() }).unwrap();
+
+    let init_rec = Arc::new(InitRec::default());
+    let viewer =
+        MeshNode::new_viewer(viewid, cfg(Role::Viewer), seg_len as u64, init_rec.clone(), ids, (n - 1) as Seq);
+    let _ = tokio::time::timeout(Duration::from_secs(8), viewer.run(vrx, Duration::from_millis(10), Some(n)))
+        .await
+        .expect("viewer should complete");
+
+    assert_eq!(
+        init_rec.init.lock().unwrap().as_ref(),
+        Some(&init_bytes),
+        "viewer must install the init segment delivered over the mesh (no Bulletin)"
+    );
+    let _ = pub_tx.send(EngineEvent::Stop);
 }
 
 #[tokio::test]

@@ -1726,8 +1726,12 @@ async fn start_publish(
                         let init = builder.init_segment();
                         // Encrypted: Bulletin gets the sealed init; the local preview gets
                         // the plaintext (the publisher watches its own stream in the clear).
+                        let mesh_init_bytes = mesh_init(feed_key, &init);
                         *init_slot_feeder.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(mesh_init(feed_key, &init));
+                            Some(mesh_init_bytes.clone());
+                        // Serve the init over the mesh too (not just Bulletin) so viewers
+                        // bootstrap playback from the peer even if the gateway is down.
+                        let _ = ptx.send(EngineEvent::InitSegment { bytes: mesh_init_bytes });
                         preview.push_init(init);
                         fb = Some(builder);
                     } else {
@@ -1834,8 +1838,10 @@ async fn start_publish(
                         if let Some(init) = segmenter::load_init(&dir) {
                             // Hand the init to the manifest publisher (→ Bulletin → viewers)
                             // and feed our own self-preview. (Bytes clone is cheap.)
+                            let mesh_init_bytes = mesh_init(feed_key, &init);
                             *init_slot_feeder.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some(mesh_init(feed_key, &init));
+                                Some(mesh_init_bytes.clone());
+                            let _ = ptx.send(EngineEvent::InitSegment { bytes: mesh_init_bytes });
                             preview.push_init(init);
                             init_sent = true;
                         }
@@ -2037,7 +2043,9 @@ async fn start_publish(
         // Init segment → self-preview (plaintext) + the manifest publisher (Bulletin, via
         // `init_slot`; sealed when encrypted).
         let init = fb.init_segment();
-        *init_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(mesh_init(feed_key, &init));
+        let mesh_init_bytes = mesh_init(feed_key, &init);
+        *init_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(mesh_init_bytes.clone());
+        let _ = ptx.send(EngineEvent::InitSegment { bytes: mesh_init_bytes });
         preview.push_init(init);
         live_w.store(true, Ordering::Relaxed);
         let _ = appc.emit("publish-state", PublishStateMsg { live: true });

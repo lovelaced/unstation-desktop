@@ -64,6 +64,20 @@ pub enum MeshMsg {
     /// reading the chain — replacing the per-viewer chain presence write. A dial hint
     /// only (unsigned): trust is still gated by the manifest + signed live-edge.
     PresenceGossip { records: Vec<PresenceRecord> },
+    /// Request the stream's init segment (the CMAF `ftyp`+`moov` bootstrap blob) from a
+    /// peer that holds it. Playback can't start without the init, and until now it came
+    /// ONLY from the Bulletin gateway — a single point of failure the first device pass
+    /// hit (gateway 504 → no init → nothing plays, even though every media segment
+    /// arrived over the mesh). The publisher (and any node that has since received it)
+    /// now serves it directly, so bootstrap survives a Bulletin outage. Appended so the
+    /// `SegmentData` tag (4) the hand-rolled framing depends on never shifts.
+    WantInit,
+    /// The init segment bytes, in reply to `WantInit` (and pushed proactively when a peer
+    /// connects to a holder). Small (~1 KB CMAF header), so it rides one reliable `Ctrl`
+    /// message rather than being chunked like `SegmentData`. For an encrypted stream these
+    /// are the SEALED init bytes — the viewer's decrypting sink opens them, exactly as it
+    /// does segments; the content is hash-anchored by the manifest's `init_segment_cid`.
+    InitData { bytes: Vec<u8> },
 }
 
 #[cfg(test)]
@@ -103,6 +117,17 @@ mod tests {
         }
         // Appending the push-pull variants must not have moved the SegmentData tag (4),
         // which the one-copy framing in `node::frame_segment_data` hardcodes.
+        let sd = MeshMsg::SegmentData { seq: 0, track_id: 0, total_len: 1, offset: 0, bytes: vec![0] };
+        assert_eq!(sd.encode()[0], 4, "SegmentData must stay variant 4");
+    }
+
+    #[test]
+    fn roundtrip_init_msgs() {
+        for msg in [MeshMsg::WantInit, MeshMsg::InitData { bytes: vec![0xDE, 0xAD, 0xBE, 0xEF] }] {
+            let bytes = msg.encode();
+            assert_eq!(MeshMsg::decode(&mut &bytes[..]).unwrap(), msg);
+        }
+        // Init variants are appended after PresenceGossip, so SegmentData stays tag 4.
         let sd = MeshMsg::SegmentData { seq: 0, track_id: 0, total_len: 1, offset: 0, bytes: vec![0] };
         assert_eq!(sd.encode()[0], 4, "SegmentData must stay variant 4");
     }
