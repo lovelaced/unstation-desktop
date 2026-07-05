@@ -564,4 +564,110 @@ mod scenarios {
             }
         }
     }
+
+    /// A 3-hop relay: publisher P → seed relay S (`Role::Seed`, never chokes, reshares +
+    /// re-gossips) → leaf viewer L, where L has NO link to P — it learns the edge only
+    /// via S's gossip and gets bytes only via S's reshare (the decentralized-TURN
+    /// substitute). Impair BOTH hops and verify the multi-hop stream still delivers and
+    /// neither honest peer is wrongly banned on the relay path.
+    #[test]
+    fn relay_chain_survives_lossy_hops() {
+        let mut sim = Sim::new(3, 100);
+        let (pid, sid, lid) = (PeerId::from_u64(1), PeerId::from_u64(2), PeerId::from_u64(3));
+        let bans = BanList::new();
+
+        let publisher = MeshNode::new_live_publisher(
+            pid,
+            cfg(Role::Publisher, 400, 16, 100),
+            SEG_BYTES as u64,
+            Arc::new(SimSink::default()),
+        )
+        .with_stream_id(SID)
+        .with_edge_signer(Arc::new(SeedSigner));
+        let seed = MeshNode::new_seed(sid, cfg(Role::Seed, 400, 16, 100), SEG_BYTES as u64, HashMap::new(), 0)
+            .with_stream_id(SID)
+            .with_publisher_key(pubkey())
+            .with_ban_list(bans.clone());
+        let leaf_sink = Arc::new(SimSink::default());
+        let leaf = MeshNode::new_viewer(
+            lid,
+            cfg(Role::Viewer, 400, 16, 100),
+            SEG_BYTES as u64,
+            leaf_sink.clone(),
+            HashMap::new(),
+            0,
+        )
+        .with_stream_id(SID)
+        .with_publisher_key(pubkey())
+        .with_ban_list(bans.clone());
+        sim.add(pid, publisher);
+        sim.add(sid, seed);
+        sim.add(lid, leaf);
+        // P↔S mildly lossy; S↔L (the last mile) lossier.
+        sim.connect_ex(pid, sid, NetModel::link(20, 0), NetModel::link(20, 0).loss(0.05));
+        sim.connect_ex(sid, lid, NetModel::link(30, 0), NetModel::link(30, 0).loss(0.15));
+        for i in 0..50u64 {
+            sim.produce(pid, 100 + i * 300, i, SEG_BYTES);
+        }
+        sim.run(60_000);
+
+        eprintln!(
+            "[relay] leaf_delivered={} seed_banned_pub={} leaf_banned_seed={} banlist={}",
+            leaf_sink.delivered(),
+            sim.node(&sid).sim_banned(&pid),
+            sim.node(&lid).sim_banned(&sid),
+            bans.len(),
+        );
+        assert!(leaf_sink.delivered() > 0, "relay leaf received nothing over the multi-hop path");
+        assert!(!sim.node(&lid).sim_banned(&sid), "leaf wrongly banned the honest seed relay");
+        assert!(!sim.node(&sid).sim_banned(&pid), "seed wrongly banned the honest publisher");
+        assert_eq!(bans.len(), 0, "an honest peer was banned on the relay path");
+    }
+
+    // ---- property fuzzing: random bad-but-usable links must uphold the invariants ----
+    use proptest::prelude::*;
+
+    proptest! {
+        // Bounded cases so the (fast, deterministic) fuzz stays in the core suite; the
+        // tuning bench will run wider sweeps under `--features netsim`.
+        #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+
+        /// Over a random bad-but-usable bulk link, a 2-viewer star must never wrongly ban
+        /// the honest publisher, never blow the reassembly caps, and never totally stall.
+        /// proptest shrinks any violating `(seed, loss, delay, jitter, dup, bw)` to a
+        /// minimal repro.
+        #[test]
+        fn fuzz_star_safety(
+            seed in 0u64..10_000,
+            loss in 0.0f64..0.30,
+            delay in 0u64..180,
+            jitter in 0u64..140,
+            dup in 0.0f64..0.15,
+            bw in prop::sample::select(vec![0u64, 3_000_000, 6_000_000]),
+        ) {
+            let ctrl = NetModel::link(delay, 0);
+            let bulk = NetModel::link(delay, bw).loss(loss).jitter(jitter).dup(dup);
+            let (mut sim, pubid, vs, bans) = star(seed, 2, ctrl, bulk);
+            for i in 0..30u64 {
+                sim.produce(pubid, 100 + i * 300, i, SEG_BYTES);
+            }
+            sim.run(45_000);
+            for (vid, sink) in &vs {
+                let st = sim.stats(vid);
+                prop_assert!(
+                    !sim.node(vid).sim_banned(&pubid),
+                    "honest publisher banned — loss={loss:.3} delay={delay} jitter={jitter} bw={bw}",
+                );
+                prop_assert!(
+                    st.reasm_bytes <= 32 * 1024 * 1024 && st.reasm_entries <= 64,
+                    "reassembly unbounded — {} B / {} entries", st.reasm_bytes, st.reasm_entries,
+                );
+                prop_assert!(
+                    sink.delivered() > 0,
+                    "total stall — loss={loss:.3} delay={delay} jitter={jitter} dup={dup:.3} bw={bw}",
+                );
+            }
+            prop_assert_eq!(bans.len(), 0, "an honest peer was banned");
+        }
+    }
 }
