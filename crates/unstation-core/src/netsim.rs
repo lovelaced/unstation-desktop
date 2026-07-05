@@ -673,4 +673,43 @@ mod scenarios {
             prop_assert_eq!(bans.len(), 0, "an honest peer was banned");
         }
     }
+
+    /// TUNING/characterization bench (prints, doesn't assert): sweep the bulk-loss rate on
+    /// a 1-viewer star and report delivery %, the honest publisher's final reputation, and
+    /// whether it got banned — turning constant-choice into data instead of guesswork. It
+    /// documents the protocol's operating envelope AND validates the target-#1 fix
+    /// quantitatively: across the whole loss range the honest peer stays usable and unbanned
+    /// (before the fix it crossed the 0.05 ban floor by ~20% loss). Run with `--nocapture`.
+    #[ignore = "characterization bench (prints metrics) — run via test-all.sh's netsim step"]
+    #[test]
+    fn bench_loss_sweep() {
+        let k = 40u64;
+        eprintln!("[bench] bulk-loss sweep (1-viewer star, avg of 3 seeds, k={k})");
+        eprintln!("[bench]  loss%   delivered%   final_rep   banned");
+        for loss_pct in [0u64, 5, 10, 15, 20, 30, 40, 50] {
+            let (mut deliv_frac, mut rep_sum) = (0.0f64, 0.0f64);
+            let mut banned = 0u32;
+            for seed in 0..3u64 {
+                let bulk = NetModel::link(30, 0).loss(loss_pct as f64 / 100.0);
+                let (mut sim, pubid, vs, bans) = star(seed, 1, NetModel::link(20, 0), bulk);
+                for i in 0..k {
+                    sim.produce(pubid, 100 + i * 300, i, SEG_BYTES);
+                }
+                sim.run(50_000);
+                let (vid, sink) = &vs[0];
+                deliv_frac += sink.delivered() as f64 / k as f64;
+                rep_sum += sim.node(vid).sim_reputation(&pubid).unwrap_or(0.0);
+                if bans.contains(&pubid) {
+                    banned += 1;
+                }
+            }
+            eprintln!(
+                "[bench]  {:>4}%   {:>9.0}%   {:>9.3}   {:>3}/3",
+                loss_pct,
+                deliv_frac / 3.0 * 100.0,
+                rep_sum / 3.0,
+                banned,
+            );
+        }
+    }
 }
