@@ -466,4 +466,102 @@ mod scenarios {
         // It should still make progress (deprioritized, not cut off).
         assert!(st.delivered > 0, "banned/cut off the only peer, so nothing was delivered");
     }
+
+    /// A star: 1 live publisher + `viewers` viewers on the same `(ctrl, bulk)` model.
+    /// Returns `(sim, pubid, [(vid, sink)], shared BanList)`.
+    fn star(
+        seed: u64,
+        viewers: usize,
+        ctrl: NetModel,
+        bulk: NetModel,
+    ) -> (Sim, PeerId, Vec<(PeerId, Arc<SimSink>)>, BanList) {
+        let mut sim = Sim::new(seed, 100);
+        let pubid = PeerId::from_u64(1);
+        let bans = BanList::new();
+        let publisher = MeshNode::new_live_publisher(
+            pubid,
+            cfg(Role::Publisher, 400, 16, 100),
+            SEG_BYTES as u64,
+            Arc::new(SimSink::default()),
+        )
+        .with_stream_id(SID)
+        .with_edge_signer(Arc::new(SeedSigner));
+        sim.add(pubid, publisher);
+        let mut vs = Vec::new();
+        for i in 0..viewers {
+            let vid = PeerId::from_u64(100 + i as u64);
+            let sink = Arc::new(SimSink::default());
+            let viewer = MeshNode::new_viewer(
+                vid,
+                cfg(Role::Viewer, 400, 16, 100),
+                SEG_BYTES as u64,
+                sink.clone(),
+                HashMap::new(),
+                0,
+            )
+            .with_stream_id(SID)
+            .with_publisher_key(pubkey())
+            .with_ban_list(bans.clone());
+            sim.add(vid, viewer);
+            sim.connect_ex(pubid, vid, ctrl.clone(), bulk.clone());
+            vs.push((vid, sink));
+        }
+        (sim, pubid, vs, bans)
+    }
+
+    /// SAFETY-INVARIANT MATRIX — a sweep of network conditions on a star, every one of
+    /// which must uphold the invariants that do NOT depend on how harsh the link is: the
+    /// honest publisher is never banned, reassembly memory stays bounded, and every viewer
+    /// makes at least some progress (never a total stall). Delivery *rate* degrades with
+    /// the link (printed for observation), but these safety properties never do.
+    /// (`corrupt` is deliberately absent — a peer emitting bad bytes is suspicious by
+    /// definition, and DTLS makes in-transit corruption unreachable at this layer; the
+    /// hash-verify/ban path is covered by the adversarial tests.)
+    #[test]
+    fn matrix_star_safety_invariants() {
+        let k = 50u64;
+        let conditions: &[(&str, NetModel, NetModel)] = &[
+            ("clean", NetModel::link(20, 0), NetModel::link(20, 0)),
+            ("loss5", NetModel::link(20, 0), NetModel::link(20, 0).loss(0.05)),
+            ("loss20", NetModel::link(20, 0), NetModel::link(20, 0).loss(0.20)),
+            ("latency150", NetModel::link(150, 0), NetModel::link(150, 0)),
+            ("jitter120", NetModel::link(40, 0), NetModel::link(40, 0).jitter(120)),
+            ("bw_tight", NetModel::link(20, 0), NetModel::link(20, 2_000_000)),
+            ("dup10", NetModel::link(20, 0), NetModel::link(20, 0).dup(0.10)),
+            (
+                "combined",
+                NetModel::link(80, 0).loss(0.02),
+                NetModel::link(80, 4_000_000).loss(0.08).jitter(40).dup(0.02),
+            ),
+        ];
+        for (name, ctrl, bulk) in conditions {
+            for seed in 0..3u64 {
+                let (mut sim, pubid, vs, bans) = star(seed, 3, ctrl.clone(), bulk.clone());
+                for i in 0..k {
+                    sim.produce(pubid, 100 + i * 300, i, SEG_BYTES);
+                }
+                sim.run(60_000);
+                let mut min_deliv = usize::MAX;
+                for (vid, sink) in &vs {
+                    let st = sim.stats(vid);
+                    assert!(
+                        !sim.node(vid).sim_banned(&pubid) && !bans.contains(&pubid),
+                        "{name}/{seed}: honest publisher wrongly banned by {vid:?}",
+                    );
+                    assert!(
+                        st.reasm_bytes <= 32 * 1024 * 1024 && st.reasm_entries <= 64,
+                        "{name}/{seed}: reassembly unbounded ({} B, {} entries)",
+                        st.reasm_bytes,
+                        st.reasm_entries,
+                    );
+                    assert!(
+                        sink.delivered() > 0,
+                        "{name}/{seed}: viewer {vid:?} made zero progress (total stall)",
+                    );
+                    min_deliv = min_deliv.min(sink.delivered());
+                }
+                eprintln!("[matrix] {name:<11} seed={seed} min_delivered={min_deliv}/{k}");
+            }
+        }
+    }
 }
