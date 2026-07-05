@@ -517,6 +517,7 @@ mod scenarios {
     /// (`corrupt` is deliberately absent — a peer emitting bad bytes is suspicious by
     /// definition, and DTLS makes in-transit corruption unreachable at this layer; the
     /// hash-verify/ban path is covered by the adversarial tests.)
+    #[ignore = "netsim hardening suite — run via test-all.sh's netsim step"]
     #[test]
     fn matrix_star_safety_invariants() {
         let k = 50u64;
@@ -570,6 +571,7 @@ mod scenarios {
     /// via S's gossip and gets bytes only via S's reshare (the decentralized-TURN
     /// substitute). Impair BOTH hops and verify the multi-hop stream still delivers and
     /// neither honest peer is wrongly banned on the relay path.
+    #[ignore = "netsim hardening suite — run via test-all.sh's netsim step"]
     #[test]
     fn relay_chain_survives_lossy_hops() {
         let mut sim = Sim::new(3, 100);
@@ -636,6 +638,7 @@ mod scenarios {
         /// the honest publisher, never blow the reassembly caps, and never totally stall.
         /// proptest shrinks any violating `(seed, loss, delay, jitter, dup, bw)` to a
         /// minimal repro.
+        #[ignore = "netsim hardening suite — run via test-all.sh's netsim step"]
         #[test]
         fn fuzz_star_safety(
             seed in 0u64..10_000,

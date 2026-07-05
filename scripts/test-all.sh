@@ -49,6 +49,8 @@ step "real-WebRTC wide fan-out (1 publisher → 8 viewers, 2 leave mid-stream)" 
   env UNSTATION_BIND_ADDR=127.0.0.1 cargo test -p transport-libdc --test fanout_loopback -- --ignored --nocapture
 step "scale sim (metrics)" \
   cargo test -p unstation-core --test scale_sim -- --nocapture
+step "netsim impairment hardening (matrix + relay + fuzz over lossy/laggy links)" \
+  cargo test -p unstation-core --lib netsim -- --ignored --nocapture
 
 if [ "$WITH_BENCH" = 1 ]; then
   step "benchmarks (criterion)" \
