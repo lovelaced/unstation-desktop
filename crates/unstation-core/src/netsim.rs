@@ -51,6 +51,11 @@ pub struct NetModel {
     /// Probability a delivered message has one byte flipped (exercises hash-verify /
     /// decode-rejects-garbage). Apply mainly to the bulk channel.
     pub corrupt_prob: f64,
+    /// A total outage window `[start_ms, end_ms)` in virtual time: EVERY message sent
+    /// during it is dropped (both directions if set on both links' models). Models a
+    /// radio dropout / walking out of range — the association survives (short outages
+    /// don't trip ICE in the sim), delivery just goes dark and must recover on heal.
+    pub outage: Option<(u64, u64)>,
 }
 
 impl NetModel {
@@ -76,6 +81,11 @@ impl NetModel {
     }
     pub fn corrupt(mut self, p: f64) -> Self {
         self.corrupt_prob = p;
+        self
+    }
+    /// Drop everything sent during `[start_ms, end_ms)` of virtual time.
+    pub fn outage(mut self, start_ms: u64, end_ms: u64) -> Self {
+        self.outage = Some((start_ms, end_ms));
         self
     }
 }
@@ -155,6 +165,12 @@ impl Link for ImpairedLink {
             Channel::Bulk => &self.bulk,
         };
         let mut s = self.net.lock().unwrap();
+        // Total outage window (radio dropout).
+        if let Some((start, end)) = model.outage {
+            if s.now_ms >= start && s.now_ms < end {
+                return;
+            }
+        }
         // Loss.
         if model.loss_prob > 0.0 && s.rng.gen::<f64>() < model.loss_prob {
             return;
@@ -225,6 +241,11 @@ impl SimSink {
     /// The contiguous-from-0 play head (the largest gap-free prefix).
     pub fn contiguous(&self) -> u64 {
         self.on_play_head()
+    }
+    /// Which of `0..k` never arrived — for diagnosing a scenario's missing tail.
+    pub fn missing(&self, k: u64) -> Vec<u64> {
+        let s = self.segs.lock().unwrap();
+        (0..k).filter(|q| !s.contains(q)).collect()
     }
 }
 
@@ -405,6 +426,27 @@ mod scenarios {
     use super::*;
 
     const SEG_BYTES: usize = 60_000;
+
+    /// Route `log` records to stderr for scenario debugging (`--nocapture`). Install
+    /// with `trace_on()` at the top of a scenario while diagnosing; harmless if the
+    /// logger is already set.
+    struct EprintLogger;
+    impl log::Log for EprintLogger {
+        fn enabled(&self, m: &log::Metadata) -> bool {
+            m.level() <= log::Level::Debug
+        }
+        fn log(&self, r: &log::Record) {
+            if self.enabled(r.metadata()) {
+                eprintln!("[{}] {}", r.level(), r.args());
+            }
+        }
+        fn flush(&self) {}
+    }
+    #[allow(dead_code)]
+    fn trace_on() {
+        let _ = log::set_logger(&EprintLogger);
+        log::set_max_level(log::LevelFilter::Debug);
+    }
 
     /// Build a 1-publisher + 1-viewer sim wired by `ctrl`/`bulk` models. Returns
     /// `(sim, pubid, vid, shared BanList)`.
@@ -672,6 +714,197 @@ mod scenarios {
             }
             prop_assert_eq!(bans.len(), 0, "an honest peer was banned");
         }
+    }
+
+    /// TARGET #2 — the panic-zone hedge must be real end-to-end. A late joiner catches up
+    /// from two holders: P (the publisher) has the more attractive control RTT so the
+    /// picker ranks it first — but its bulk channel is a BLACKHOLE (accepts Wants, no
+    /// bytes ever arrive); S (a caught-up seed) is healthy but ranked second. Without the
+    /// hedge every deadline-critical segment goes pending to P alone and stalls the full
+    /// 2 s timeout before rerouting; with it the picker's `redundant` second request
+    /// reaches S concurrently, so the healthy holder serves immediately. Asserts most of
+    /// the window is delivered within ~1.5 s of joining — red before the hedge, green
+    /// after.
+    #[test]
+    fn panic_hedge_rescues_a_dead_primary() {
+        const K: u64 = 24;
+        let mut sim = Sim::new(11, 100);
+        let (pid, sid_, vid) = (PeerId::from_u64(1), PeerId::from_u64(2), PeerId::from_u64(3));
+
+        let publisher = MeshNode::new_live_publisher(
+            pid,
+            cfg(Role::Publisher, 400, 16, 100),
+            SEG_BYTES as u64,
+            Arc::new(SimSink::default()),
+        )
+        .with_stream_id(SID)
+        .with_edge_signer(Arc::new(SeedSigner));
+        let seed = MeshNode::new_seed(sid_, cfg(Role::Seed, 400, 16, 100), SEG_BYTES as u64, HashMap::new(), 0)
+            .with_stream_id(SID)
+            .with_publisher_key(pubkey());
+        sim.add(pid, publisher);
+        sim.add(sid_, seed);
+        // Phase 1: the seed catches up over a clean link BEFORE the viewer exists, so the
+        // viewer's segments can only arrive by PULL (pushes fire on new obtains only).
+        sim.connect(pid, sid_, &NetModel::link(10, 0));
+        for i in 0..K {
+            sim.produce(pid, 100 + i * 50, i, SEG_BYTES);
+        }
+        sim.run(3_000);
+
+        // Phase 2: the viewer joins. P looks best (5 ms ctrl) but its bulk is a blackhole;
+        // S is healthy at 60 ms. The viewer learns the backlog's ids the way a real late
+        // joiner does — from the chain edge (injected LiveEdge events).
+        let sink = Arc::new(SimSink::default());
+        let viewer = MeshNode::new_viewer(
+            vid,
+            cfg(Role::Viewer, 400, 16, 100),
+            SEG_BYTES as u64,
+            sink.clone(),
+            HashMap::new(),
+            0,
+        )
+        .with_stream_id(SID)
+        .with_publisher_key(pubkey());
+        sim.add(vid, viewer);
+        sim.connect_ex(vid, pid, NetModel::link(5, 0), NetModel::link(5, 0).loss(1.0));
+        sim.connect_ex(vid, sid_, NetModel::link(60, 0), NetModel::link(60, 0));
+        for i in 0..K {
+            let seg = Bytes::from(vec![(i as u8).wrapping_mul(7).wrapping_add(1); SEG_BYTES]);
+            let id = crypto::segment_id(&seg);
+            sim.inject_at(3_050, vid, EngineEvent::LiveEdge { seq: i, id });
+        }
+        sim.run(4_600); // ≈1.5 s after joining
+
+        let got = sink.delivered();
+        eprintln!("[hedge] delivered {got}/{K} within ~1.5s of a late join with a dead primary");
+        // Deterministic scenario (fixed seed): 23/24 with the hedge, 16/24 without it
+        // (panic-zone segments stall on the dead primary until the 2 s timeout, so the
+        // play head can't advance and the window can't slide). ≥20 splits the two.
+        assert!(
+            got >= 20,
+            "hedge failed: only {got}/{K} delivered — deadline-critical segments stalled \
+             on the dead primary until the pending timeout instead of hedging to the \
+             healthy second holder",
+        );
+    }
+
+    /// TARGET #3 + convergence — a radio dropout mid-stream (total outage on both
+    /// channels, association survives) must heal cleanly: the viewer snaps back to the
+    /// live edge, the delivered tail is never pruned to an EMPTY playlist (the
+    /// anchor-at-`local.highest()` guard), the honest publisher isn't banned for the
+    /// outage's timeouts, and delivery converges back to near-live afterward.
+    #[test]
+    fn partition_heals_snaps_to_live_and_keeps_the_playlist() {
+        const K: u64 = 90; // 400 ms cadence → 36 s of stream
+        // Outage 10 s → 20 s: far longer than the 6.4 s window (16 × 400 ms), so the
+        // viewer falls off the back of the window and MUST snap on heal.
+        let ctrl = NetModel::link(20, 0).outage(10_000, 20_000);
+        let bulk = NetModel::link(20, 0).outage(10_000, 20_000);
+        let (mut sim, pubid, vid, bans) = pub_viewer(5, ctrl, bulk);
+        for i in 0..K {
+            sim.produce(pubid, 100 + i * 400, i, SEG_BYTES);
+        }
+
+        // Run to just before the outage — the viewer should be following near-live.
+        sim.run(9_900);
+        let pre = sim.stats(&vid).delivered;
+        assert!(pre > 15, "viewer never got going before the outage (delivered={pre})");
+
+        // Through the outage and the heal, sampling the retention invariant: once the
+        // viewer has ever held content, its local window must never empty (an empty local
+        // store = an empty playlist under the player).
+        for t in [12_000, 16_000, 20_000, 22_000, 26_000, 30_000, 38_000, 42_000] {
+            sim.run(t);
+            let (play, head, local) = sim.node(&vid).sim_window();
+            eprintln!("[heal] t={t}ms play={play} head={head} local={local}");
+            assert!(local > 0, "t={t}ms: local window emptied (empty playlist) — play={play} head={head}");
+        }
+
+        // Converged: near the live edge again, no wrongful ban, and clearly more
+        // delivered than when the outage began.
+        let (play, head, _) = sim.node(&vid).sim_window();
+        let post = sim.stats(&vid).delivered;
+        assert!(
+            head.saturating_sub(play) <= 16 + 2,
+            "did not converge to the live edge after the heal: play={play} head={head}",
+        );
+        assert!(post > pre + 20, "no real progress after the heal: {pre} → {post}");
+        assert!(
+            !sim.node(&vid).sim_banned(&pubid) && !bans.contains(&pubid),
+            "honest publisher banned for a radio dropout",
+        );
+    }
+
+    /// CHURN under loss — a churner joins the mesh mid-stream over a lossy link (so it
+    /// plausibly holds pending AND hedge entries at viewers), then vanishes abruptly
+    /// (radio silence + PeerDisconnected). The stable viewer must keep delivering the
+    /// full stream, clean up every in-flight structure tied to the dead peer (the hedge
+    /// promote/retain paths), and end with zero leaks.
+    #[test]
+    fn abrupt_churn_under_loss_leaves_no_leaks() {
+        const K: u64 = 60;
+        let mut sim = Sim::new(9, 100);
+        let (pid, vid, cid) = (PeerId::from_u64(1), PeerId::from_u64(2), PeerId::from_u64(3));
+        let bans = BanList::new();
+
+        let publisher = MeshNode::new_live_publisher(
+            pid,
+            cfg(Role::Publisher, 400, 16, 100),
+            SEG_BYTES as u64,
+            Arc::new(SimSink::default()),
+        )
+        .with_stream_id(SID)
+        .with_edge_signer(Arc::new(SeedSigner));
+        let vsink = Arc::new(SimSink::default());
+        let viewer = MeshNode::new_viewer(vid, cfg(Role::Viewer, 400, 16, 100), SEG_BYTES as u64, vsink.clone(), HashMap::new(), 0)
+            .with_stream_id(SID)
+            .with_publisher_key(pubkey())
+            .with_ban_list(bans.clone());
+        let churner = MeshNode::new_viewer(cid, cfg(Role::Viewer, 400, 16, 100), SEG_BYTES as u64, Arc::new(SimSink::default()), HashMap::new(), 0)
+            .with_stream_id(SID)
+            .with_publisher_key(pubkey());
+        sim.add(pid, publisher);
+        sim.add(vid, viewer);
+        sim.add(cid, churner);
+
+        let lossy = NetModel::link(30, 0).loss(0.10);
+        sim.connect(pid, vid, &lossy);
+        // The churner joins P AND V at 3 s; every link involving it goes permanently
+        // dark at 8 s (radio silence — so its own late sends can't resurrect it), and
+        // both sides get the transport's PeerDisconnected.
+        let churn_link = NetModel::link(30, 0).loss(0.10).outage(8_000, u64::MAX);
+        sim.connect(pid, cid, &churn_link);
+        sim.connect(vid, cid, &churn_link);
+        sim.inject_at(8_000, pid, EngineEvent::PeerDisconnected { peer: cid });
+        sim.inject_at(8_000, vid, EngineEvent::PeerDisconnected { peer: cid });
+
+        for i in 0..K {
+            sim.produce(pid, 100 + i * 400, i, SEG_BYTES);
+        }
+        sim.run(40_000);
+
+        let st = sim.stats(&vid);
+        let (play, head, local) = sim.node(&vid).sim_window();
+        eprintln!(
+            "[churn] delivered={}/{K} pending={} reasm={} bans={} play={play} head={head} local={local} missing={:?}",
+            st.delivered, st.pending_entries, st.reasm_entries, bans.len(), vsink.missing(K),
+        );
+        // Live-mode invariants: a gap the snap abandoned (below the final play cursor)
+        // is by design — but EVERYTHING in the live window must eventually deliver
+        // (this is what the edge re-announce guarantees: a lost one-shot EdgeAnnounce
+        // used to leave an in-window segment reassembling forever, unverifiable).
+        let missing = vsink.missing(K);
+        assert!(
+            missing.iter().all(|q| *q < play),
+            "in-window segments left undelivered (missing={missing:?}, play={play}) — \
+             an id never arrived (edge re-announce broken?) or a fetch wedged",
+        );
+        assert!(st.delivered as u64 >= K - 8, "too much lost to churn+loss: {}/{K}", st.delivered);
+        assert!(head.saturating_sub(play) <= 18, "did not stay near live: play={play} head={head}");
+        assert_eq!(st.pending_entries, 0, "leaked pending entries after the churner vanished");
+        assert!(st.reasm_entries <= 1, "leaked reassemblies after the churner vanished");
+        assert_eq!(bans.len(), 0, "someone was wrongly banned during churn");
     }
 
     /// TUNING/characterization bench (prints, doesn't assert): sweep the bulk-loss rate on

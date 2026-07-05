@@ -101,6 +101,14 @@ const MAX_GOSSIP_RECORDS: usize = 64;
 const MAX_BITFIELD_BYTES: usize = 8 * 1024;
 /// `known_peers` is a stat + gossip seed, not a routing table — cap it.
 const KNOWN_PEERS_MAX: usize = 4096;
+/// Re-gossip the live window's signed edges this often. An `EdgeAnnounce` used to be
+/// sent exactly ONCE (at produce time); on a lossy control path a lost announce meant a
+/// viewer never learned that segment's id — its bytes reassembled fine but parked
+/// unverifiable forever while the picker re-fetched them in a loop (found by the netsim
+/// churn-under-loss scenario; the chain edge poll masks it only when a chain is
+/// reachable). Re-announcing is idempotent (receivers dedup via `edge_seen`, relays
+/// forward only what's new to them) and costs ~window × ~110 B per link per interval.
+const EDGE_REANNOUNCE_MS: u64 = 1_000;
 /// Reputation floor: crossing it bans the peer (choke + disconnect + BanList).
 /// 0.05 ≈ five forged segments (0.5⁵), or a long run of timeouts/abuse.
 const REPUTATION_FLOOR: f64 = 0.05;
@@ -302,6 +310,11 @@ pub struct MeshNode {
     edge_signer: Option<Arc<dyn EdgeSigner>>,
     publisher_key: Option<[u8; 32]>,
     edge_seen: HashSet<Seq>,
+    /// The publisher's recent signed edges (≤ window), re-gossiped every
+    /// [`EDGE_REANNOUNCE_MS`] so a viewer that lost the one-shot announce still learns
+    /// each segment's id (see the constant's rationale).
+    recent_edges: std::collections::VecDeque<(Seq, SegmentId, [u8; 64])>,
+    last_edge_regossip_ms: u64,
     /// Off-chain presence directory (TECH_SPEC §7.3), shared with the session: the node
     /// periodically gossips a sample of it to peers and merges what it receives, so the
     /// session can dial in-mesh-discovered peers without a per-viewer chain write.
@@ -322,6 +335,12 @@ pub struct MeshNode {
     pending_verify_bytes: u64,
     /// In-flight segment requests: seq → (peer we asked, when we asked, in `now_ms`).
     pending: HashMap<Seq, (PeerId, u64)>,
+    /// The panic-zone hedge (TECH_SPEC §8.4): ONE additional concurrent request per seq,
+    /// to a DIFFERENT peer than `pending`'s primary. The picker plans dual-holder fetches
+    /// for deadline-critical segments (`Request::redundant`); realizing them here means a
+    /// slow/dead primary no longer stalls the segment until the 2 s pending timeout —
+    /// whichever peer lands first wins, and delivery clears both entries.
+    hedge: HashMap<Seq, (PeerId, u64)>,
     rng: ChaCha8Rng,
     now_ms: u64,
     last_ping_ms: u64,
@@ -455,6 +474,8 @@ impl MeshNode {
             edge_signer: None,
             publisher_key: None,
             edge_seen: HashSet::new(),
+            recent_edges: std::collections::VecDeque::new(),
+            last_edge_regossip_ms: 0,
             presence_book: None,
             ban_list: None,
             last_presence_gossip_ms: 0,
@@ -463,6 +484,7 @@ impl MeshNode {
             pending_verify: HashMap::new(),
             pending_verify_bytes: 0,
             pending: HashMap::new(),
+            hedge: HashMap::new(),
             rng: ChaCha8Rng::seed_from_u64(me.0[0] as u64 + 1),
             now_ms: 0,
             last_ping_ms: 0,
@@ -665,6 +687,31 @@ impl MeshNode {
     pub fn sim_banned(&self, peer: &PeerId) -> bool {
         self.eng.peers.get(peer).map(|p| p.banned).unwrap_or(false)
     }
+    /// `(play_seq, head_seq, locally buffered count)` — the live-lag + retention view,
+    /// for asserting snap-to-live convergence and the never-an-empty-playlist prune
+    /// invariant after a partition heals.
+    #[cfg(any(test, feature = "netsim"))]
+    pub fn sim_window(&self) -> (Seq, Seq, usize) {
+        (self.eng.play_seq, self.eng.head_seq, self.eng.local.count())
+    }
+    /// Debug view of one seq for scenario diagnosis: `(local.has, pending-to, hedge-to,
+    /// [(peer, buffer.has, reputation, pending_bytes)])`.
+    #[cfg(any(test, feature = "netsim"))]
+    pub fn sim_seq_debug(
+        &self,
+        seq: Seq,
+    ) -> (bool, Option<PeerId>, Option<PeerId>, Vec<(PeerId, bool, f64, u64)>) {
+        (
+            self.eng.local.has(seq),
+            self.pending.get(&seq).map(|(p, _)| *p),
+            self.hedge.get(&seq).map(|(p, _)| *p),
+            self.eng
+                .peers
+                .values()
+                .map(|p| (p.id, p.buffer.has(seq), p.reputation, p.pending_bytes))
+                .collect(),
+        )
+    }
 
     fn on_event(&mut self, ev: EngineEvent) {
         match ev {
@@ -713,7 +760,15 @@ impl MeshNode {
                     .collect();
                 for seq in dropped {
                     self.pending.remove(&seq);
+                    // The hedge outlives its dead primary: promote it so its delivery is
+                    // still admitted and the timeout sweep still covers it.
+                    if let Some(h) = self.hedge.remove(&seq) {
+                        self.pending.insert(seq, h);
+                    }
                 }
+                // And drop hedge entries POINTING AT the dead peer (their primary lives on;
+                // the dead peer's budget accounting died with its PeerState).
+                self.hedge.retain(|_, (p, _)| *p != peer);
                 let keys: Vec<(PeerId, Seq)> =
                     self.reasm.keys().filter(|(p, _)| *p == peer).copied().collect();
                 for k in keys {
@@ -736,6 +791,11 @@ impl MeshNode {
                     if self.edge_seen.insert(seq) {
                         let sig = signer.sign(&edge_payload(&self.stream_id, seq, &id));
                         self.gossip_edge(seq, id, sig, None);
+                        // Remember it for the periodic re-announce (loss recovery).
+                        self.recent_edges.push_back((seq, id, sig));
+                        while self.recent_edges.len() > self.eng.cfg.window as usize {
+                            self.recent_edges.pop_front();
+                        }
                     }
                 }
                 // Push-pull: push it straight to subscribers (don't wait for their Want).
@@ -1024,6 +1084,19 @@ impl MeshNode {
             self.edge_seen.retain(|&s| s >= cutoff);
         }
 
+        // Publisher: re-announce the live window's signed edges (loss recovery — see
+        // EDGE_REANNOUNCE_MS). Receivers dedup via `edge_seen`, so a heard announce
+        // costs one decode; a MISSED one finally delivers the id that unwedges any
+        // bytes parked unverifiable in `pending_verify`.
+        if !self.recent_edges.is_empty()
+            && self.now_ms.saturating_sub(self.last_edge_regossip_ms) >= EDGE_REANNOUNCE_MS
+        {
+            self.last_edge_regossip_ms = self.now_ms;
+            for (seq, id, sig) in self.recent_edges.clone() {
+                self.gossip_edge(seq, id, sig, None);
+            }
+        }
+
         // Advertise the buffer map only on change, or at most every BUFFERMAP_INTERVAL_MS
         // (was every 100ms tick — pure overhead that scales with peer count).
         let count = self.eng.local.count();
@@ -1109,11 +1182,30 @@ impl MeshNode {
         // peer able to meet a deadline, escalate to the durable floor).
         let reqs = self.eng.plan(self.now_ms, &mut self.rng);
         for r in reqs {
+            // Bytes already reassembled but parked awaiting their id (`pending_verify` —
+            // the announce that carries it was lost) must not be re-fetched in a loop;
+            // the periodic edge re-announce delivers the id and unparks them.
+            if self.pending_verify.contains_key(&r.seq) {
+                continue;
+            }
             match r.source {
                 Source::Peer(pid) => {
-                    if self.pending.contains_key(&r.seq) {
-                        continue;
-                    }
+                    let hedging = match self.pending.get(&r.seq) {
+                        // Free seq — this Want becomes the primary.
+                        None => false,
+                        // Already in flight. The picker's panic-zone hedge (`redundant`)
+                        // plans ONE second concurrent holder — realize it (deduping it
+                        // away made the hedge a no-op end-to-end, so a slow primary
+                        // stalled every deadline-critical segment until the 2 s pending
+                        // timeout). Same-peer re-requests and a second hedge still dedup.
+                        Some((primary, _)) => {
+                            if !r.redundant || *primary == pid || self.hedge.contains_key(&r.seq)
+                            {
+                                continue;
+                            }
+                            true
+                        }
+                    };
                     // Don't waste a Want on a peer that's choking us.
                     if self.eng.peers.get(&pid).map(|p| p.choked_by).unwrap_or(false) {
                         continue;
@@ -1124,8 +1216,13 @@ impl MeshNode {
                             deadline_hint_ms: 0,
                         };
                         link.send(Channel::Ctrl, want.encode());
-                        log::info!("[mesh] → Want seq={} to {:?}", r.seq, pid);
-                        self.pending.insert(r.seq, (pid, self.now_ms));
+                        if hedging {
+                            log::info!("[mesh] → hedge Want seq={} to {:?}", r.seq, pid);
+                            self.hedge.insert(r.seq, (pid, self.now_ms));
+                        } else {
+                            log::info!("[mesh] → Want seq={} to {:?}", r.seq, pid);
+                            self.pending.insert(r.seq, (pid, self.now_ms));
+                        }
                         if let Some(p) = self.eng.peers.get_mut(&pid) {
                             p.pending_bytes =
                                 p.pending_bytes.saturating_add(self.eng.seg_bytes);
@@ -1382,7 +1479,8 @@ impl MeshNode {
         // unsolicited push (push-pull runs a little ahead of the verified edge). An
         // out-of-window spray for segments nobody asked about is dropped before it
         // can allocate anything.
-        let asked_this_peer = self.pending.get(&seq).map(|(p, _)| *p == peer).unwrap_or(false);
+        let asked_this_peer = self.pending.get(&seq).map(|(p, _)| *p == peer).unwrap_or(false)
+            || self.hedge.get(&seq).map(|(p, _)| *p == peer).unwrap_or(false);
         let in_push_window =
             seq >= self.eng.play_seq && seq <= self.eng.head_seq.saturating_add(PUSH_AHEAD);
         if !asked_this_peer && !in_push_window {
@@ -1451,9 +1549,17 @@ impl MeshNode {
     /// the picker's expected-delivery-time ranking for it.
     fn clear_pending(&mut self, seq: Seq) -> Option<(PeerId, u64)> {
         let entry = self.pending.remove(&seq);
+        let seg_bytes = self.eng.seg_bytes;
         if let Some((asked, _)) = entry {
-            let seg_bytes = self.eng.seg_bytes;
             if let Some(p) = self.eng.peers.get_mut(&asked) {
+                p.pending_bytes = p.pending_bytes.saturating_sub(seg_bytes);
+            }
+        }
+        // The hedge rode alongside the primary — release its budget too (whichever peer
+        // delivered, the other's in-flight copy is now moot; late bytes are just dropped
+        // by the reassembler admission since the seq is held).
+        if let Some((hedged, _)) = self.hedge.remove(&seq) {
+            if let Some(p) = self.eng.peers.get_mut(&hedged) {
                 p.pending_bytes = p.pending_bytes.saturating_sub(seg_bytes);
             }
         }
