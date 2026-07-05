@@ -41,6 +41,27 @@
   .hint { font-family: var(--mono); font-size: 11.5px; color: var(--faint); letter-spacing: .3px; }
   .hint b { color: var(--dim); font-weight: 590; }
 
+  /* Stream-option checkboxes (Go Live). Native OS boxes clash with the theme, so draw
+     our own: a surface well that fills with the brand gradient when checked — same
+     vocabulary as .btn (gradient + glow), .cmd (focus ring), and .hint (copy). */
+  .check-row { display: flex; gap: 10px; align-items: flex-start; margin: 12px 0; cursor: pointer; max-width: 56ch; }
+  .check-row input[type="checkbox"] { appearance: none; -webkit-appearance: none; flex: 0 0 auto; width: 18px; height: 18px; margin: 1px 0 0;
+    background: var(--surface-1); border: 1px solid var(--line-strong); border-radius: 6px;
+    display: inline-grid; place-content: center; cursor: pointer;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.04);
+    transition: border-color var(--t-control) var(--ease), background var(--t-control) var(--ease), box-shadow var(--t-control) var(--ease); }
+  .check-row:hover input[type="checkbox"] { border-color: rgba(255,92,122,.55); }
+  .check-row input[type="checkbox"]:focus-visible { outline: none; border-color: rgba(255,92,122,.55); box-shadow: 0 0 0 4px rgba(255,92,122,.14); }
+  .check-row input[type="checkbox"]::after { content: ""; width: 10px; height: 10px; transform: scale(0);
+    transition: transform var(--t-control) var(--spring);
+    background: #2a0d14; clip-path: polygon(14% 44%, 0 65%, 40% 100%, 100% 16%, 84% 0%, 38% 66%); }
+  .check-row input[type="checkbox"]:checked { background: var(--brand-grad); border-color: transparent;
+    box-shadow: 0 4px 14px -4px rgba(255,92,122,.55), inset 0 1px 0 rgba(255,255,255,.35); }
+  .check-row input[type="checkbox"]:checked::after { transform: scale(1); }
+  .check-copy { font-family: var(--mono); font-size: 11.5px; color: var(--faint); letter-spacing: .3px; line-height: 1.55; }
+  .check-copy b { color: var(--dim); font-weight: 590; }
+  .check-row:hover .check-copy b { color: var(--text); }
+
   .qr-card { display: flex; gap: 26px; align-items: center; padding: 26px; border-radius: var(--r-card);
     background: var(--surface-2); border: 1px solid var(--line);
     box-shadow: inset 0 1px 0 rgba(255,255,255,.04), 0 24px 60px -24px rgba(0,0,0,.8); text-align: left; max-width: 560px; }
@@ -67,12 +88,16 @@
   .frame .video { position: absolute; inset: 0; background:
       radial-gradient(60% 120% at 20% 10%, #2a1420, transparent 60%), radial-gradient(50% 120% at 85% 80%, #2a2018, transparent 60%), linear-gradient(120deg, #141016, #0c0a10);
     background-size: 200% 200%; animation: drift 18s var(--ease) infinite alternate; }
-  .frame video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: 1; background: transparent; display: none;
+  /* `contain`, not `cover`: a stream whose aspect differs from the frame (a vertical
+     phone stream in the 16:9 card, or any stream once the phone's portrait layout sizes
+     the frame from --vid-ar) letterboxes like a normal player instead of cropping to a
+     slice. For matching aspects the two are pixel-identical. */
+  .frame video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; z-index: 1; background: transparent; display: none;
     /* Invisible until frames actually render: the WebView paints an ugly stretched
        play-glyph placeholder on an attached-but-not-yet-playing <video>. player.js
        adds .playing on the `playing` event and removes it when the source resets. */
     opacity: 0; transition: opacity .35s var(--ease); }
-  .frame video.playing { opacity: 1; }
+  .frame video.playing { opacity: 1; background: #000; /* classic letterbox bars */ }
   @keyframes drift { to { background-position: 100% 100%, 0% 0%, 50% 50%; } }
   .frame .grain { position: absolute; inset: 0; opacity: .5; mix-blend-mode: overlay; background-image: radial-gradient(rgba(255,255,255,.06) .5px, transparent .5px); background-size: 3px 3px; }
   .frame .live-tag { position: absolute; top: 12px; left: 12px; z-index: 3; display: flex; align-items: center; gap: 7px; padding: 5px 10px 5px 9px; border-radius: var(--r-pill); background: rgba(8,10,15,.55); backdrop-filter: blur(10px); font-family: var(--mono); font-size: 11px; letter-spacing: 1.2px;

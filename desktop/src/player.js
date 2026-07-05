@@ -92,6 +92,19 @@ export function playNativeHlsWithRetry(v, url, onPlaying){
 // Tear down a native-HLS element started by playNativeHlsWithRetry (stops the retry loop too).
 export function stopNativeHls(v){ if(!v) return; clearInterval(v._retry); v._retry=null; try{ v.pause(); }catch(e){} v.removeAttribute('src'); }
 
+// Publish the playing stream's real aspect ratio as --vid-ar on <html>, so layout can
+// size the video box from the CONTENT (a vertical phone stream gets a tall box in the
+// phone's portrait watch layout) instead of assuming 16:9. Falls back to the CSS
+// default (16/9) whenever unknown; re-fires on mid-stream rendition changes (`resize`).
+export function wireAspectVar(vidId){
+  const v=document.getElementById(vidId); if(!v) return;
+  const pub=()=>{ if(v.videoWidth>0 && v.videoHeight>0) document.documentElement.style.setProperty('--vid-ar', (v.videoWidth/v.videoHeight).toFixed(4)); };
+  v.addEventListener('loadedmetadata', pub);
+  v.addEventListener('resize', pub);
+  // A fresh attach forgets the previous stream's shape until the new one is known.
+  v.addEventListener('emptied', ()=>document.documentElement.style.removeProperty('--vid-ar'));
+}
+
 // Surface real media ERRORS on-screen (the bundled DMG has no devtools). We only
 // show genuine `error` events — `stalled`/`waiting` fire routinely at the live edge
 // during normal HLS playback, so showing those would be a constant false alarm.

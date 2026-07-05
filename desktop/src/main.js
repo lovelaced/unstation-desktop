@@ -3,7 +3,7 @@ import * as sso from './sso.js';
 import { invoke, listen, NATIVE, appWindow } from './tauri.js';
 import { renderViewerHealth } from './health.js';
 import { S, go, win, hud, refreshGoLiveBadge } from './state.js';
-import { wireVideoDiag } from './player.js';
+import { wireAspectVar, wireVideoDiag } from './player.js';
 import { applyStats, applyWatchPhase, enterWatch, leaveWatch, selfWatch, startWatch } from './scenes/watch.js';
 import { enterGoLive, goLiveStart, endPublish, applyPublishState, updatePubHealth, applyPublishStats, applyPublishProgress } from './scenes/publish.js';
 import { beginPairing, pushChainIdentity, onboardingStatus, showRetry, resumeAfterSignIn, ensureSignedIn } from './scenes/onboarding.js';
@@ -63,6 +63,10 @@ document.querySelectorAll('[data-goto]').forEach(b=>b.addEventListener('click',(
 
 wireVideoDiag('pubVid','pubVidDiag', true);
 wireVideoDiag('vid','vidDiag', false);
+// The watch layout sizes the video box from the stream's REAL aspect (--vid-ar) —
+// vertical streams get a tall box on the phone instead of a cropped 16:9 slice.
+wireAspectVar('vid');
+wireAspectVar('fastVid');
 
 document.getElementById('pairedBtn').addEventListener('click', async ()=>{ if(NATIVE && invoke){ try{ await invoke('complete_signin'); }catch(e){} } go('entry'); });
 document.getElementById('tabWatch').addEventListener('click', enterWatch);
