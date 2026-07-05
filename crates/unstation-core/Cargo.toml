@@ -26,6 +26,12 @@ tokio.workspace = true
 # unaffected; the desktop/mobile shells route it through env_logger.
 log = "0.4"
 
+[features]
+# Deterministic network-impairment simulation harness (`netsim` module + the
+# `MeshNode::sim_*` step hooks). Test/bench-only — never in a production build. Enabled
+# automatically under `cfg(test)`; integration tests + the tuning bench opt in explicitly.
+netsim = []
+
 [dev-dependencies]
 criterion = "0.5"
 proptest = "1"

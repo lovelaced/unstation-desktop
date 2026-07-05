@@ -15,6 +15,11 @@ pub mod engine;
 pub mod manifest;
 pub mod media;
 pub mod node;
+/// Deterministic network-impairment simulation harness (test/bench-only): drives many
+/// real `MeshNode`s in lockstep on a virtual clock over impaired in-memory links, to
+/// harden + tune the protocol under loss/latency/jitter/reorder/bandwidth/partition.
+#[cfg(any(test, feature = "netsim"))]
+pub mod netsim;
 pub mod origin_mem;
 pub mod peer;
 pub mod picker;

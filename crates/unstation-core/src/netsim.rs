@@ -1,0 +1,469 @@
+//! Deterministic network-impairment simulation harness (test/bench-only).
+//!
+//! Drives many real [`MeshNode`]s in lockstep on a **virtual clock** over impaired
+//! in-memory links, so the full protocol (picker, reputation, reassembly, live-edge,
+//! serve pacing, fallback) can be hardened + tuned under loss / latency / jitter /
+//! bandwidth / duplication / corruption / partition — the class of conditions the
+//! instant, lossless [`crate::transport_mem`] never exercises.
+//!
+//! It is a discrete-event simulation: every inter-node send is scheduled into a
+//! virtual-time min-heap by [`ImpairedLink`] (with the impairment applied at send
+//! time), and [`Sim::run`] advances time to the next tick-or-delivery, steps the
+//! affected nodes by hand ([`MeshNode::sim_tick`]/[`MeshNode::sim_deliver`]), and loops.
+//! No wall clock, no `tokio`, no real sleeps — so a `(seed, scenario)` pair is
+//! bit-for-bit reproducible and a whole stream simulates in microseconds.
+//!
+//! The template link model (serialized-link `tx = bytes*8000/bps` + RTT) is the same
+//! one the picker-only `tests/sim.rs` already uses, lifted onto the real node loop.
+
+use crate::config::{MeshConfig, Mode, PickerWeights, Role};
+use crate::media::MediaSink;
+use crate::node::{EdgeSigner, MeshNode, NodeStats};
+use crate::signaling::BanList;
+use crate::transport::{Channel, EngineEvent, Link};
+use crate::types::{PeerId, Seq};
+use crate::crypto;
+use bytes::Bytes;
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, BinaryHeap, HashMap};
+use std::sync::{Arc, Mutex};
+
+// ---------------------------------------------------------------------------
+// Impairment model
+// ---------------------------------------------------------------------------
+
+/// Per-link, per-channel network impairment. `Default` is a perfect wire (instant,
+/// lossless, unmetered). Builders layer on adversity.
+#[derive(Clone, Debug, Default)]
+pub struct NetModel {
+    /// Base one-way latency in ms.
+    pub delay_ms: u64,
+    /// Uniform extra latency in `[0, jitter_ms]` per message — reorders naturally.
+    pub jitter_ms: u64,
+    /// Probability in `[0,1]` a message is dropped outright.
+    pub loss_prob: f64,
+    /// Probability a delivered message is also duplicated.
+    pub dup_prob: f64,
+    /// Serialized-link bandwidth in bits/sec; `0` = unmetered (no transfer time).
+    pub bandwidth_bps: u64,
+    /// Probability a delivered message has one byte flipped (exercises hash-verify /
+    /// decode-rejects-garbage). Apply mainly to the bulk channel.
+    pub corrupt_prob: f64,
+}
+
+impl NetModel {
+    /// A perfect wire: instant, lossless, unmetered.
+    pub fn perfect() -> Self {
+        Self::default()
+    }
+    /// A wire with a base latency (ms) and bandwidth (bps; `0` = unmetered).
+    pub fn link(delay_ms: u64, bandwidth_bps: u64) -> Self {
+        Self { delay_ms, bandwidth_bps, ..Self::default() }
+    }
+    pub fn loss(mut self, p: f64) -> Self {
+        self.loss_prob = p;
+        self
+    }
+    pub fn jitter(mut self, ms: u64) -> Self {
+        self.jitter_ms = ms;
+        self
+    }
+    pub fn dup(mut self, p: f64) -> Self {
+        self.dup_prob = p;
+        self
+    }
+    pub fn corrupt(mut self, p: f64) -> Self {
+        self.corrupt_prob = p;
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Discrete-event scheduler
+// ---------------------------------------------------------------------------
+
+/// One scheduled delivery. Ordered by `(deliver_at, seq)` — `seq` is a monotonic
+/// tiebreaker so same-time events resolve in a deterministic (enqueue) order.
+struct Scheduled {
+    deliver_at: u64,
+    seq: u64,
+    to: PeerId,
+    event: EngineEvent,
+}
+impl PartialEq for Scheduled {
+    fn eq(&self, o: &Self) -> bool {
+        self.deliver_at == o.deliver_at && self.seq == o.seq
+    }
+}
+impl Eq for Scheduled {}
+impl Ord for Scheduled {
+    fn cmp(&self, o: &Self) -> Ordering {
+        // Reversed so `BinaryHeap` (a max-heap) pops the *earliest* delivery first.
+        o.deliver_at.cmp(&self.deliver_at).then_with(|| o.seq.cmp(&self.seq))
+    }
+}
+impl PartialOrd for Scheduled {
+    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+/// Shared mutable simulation state — the event heap + virtual clock + one RNG for all
+/// impairment decisions (single RNG keeps a scenario deterministic given a seed, since
+/// the driver processes sends in a fixed order).
+struct NetState {
+    now_ms: u64,
+    next_seq: u64,
+    heap: BinaryHeap<Scheduled>,
+    rng: ChaCha8Rng,
+    /// Serialized-link "free at" time per directed link, so bandwidth queues rather
+    /// than teleports (a large segment's chunks stack up behind each other).
+    link_busy: HashMap<(PeerId, PeerId), u64>,
+}
+
+impl NetState {
+    fn push(&mut self, deliver_at: u64, to: PeerId, event: EngineEvent) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.heap.push(Scheduled { deliver_at, seq, to, event });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Impaired link
+// ---------------------------------------------------------------------------
+
+/// A [`Link`] that, instead of delivering instantly, schedules delivery into the shared
+/// [`NetState`] heap with its channel's [`NetModel`] applied.
+struct ImpairedLink {
+    from: PeerId,
+    to: PeerId,
+    net: Arc<Mutex<NetState>>,
+    ctrl: NetModel,
+    bulk: NetModel,
+}
+
+impl Link for ImpairedLink {
+    fn remote(&self) -> PeerId {
+        self.to
+    }
+    fn send(&self, channel: Channel, bytes: Vec<u8>) {
+        let model = match channel {
+            Channel::Ctrl => &self.ctrl,
+            Channel::Bulk => &self.bulk,
+        };
+        let mut s = self.net.lock().unwrap();
+        // Loss.
+        if model.loss_prob > 0.0 && s.rng.gen::<f64>() < model.loss_prob {
+            return;
+        }
+        let now = s.now_ms;
+        // Serialized-link bandwidth: this message can't start until the wire is free.
+        let tx_ms = if model.bandwidth_bps > 0 {
+            (bytes.len() as u64 * 8000) / model.bandwidth_bps
+        } else {
+            0
+        };
+        let start = s.link_busy.get(&(self.from, self.to)).copied().unwrap_or(0).max(now);
+        s.link_busy.insert((self.from, self.to), start + tx_ms);
+        let jitter =
+            if model.jitter_ms > 0 { s.rng.gen_range(0..=model.jitter_ms) } else { 0 };
+        let deliver_at = start + tx_ms + model.delay_ms + jitter;
+        let copies = if model.dup_prob > 0.0 && s.rng.gen::<f64>() < model.dup_prob { 2 } else { 1 };
+        for _ in 0..copies {
+            let payload = if model.corrupt_prob > 0.0 && s.rng.gen::<f64>() < model.corrupt_prob {
+                let mut b = bytes.clone();
+                if !b.is_empty() {
+                    let i = s.rng.gen_range(0..b.len());
+                    b[i] ^= 0xFF;
+                }
+                b
+            } else {
+                bytes.clone()
+            };
+            s.push(deliver_at, self.to, EngineEvent::Inbound { peer: self.from, channel, bytes: payload });
+        }
+    }
+    fn close(&self) {
+        let mut s = self.net.lock().unwrap();
+        let now = s.now_ms;
+        s.push(now, self.to, EngineEvent::PeerDisconnected { peer: self.from });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sink that models an in-order player (deterministic; no wall clock)
+// ---------------------------------------------------------------------------
+
+/// Tracks delivered segments so the play head slides like an in-order player. Deterministic
+/// (unlike `tests/*`'s `Instant`-based sinks).
+#[derive(Default)]
+pub struct SimSink {
+    segs: Mutex<BTreeSet<u64>>,
+}
+impl MediaSink for SimSink {
+    fn push_init(&self, _: Bytes) {}
+    fn push_segment(&self, seq: u64, _: Bytes) {
+        self.segs.lock().unwrap().insert(seq);
+    }
+    fn on_play_head(&self) -> u64 {
+        let s = self.segs.lock().unwrap();
+        let mut h = 0u64;
+        while s.contains(&h) {
+            h += 1;
+        }
+        h
+    }
+}
+impl SimSink {
+    /// How many distinct segments have been delivered to the player.
+    pub fn delivered(&self) -> usize {
+        self.segs.lock().unwrap().len()
+    }
+    /// The contiguous-from-0 play head (the largest gap-free prefix).
+    pub fn contiguous(&self) -> u64 {
+        self.on_play_head()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The simulation driver
+// ---------------------------------------------------------------------------
+
+/// A discrete-event driver over real [`MeshNode`]s. Add nodes, connect them with a
+/// [`NetModel`], schedule the workload, then [`run`](Sim::run) to a virtual deadline.
+pub struct Sim {
+    net: Arc<Mutex<NetState>>,
+    nodes: HashMap<PeerId, MeshNode>,
+    /// Deterministic node iteration order.
+    order: Vec<PeerId>,
+    tick_ms: u64,
+    next_tick: HashMap<PeerId, u64>,
+}
+
+impl Sim {
+    /// A fresh simulation with a seeded impairment RNG and the given node tick period.
+    pub fn new(seed: u64, tick_ms: u64) -> Self {
+        let net = NetState {
+            now_ms: 0,
+            next_seq: 0,
+            heap: BinaryHeap::new(),
+            rng: ChaCha8Rng::seed_from_u64(seed),
+            link_busy: HashMap::new(),
+        };
+        Self {
+            net: Arc::new(Mutex::new(net)),
+            nodes: HashMap::new(),
+            order: Vec::new(),
+            tick_ms,
+            next_tick: HashMap::new(),
+        }
+    }
+
+    /// Register a node under `id`. Its first tick fires at `tick_ms`.
+    pub fn add(&mut self, id: PeerId, node: MeshNode) {
+        self.order.push(id);
+        self.next_tick.insert(id, self.tick_ms);
+        self.nodes.insert(id, node);
+    }
+
+    /// Connect `a`↔`b` with one symmetric model on both channels/directions.
+    pub fn connect(&mut self, a: PeerId, b: PeerId, model: &NetModel) {
+        self.connect_ex(a, b, model.clone(), model.clone());
+    }
+
+    /// Connect `a`↔`b` with distinct control- and bulk-channel models (same both
+    /// directions). Injects the `PeerConnected` on each side immediately (virtual t=0).
+    pub fn connect_ex(&mut self, a: PeerId, b: PeerId, ctrl: NetModel, bulk: NetModel) {
+        let link_a: Arc<dyn Link> = Arc::new(ImpairedLink {
+            from: a,
+            to: b,
+            net: self.net.clone(),
+            ctrl: ctrl.clone(),
+            bulk: bulk.clone(),
+        });
+        let link_b: Arc<dyn Link> =
+            Arc::new(ImpairedLink { from: b, to: a, net: self.net.clone(), ctrl, bulk });
+        if let Some(n) = self.nodes.get_mut(&a) {
+            n.sim_deliver(EngineEvent::PeerConnected { peer: b, link: link_a });
+        }
+        if let Some(n) = self.nodes.get_mut(&b) {
+            n.sim_deliver(EngineEvent::PeerConnected { peer: a, link: link_b });
+        }
+    }
+
+    /// Schedule an arbitrary local event onto `to` at virtual time `at_ms`.
+    pub fn inject_at(&mut self, at_ms: u64, to: PeerId, event: EngineEvent) {
+        self.net.lock().unwrap().push(at_ms, to, event);
+    }
+
+    /// Schedule `Produced(seq)` of a `seg_bytes`-sized deterministic segment onto the
+    /// publisher `at_ms`.
+    pub fn produce(&mut self, publisher: PeerId, at_ms: u64, seq: Seq, seg_bytes: usize) {
+        let seg = Bytes::from(vec![(seq as u8).wrapping_mul(7).wrapping_add(1); seg_bytes]);
+        let id = crypto::segment_id(&seg);
+        self.inject_at(at_ms, publisher, EngineEvent::Produced { seq, id, bytes: seg });
+    }
+
+    /// Borrow a node for assertions.
+    pub fn node(&self, id: &PeerId) -> &MeshNode {
+        self.nodes.get(id).expect("unknown node")
+    }
+
+    /// Snapshot a node's stats.
+    pub fn stats(&self, id: &PeerId) -> NodeStats {
+        self.node(id).sim_stats()
+    }
+
+    /// Advance virtual time to `end_ms`, delivering scheduled events and firing node
+    /// ticks in `(deliver_at, seq)` / node-order — deterministically.
+    pub fn run(&mut self, end_ms: u64) {
+        loop {
+            let next_tick = self.order.iter().map(|p| self.next_tick[p]).min().unwrap_or(u64::MAX);
+            let next_event =
+                self.net.lock().unwrap().heap.peek().map(|e| e.deliver_at).unwrap_or(u64::MAX);
+            let t = next_tick.min(next_event);
+            if t == u64::MAX || t > end_ms {
+                break;
+            }
+            self.net.lock().unwrap().now_ms = t;
+            // Deliver everything due at `t` (lock only to pop — never while stepping a
+            // node, since its sends re-enter the heap through the same lock).
+            loop {
+                let due = {
+                    let mut s = self.net.lock().unwrap();
+                    match s.heap.peek() {
+                        Some(top) if top.deliver_at <= t => s.heap.pop(),
+                        _ => None,
+                    }
+                };
+                match due {
+                    Some(sc) => {
+                        if let Some(n) = self.nodes.get_mut(&sc.to) {
+                            n.sim_deliver(sc.event);
+                        }
+                    }
+                    None => break,
+                }
+            }
+            // Fire every node whose tick is due at `t`.
+            for p in self.order.clone() {
+                if self.next_tick[&p] <= t {
+                    if let Some(n) = self.nodes.get_mut(&p) {
+                        n.sim_tick(t);
+                    }
+                    *self.next_tick.get_mut(&p).unwrap() += self.tick_ms;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared scenario fixtures
+// ---------------------------------------------------------------------------
+
+/// Publisher's stream id + signing seed (edges are signed with this; viewers verify
+/// against [`pubkey`]).
+pub const SID: [u8; 32] = [7u8; 32];
+const SEED: [u8; 32] = [4u8; 32];
+
+/// Signs live-edge gossip with the scenario publisher key.
+pub struct SeedSigner;
+impl EdgeSigner for SeedSigner {
+    fn sign(&self, payload: &[u8]) -> [u8; 64] {
+        crypto::sign_sr25519(&crypto::keypair_from_seed(&SEED), payload)
+    }
+}
+
+/// The publisher's public key (viewers pass this to `with_publisher_key`).
+pub fn pubkey() -> [u8; 32] {
+    crypto::public_bytes(&crypto::keypair_from_seed(&SEED))
+}
+
+/// A live-stream `MeshConfig` with the given role, segment duration, and window.
+pub fn cfg(role: Role, seg_ms: u64, window: u32, tick_ms: u64) -> MeshConfig {
+    MeshConfig {
+        mode: Mode::Live,
+        role,
+        window,
+        tick: std::time::Duration::from_millis(tick_ms),
+        seg_ms,
+        upload_budget_bps: 100_000_000,
+        weights: PickerWeights::default(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenarios (the hardening suite grows here)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod scenarios {
+    use super::*;
+
+    const SEG_BYTES: usize = 60_000;
+
+    /// Build a 1-publisher + 1-viewer sim wired by `ctrl`/`bulk` models. Returns
+    /// `(sim, pubid, vid, shared BanList)`.
+    fn pub_viewer(seed: u64, ctrl: NetModel, bulk: NetModel) -> (Sim, PeerId, PeerId, BanList) {
+        let mut sim = Sim::new(seed, 100);
+        let pubid = PeerId::from_u64(1);
+        let vid = PeerId::from_u64(2);
+        let bans = BanList::new();
+
+        let publisher =
+            MeshNode::new_live_publisher(pubid, cfg(Role::Publisher, 400, 16, 100), SEG_BYTES as u64, Arc::new(SimSink::default()))
+                .with_stream_id(SID)
+                .with_edge_signer(Arc::new(SeedSigner));
+        let viewer =
+            MeshNode::new_viewer(vid, cfg(Role::Viewer, 400, 16, 100), SEG_BYTES as u64, Arc::new(SimSink::default()), HashMap::new(), 0)
+                .with_stream_id(SID)
+                .with_publisher_key(pubkey())
+                .with_ban_list(bans.clone());
+        sim.add(pubid, publisher);
+        sim.add(vid, viewer);
+        sim.connect_ex(pubid, vid, ctrl, bulk);
+        (sim, pubid, vid, bans)
+    }
+
+    /// TARGET #1 — an HONEST publisher on a LOSSY link must not be banned. Loss makes the
+    /// viewer miss pushed segments, so it PULLS them; on the unreliable bulk channel a
+    /// single lost 16 KiB chunk means the whole segment never completes and just times out
+    /// at the flat `PENDING_TIMEOUT_MS` (2 s). Reputation decays `×0.8` per timeout but
+    /// heals only `+0.02` per verified delivery, so on a bad-but-not-malicious link it
+    /// crosses the `0.05` floor and the peer is wrongly banned for 600 s. (Expected to
+    /// FAIL until the timeout scales with the peer's measured throughput / the
+    /// decay-vs-heal asymmetry softens.)
+    #[test]
+    fn honest_lossy_peer_is_not_wrongly_banned() {
+        let ctrl = NetModel::link(20, 0); // control plane fast + reliable (real WebRTC ctrl is reliable)
+        let bulk = NetModel::link(20, 8_000_000).loss(0.4); // fast link, but 40% bulk-chunk loss
+        let (mut sim, pubid, vid, bans) = pub_viewer(1, ctrl, bulk);
+        // A live stream the viewer keeps trying to follow (and keeps missing chunks of).
+        for i in 0..80u64 {
+            sim.produce(pubid, 100 + i * 400, i, SEG_BYTES);
+        }
+        sim.run(40_000);
+
+        let st = sim.stats(&vid);
+        let rep = sim.node(&vid).sim_reputation(&pubid);
+        eprintln!(
+            "[target#1] delivered={} peer_bytes={} pending={} rep={:?} banned={} banlist={}",
+            st.delivered,
+            st.peer_bytes,
+            st.pending_entries,
+            rep,
+            sim.node(&vid).sim_banned(&pubid),
+            bans.contains(&pubid),
+        );
+        assert!(
+            !sim.node(&vid).sim_banned(&pubid) && !bans.contains(&pubid),
+            "honest peer on a lossy link was wrongly banned — reputation={rep:?}",
+        );
+        // It should still make progress (deprioritized, not cut off).
+        assert!(st.delivered > 0, "banned/cut off the only peer, so nothing was delivered");
+    }
+}

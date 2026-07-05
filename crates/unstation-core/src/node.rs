@@ -107,6 +107,17 @@ const REPUTATION_FLOOR: f64 = 0.05;
 /// Verified deliveries slowly heal reputation, so an honest peer on a lossy link
 /// (whose timeouts are genuine) recovers instead of drifting toward the floor.
 const REPUTATION_HEAL: f64 = 0.02;
+/// A timeout is ambiguous — a dying/lying link OR just packet loss on an honest one. On
+/// the unreliable bulk channel a single lost 16 KiB chunk fails a whole segment, so an
+/// honest peer on a lossy link racks up timeouts fast; multiplicative `×0.8` decay would
+/// otherwise cross [`REPUTATION_FLOOR`] and get it 600 s SHARED-banned (and never
+/// re-dialed) purely for a bad link — the join-time "discover → 0 candidates" churn we
+/// saw on-device. So timeout decay is CLAMPED here: it still deprioritizes the peer (the
+/// picker divides expected delivery time by reputation, clamped to 0.1), but only
+/// definitive misbehavior — forged bytes ([`Penalty::HashFail`]) or protocol abuse —
+/// reaches the ban floor below this. A genuinely dead/lying peer just delivers nothing,
+/// so the picker routes around it via throughput ranking; it doesn't need banning.
+const TIMEOUT_REP_FLOOR: f64 = 0.1;
 
 /// Why a peer is being penalized. Each maps to a decay factor commensurate with how
 /// strong the evidence of misbehavior is — forged bytes are proof, a timeout might
@@ -613,6 +624,46 @@ impl MeshNode {
         self.stats.reasm_bytes = self.reasm_bytes;
         self.stats.pending_entries = self.pending.len();
         self.stats
+    }
+
+    /// Test/simulation hooks for the deterministic impairment harness (`crate::netsim`).
+    /// Gated so production never compiles them. They expose the otherwise-private step
+    /// methods so a discrete-event driver can advance many nodes in lockstep on a virtual
+    /// clock (instead of the wall-clock `run()` above): `on_event`/`on_tick` never touch a
+    /// real timer, so stepping them by hand is bit-for-bit deterministic.
+    #[cfg(any(test, feature = "netsim"))]
+    pub fn sim_tick(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+        self.on_tick();
+    }
+    /// Deliver one event at the node's current virtual time — matches `run()`, where
+    /// `on_event` does not advance the clock (only `sim_tick` does).
+    #[cfg(any(test, feature = "netsim"))]
+    pub fn sim_deliver(&mut self, ev: EngineEvent) {
+        self.on_event(ev);
+    }
+    /// Snapshot the invariant-bearing stats without consuming the node (the fields `run()`
+    /// fills on exit).
+    #[cfg(any(test, feature = "netsim"))]
+    pub fn sim_stats(&self) -> NodeStats {
+        let mut s = self.stats.clone();
+        s.delivered = self.delivered_total;
+        s.known_peers = self.known_peers.len();
+        s.peers = self.eng.peers.len();
+        s.reasm_entries = self.reasm.len();
+        s.reasm_bytes = self.reasm_bytes;
+        s.pending_entries = self.pending.len();
+        s
+    }
+    /// A peer's current reputation in `[0,1]`, or `None` if we don't know the peer.
+    #[cfg(any(test, feature = "netsim"))]
+    pub fn sim_reputation(&self, peer: &PeerId) -> Option<f64> {
+        self.eng.peers.get(peer).map(|p| p.reputation)
+    }
+    /// Whether we've banned this peer (reputation crossed the floor).
+    #[cfg(any(test, feature = "netsim"))]
+    pub fn sim_banned(&self, peer: &PeerId) -> bool {
+        self.eng.peers.get(peer).map(|p| p.banned).unwrap_or(false)
     }
 
     fn on_event(&mut self, ev: EngineEvent) {
@@ -1429,6 +1480,8 @@ impl MeshNode {
                 p.reputation *= why.factor();
                 if matches!(why, Penalty::Timeout) {
                     p.strikes += 1;
+                    // Timeouts deprioritize but never alone ban — see TIMEOUT_REP_FLOOR.
+                    p.reputation = p.reputation.max(TIMEOUT_REP_FLOOR);
                 }
                 let crossed = p.reputation < REPUTATION_FLOOR && !p.banned;
                 if crossed {
