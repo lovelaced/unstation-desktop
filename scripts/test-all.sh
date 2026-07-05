@@ -47,6 +47,8 @@ step "real-WebRTC mesh over loopback" \
   env UNSTATION_BIND_ADDR=127.0.0.1 cargo test -p transport-libdc --test mesh_loopback -- --ignored --nocapture
 step "real-WebRTC wide fan-out (1 publisher → 8 viewers, 2 leave mid-stream)" \
   env UNSTATION_BIND_ADDR=127.0.0.1 cargo test -p transport-libdc --test fanout_loopback -- --ignored --nocapture
+step "real-transport impairment (bulk burst over a shaped userspace relay, no sudo)" \
+  env UNSTATION_BIND_ADDR=127.0.0.1 cargo test -p transport-libdc --test impaired_relay -- --ignored --nocapture
 step "scale sim (metrics)" \
   cargo test -p unstation-core --test scale_sim -- --nocapture
 step "netsim impairment hardening (matrix + relay + fuzz over lossy/laggy links)" \

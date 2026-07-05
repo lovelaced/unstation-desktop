@@ -24,3 +24,6 @@ log = "0.4"
 parity-scale-codec.workspace = true
 bytes.workspace = true
 env_logger = "0.11"
+rand.workspace = true
+# The impaired-relay test needs a userspace UDP socket to shape ICE/media traffic.
+tokio = { workspace = true, features = ["net"] }
