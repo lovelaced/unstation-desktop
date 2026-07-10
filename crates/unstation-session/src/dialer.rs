@@ -11,11 +11,18 @@ use unstation_core::types::PeerId;
 const BACKOFF_BASE: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// A dial that hasn't produced a connection within this window is abandoned
-/// (closed + backed off) so the transport will accept a fresh attempt. Sized ABOVE the
-/// statement-store signaling round trip observed on-device (offer→answer took 9–15 s on
-/// a degraded chain RPC): at the old 12 s we repeatedly abandoned dials moments before
-/// their answer landed, turning a slow join into a multi-cycle one.
-pub const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
+/// (closed + backed off) so the transport will accept a fresh attempt.
+///
+/// Sized ABOVE the worst statement-store signaling round trip observed on-device, not
+/// above the typical one: on WiFi offer→answer is 2–15 s, but on cellular right after a
+/// network switch (half-dead RPC websocket riding out TCP timeouts) it measured
+/// **33–81 s** — and every abandoned dial threw away an answer that was still in
+/// flight, so the phone could never connect over 4G at all. The timeout's only job is
+/// to free the transport's glare guard from truly dead attempts; retry pacing belongs
+/// to the backoff and candidate freshness to the presence TTL, so a generous window
+/// costs nothing on a healthy network (the connect clears it) and is the difference
+/// between "slow join" and "never joins" on a degraded one.
+pub const DIAL_TIMEOUT: Duration = Duration::from_secs(90);
 /// Forget a peer's dial history after this long with no attempts — the map stays
 /// bounded across hours of churn without a separate sweeper.
 const HISTORY_TTL: Duration = Duration::from_secs(300);
