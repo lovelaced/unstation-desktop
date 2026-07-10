@@ -450,11 +450,28 @@ impl Session {
         let (ev_tx, mut ev_rx) = unbounded_channel::<TransportEvent>();
         transport.set_event_sink(ev_tx);
         tokio::spawn(async move {
+            // Live connections, from the transport's own lifecycle events. The maintainer
+            // MUST consult this before dialing or abandoning: re-dialing a peer that is
+            // already connected is silently ignored by the transport's glare guard, but
+            // it used to leave a phantom "in-flight" entry in the dialer — and 12 s later
+            // the stalled sweep would `close()` that peer, KILLING the live, working
+            // connection. On-device that was a perpetual ~25 s connect→kill→re-dial loop
+            // (27 re-dials of an already-connected publisher in one 6-minute watch):
+            // playback drained during every dark window, the UI flapped LIVE→Connecting,
+            // and viewers drifted >6 s behind live. Never dial into, never abandon, a
+            // connected peer.
+            let mut connected: std::collections::HashSet<PeerId> = std::collections::HashSet::new();
             loop {
                 // Abandon dials that hung mid-handshake (lost signaling / ICE failure):
                 // close them so a fresh dial isn't blocked by the duplicate guard, and
                 // let the backoff schedule own the retry.
                 for p in dialer.stalled() {
+                    if connected.contains(&p) {
+                        // Not a stall — a dial recorded against a peer that (already or
+                        // meanwhile) connected. Clear it instead of closing the link.
+                        dialer.record_connected(&p);
+                        continue;
+                    }
                     log::info!("[session] dial to {p:?} timed out — abandoning");
                     transport.close(p);
                     dialer.record_failed(p);
@@ -467,6 +484,9 @@ impl Session {
                     for cand in session.discover_peers(16).await {
                         if budget == 0 || transport.peer_count() >= target_degree {
                             break;
+                        }
+                        if connected.contains(&cand.peer_id) {
+                            continue; // already live — see the header comment
                         }
                         if !dialer.should_dial(&cand.peer_id) {
                             continue;
@@ -486,8 +506,8 @@ impl Session {
                 // the periodic tick (ages stalled dials + retries after backoff).
                 tokio::select! {
                     ev = ev_rx.recv() => match ev {
-                        Some(TransportEvent::Connected(p)) => dialer.record_connected(&p),
-                        Some(TransportEvent::Disconnected(p)) => dialer.record_failed(p),
+                        Some(TransportEvent::Connected(p)) => { connected.insert(p); dialer.record_connected(&p); }
+                        Some(TransportEvent::Disconnected(p)) => { connected.remove(&p); dialer.record_failed(p); }
                         None => break,
                     },
                     _ = sleep(MAINTAIN_TICK) => {}
@@ -495,8 +515,8 @@ impl Session {
                 // Coalesce any burst before re-evaluating.
                 while let Ok(ev) = ev_rx.try_recv() {
                     match ev {
-                        TransportEvent::Connected(p) => dialer.record_connected(&p),
-                        TransportEvent::Disconnected(p) => dialer.record_failed(p),
+                        TransportEvent::Connected(p) => { connected.insert(p); dialer.record_connected(&p); }
+                        TransportEvent::Disconnected(p) => { connected.remove(&p); dialer.record_failed(p); }
                     }
                 }
             }

@@ -11,8 +11,11 @@ use unstation_core::types::PeerId;
 const BACKOFF_BASE: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// A dial that hasn't produced a connection within this window is abandoned
-/// (closed + backed off) so the transport will accept a fresh attempt.
-pub const DIAL_TIMEOUT: Duration = Duration::from_secs(12);
+/// (closed + backed off) so the transport will accept a fresh attempt. Sized ABOVE the
+/// statement-store signaling round trip observed on-device (offer→answer took 9–15 s on
+/// a degraded chain RPC): at the old 12 s we repeatedly abandoned dials moments before
+/// their answer landed, turning a slow join into a multi-cycle one.
+pub const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 /// Forget a peer's dial history after this long with no attempts — the map stays
 /// bounded across hours of churn without a separate sweeper.
 const HISTORY_TTL: Duration = Duration::from_secs(300);
