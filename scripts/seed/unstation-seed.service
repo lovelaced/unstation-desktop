@@ -1,0 +1,35 @@
+# unstation-seed — headless volunteer seed/relay for one Unstation stream.
+# Installed by scripts/seed/install.sh (which substitutes the @PLACEHOLDERS@);
+# hand-edit /etc/systemd/system/unstation-seed.service and `systemctl daemon-reload
+# && systemctl restart unstation-seed` to change the stream or budget later.
+[Unit]
+Description=Unstation volunteer seed (@STREAM@)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=unstation
+Group=unstation
+ExecStart=/usr/local/bin/unstation-node @STREAM@
+Restart=always
+RestartSec=5
+
+# The seed's persistent statement-store identity lives here (auto-provisioned on the
+# public testnet on first run — keep the dir to keep the identity).
+Environment=UNSTATION_NODE_KEY_DIR=/var/lib/unstation-seed
+# Uplink to donate, in Mbps (aggregate across the viewers this seed serves).
+Environment=UNSTATION_NODE_BUDGET_MBPS=@BUDGET@
+Environment=RUST_LOG=info
+
+# Containment: the seed needs nothing but its key dir and the network.
+StateDirectory=unstation-seed
+ReadWritePaths=/var/lib/unstation-seed
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+# Rolling live window + buffers; a healthy seed sits far below this.
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target

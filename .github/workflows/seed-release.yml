@@ -1,0 +1,109 @@
+name: Seed release (linux binaries)
+
+# Build the headless volunteer seed/relay (`unstation-node`) for Linux and attach the
+# binaries + SHA256SUMS to a GitHub Release, so volunteers can run a seed with the
+# one-line installer (scripts/seed/install.sh) instead of compiling the chain SDK
+# stack themselves.
+#
+# Like every SDK-backed job, this only runs when the private chain SDK is configured
+# (vars.SDK_REPO + secrets.SDK_TOKEN) — it skips cleanly on forks. Trigger by pushing
+# a `seed-v*` tag, or dispatch it against an existing tag to rebuild artifacts.
+
+on:
+  push:
+    tags: ["seed-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing seed tag to (re)build artifacts for (e.g. seed-v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    if: ${{ vars.SDK_REPO != '' }}
+    strategy:
+      matrix:
+        include:
+          # ubuntu-22.04 keeps the glibc baseline at 2.35, so the binary runs on any
+          # 22.04+ VPS image. The arm64 runner covers the cheap ARM instances
+          # (Hetzner CAX, AWS Graviton) volunteers actually rent.
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: unstation-desktop
+      - name: Check out the chain SDK as the expected sibling
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SDK_REPO }}
+          ref: ${{ vars.SDK_REF || 'main' }}
+          token: ${{ secrets.SDK_TOKEN || github.token }}
+          path: useragent-kit
+      - name: Install native build deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake pkg-config libssl-dev clang
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: unstation-desktop/crates/unstation-node
+      - name: Build (release)
+        working-directory: unstation-desktop/crates/unstation-node
+        run: cargo build --release
+      - name: Package
+        working-directory: unstation-desktop
+        run: |
+          BIN=$(find . -path "*release/unstation-node" -type f | head -1)
+          OUT="unstation-node-${{ matrix.arch }}-linux"
+          cp "$BIN" "$OUT"
+          strip "$OUT" || true
+          sha256sum "$OUT" > "$OUT.sha256"
+          ./"$OUT" --help || true # smoke: the binary at least starts on this runner
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seed-${{ matrix.arch }}
+          path: |
+            unstation-desktop/unstation-node-${{ matrix.arch }}-linux
+            unstation-desktop/unstation-node-${{ matrix.arch }}-linux.sha256
+
+  release:
+    name: attach to release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve tag
+        id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          git rev-parse "refs/tags/$TAG" >/dev/null # fail fast on a bad dispatch input
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+      - name: Combined checksums
+        working-directory: dist
+        run: cat ./*.sha256 > SHA256SUMS && rm ./*.sha256
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "Unstation seed $TAG" \
+              --notes "Headless volunteer seed/relay binaries. Install with scripts/seed/install.sh — see crates/unstation-node/README.md. Verify downloads against SHA256SUMS."
+          fi
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber dist/*
