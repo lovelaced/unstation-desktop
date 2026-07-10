@@ -4,6 +4,7 @@
 
 import { S } from './state.js';
 import { STRINGS } from './copy.js';
+import { invoke, NATIVE } from './tauri.js';
 
 export function isVideoPlaying(id){ const v=document.getElementById(id); return !!(v && v.readyState>=3 && !v.paused && !v.ended); }
 
@@ -32,7 +33,15 @@ export function startWatchWatchdog(){
     const msg = S.lastPeers>0 ? STRINGS.watchNoVideoFromPeer : STRINGS.watchUnreachable;
     setCatchup('<div class="giveup"><div>'+msg+'</div><div class="giveup-row">'
       +'<button class="btn" id="retryWatchBtn" type="button">'+STRINGS.tryAgain+'</button>'
-      +'<button class="btn ghost" id="giveUpLeaveBtn" type="button">'+STRINGS.leave+'</button></div></div>'); }, 45000));
+      +'<button class="btn ghost" id="giveUpLeaveBtn" type="button">'+STRINGS.leave+'</button></div></div>');
+    // Giving up means GOING QUIET, not just showing a card: the session used to keep
+    // its active signaling poll + discovery + dialing running behind the card
+    // indefinitely — on cellular that pinned the radio and (with the screen held on)
+    // produced real thermal warnings on-device. Stop the watch outright; "Try again"
+    // re-runs a full start_watch from S.watchTarget, so nothing is lost.
+    if(window.__keepAwake) window.__keepAwake(false);
+    if(NATIVE && invoke) invoke('stop_watch').catch(()=>{});
+  }, 45000));
 }
 
 // Attach the viewer to its local HLS server. The mesh delivers segments a moment

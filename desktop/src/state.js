@@ -118,7 +118,12 @@ export function go(state){ clearSeq(); S.curState=state;
   setActiveTab(state);
   player.classList.toggle('show', isLive); hud.classList.toggle('show', isLive);
   document.getElementById('catchup').style.display = state==='catchup'?'grid':'none';
-  if(isLive){ if(window.__keepAwake) window.__keepAwake(true); const mode=state==='seed'?'seed':'p2p'; win.dataset.health=mode; setAmbient(false); document.getElementById('modeText').textContent=state==='seed'?STRINGS.modeLiveHelper:STRINGS.modeLiveP2p; showScene(''); if(!NATIVE){ setTitle('hardfork.dot',true); renderViewerHealth({peers: state==='seed'?6:23, playing:true, mode, publisher:'hardfork.dot'}); } return; }
+  // Hold the screen awake only while video actually plays (live/seed) — NOT in
+  // catchup/connecting. A watch stuck on "Connecting…" used to pin the screen on
+  // indefinitely (keep-awake + active polling + cellular radio = the thermal-warning
+  // combo measured on-device); if a stall outlasts the system screen timeout, dimming
+  // is the correct behavior.
+  if(isLive){ if(window.__keepAwake) window.__keepAwake(state!=='catchup'); const mode=state==='seed'?'seed':'p2p'; win.dataset.health=mode; setAmbient(false); document.getElementById('modeText').textContent=state==='seed'?STRINGS.modeLiveHelper:STRINGS.modeLiveP2p; showScene(''); if(!NATIVE){ setTitle('hardfork.dot',true); renderViewerHealth({peers: state==='seed'?6:23, playing:true, mode, publisher:'hardfork.dot'}); } return; }
   setAmbient(state==='entry'||state==='onboarding'||state==='ended'||state==='settings'); win.dataset.net='closed'; if(state!=='finding') setTitle('Unstation',false);
   if(state==='finding'){ showScene('finding'); if(findingHook) findingHook(); return; } showScene(state); }
 
