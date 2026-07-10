@@ -35,3 +35,7 @@ dist/
 # Only the README is published; specs, notes, and other markdown stay local.
 *.md
 !README.md
+
+# Local cross-builds of the seed binary (Docker; see crates/unstation-node/README.md)
+/target-linux-*
+/dist-seed
