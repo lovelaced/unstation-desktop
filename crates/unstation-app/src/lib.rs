@@ -1020,7 +1020,13 @@ async fn stop_watch(app: AppHandle, state: State<'_, AppState>) -> Result<(), St
     // (UNSTATION_SEED=0).
     let Some(sess) = state.watch.lock().unwrap().take() else { return Ok(()) };
     let healthy = sess.health.load(Ordering::Relaxed) == 0;
-    if !(seed_by_default() && healthy) {
+    // A watch that never actually delivered has NOTHING to seed (empty cache) — and its
+    // health reads "full" only because the stall detector requires peers > 0, so a watch
+    // that never connected looks healthy. Converting those made every failed/given-up
+    // watch an eternal background seed: discovery + signaling churn forever, measured
+    // on-device as ~1 core of CPU and continuous radio wakeups while showing nothing.
+    let delivered = sess.stats.borrow().delivered > 0;
+    if !(seed_by_default() && healthy && delivered) {
         let _ = sess.node_tx.send(EngineEvent::Stop);
         for t in sess.tasks {
             t.abort();
