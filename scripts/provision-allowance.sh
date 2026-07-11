@@ -26,6 +26,17 @@ le32() { local v=$1; printf '%02x%02x%02x%02x' $((v & 255)) $(((v >> 8) & 255)) 
 VALUE="0x$(le32 "$COUNT")$(le32 "$SIZE")"
 
 echo "[provision] granting statement allowance to 0x${ACCT} (count=${COUNT}, size=${SIZE}) on ${NODE_WS}"
-npx --yes @polkadot/api-cli@latest --ws "$NODE_WS" --sudo --seed "//Alice" \
-  tx.system.setStorage "[[\"$KEY\",\"$VALUE\"]]"
-echo "[provision] done"
+# Retry: concurrent provisioners (parallel e2e tests) race on Alice's nonce — the
+# loser's extrinsic dies with "1014: Priority is too low". A short backoff and a
+# fresh nonce fetch resolve it; anything still failing after 3 tries is real.
+for attempt in 1 2 3; do
+  if npx --yes @polkadot/api-cli@latest --ws "$NODE_WS" --sudo --seed "//Alice" \
+       tx.system.setStorage "[[\"$KEY\",\"$VALUE\"]]"; then
+    echo "[provision] done"
+    exit 0
+  fi
+  echo "[provision] attempt ${attempt} failed (nonce race with a parallel provisioner?) — retrying" >&2
+  sleep $((attempt * 2))
+done
+echo "[provision] failed after 3 attempts" >&2
+exit 1

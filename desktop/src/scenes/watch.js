@@ -7,7 +7,7 @@ import { invoke, NATIVE } from '../tauri.js';
 import { S, go, win, setTitle, clearSeq, addSeqTimer, setTtff, registerFindingHook } from '../state.js';
 import { renderViewerHealth } from '../health.js';
 import { STRINGS } from '../copy.js';
-import { setVideo, isVideoPlaying, startWatchWatchdog, clearWatchUi, setCatchup, hideCatchup, cancelStallLadder, getBehindSuffix } from '../player.js';
+import { setVideo, isVideoPlaying, startWatchWatchdog, clearWatchUi, setCatchup, hideCatchup, cancelStallLadder, stopWatchQuietly, getBehindSuffix } from '../player.js';
 import { updateSettingsStatus } from './settings.js';
 import { ensureSignedIn } from './onboarding.js';
 import { shareName } from './publish.js';
@@ -69,16 +69,17 @@ function endWatchToEnded(){
   cleanupVideo();
   go('ended');
 }
+// A live "time to first frame" only makes sense while a frame is plausibly imminent.
+// On the forward phases it stays visible; when no frame is coming (`unreachable`, an
+// invite-only stream without its key) a counter climbing past 100s reads as broken,
+// not reassuring — hide it.
+function showTtff(on){ const el=document.getElementById('ttff'); if(el&&el.parentElement) el.parentElement.style.visibility=on?'':'hidden'; }
 export function applyWatchPhase(p){
   if(!NATIVE || !p || !p.phase) return;
   const finding = S.curState==='finding';
   const watching = ['live','seed','catchup'].includes(S.curState);
   if(!finding && !watching) return; // stale event after leaving the watch
   if(finding && !ttffSynced && typeof p.since_ms==='number'){ ttffStart=performance.now()-p.since_ms; ttffSynced=true; }
-  // A live "time to first frame" only makes sense while a frame is plausibly imminent.
-  // On the forward phases keep it visible; on `unreachable` there IS no imminent frame,
-  // so a counter climbing past 100s reads as broken, not reassuring — hide it.
-  const showTtff=(on)=>{ const el=document.getElementById('ttff'); if(el&&el.parentElement) el.parentElement.style.visibility=on?'':'hidden'; };
   switch(p.phase){
     case 'resolving':   if(finding){ showTtff(true); setFindingStep('resolve'); } break;
     case 'verifying':   if(finding){ showTtff(true); setFindingStep('verify'); } break;
@@ -108,9 +109,38 @@ export function applyWatchPhase(p){
   }
 }
 
+/* ---- mesh-status errors that concern the watch journey (forwarded by main.js) ---- */
+// Two codes matter here. `invite_key_missing` is TERMINAL for this watch: without the
+// invite link's key the video can never decrypt, so there is no Try again — tell the
+// story, then go quiet exactly like the stall ladder's give-up rung. `verify_failed`
+// is transient: a candidate broadcaster was skipped and the search keeps running.
+export function applyMeshError(p){
+  if(!NATIVE || !p || !p.code) return;
+  const finding = S.curState==='finding';
+  const watching = ['live','seed','catchup'].includes(S.curState);
+  if(p.code==='invite_key_missing'){
+    if(finding){
+      findingCopy(STRINGS.inviteNeededEyebrow, STRINGS.inviteNeededTitle, STRINGS.inviteNeededSub);
+      showTtff(false);          // no frame is coming — a climbing counter reads as broken
+      ttffFrozen=true; clearSeq(); // stop the counter's rAF + any queued step timers
+      stopWatchQuietly();
+    } else if(watching){
+      // Mid-watch (e.g. the broadcaster restarted invite-only): the catchup card
+      // carries the story with Leave as the only action — the give-up card's Try
+      // again is deliberately absent, since retrying can't conjure the key.
+      setCatchup('<div class="giveup"><div>'+STRINGS.inviteNeededTitle+'. '+STRINGS.inviteNeededSub+'</div><div class="giveup-row">'
+        +'<button class="btn ghost" id="giveUpLeaveBtn" type="button">'+STRINGS.leave+'</button></div></div>');
+      stopWatchQuietly();
+    }
+  } else if(p.code==='verify_failed' && finding){
+    // Keep the steps running — only the sub line tells what just happened.
+    const el=document.getElementById('progSub'); if(el) el.textContent=STRINGS.verifySkippedSub;
+  }
+}
+
 /* real stats from the engine */
 export function applyStats(s){ if(!s)return; S.lastPeers = s.peers||0; const seed=s.mode==='seed'; win.dataset.health=seed?'seed':'p2p';
-  const mt=document.getElementById('modeText'); if(mt) mt.textContent=(seed?STRINGS.modeLiveHelper:STRINGS.modeLiveP2p)+getBehindSuffix();
+  const mt=document.getElementById('modeText'); if(mt) mt.textContent=(seed?STRINGS.modeLiveBackup:STRINGS.modeLiveP2p)+getBehindSuffix();
   renderViewerHealth({peers:S.lastPeers, playing:isVideoPlaying('vid'), mode:s.mode});
   if(S.curState==='settings') updateSettingsStatus(); }
 
@@ -146,7 +176,7 @@ export async function startWatch(target, key){
   // Fast connect is unlocked per-stream by the broadcaster's invite, never by default.
   S.fastEligible = !!S.fastFor && S.fastFor === shareName(target);
   go('finding');
-  if(NATIVE && invoke){ try{ const info=await invoke('start_watch',{ target, key: S.watchKey }); document.getElementById('mPub').textContent=info.publisher; S.lastPeers=0; setTitle(target,true); applyStats({peers:0,rho:0,mode:'p2p',from_seed:0,from_chain:0,latency_s:0,ice:'connecting'}); startWatchWatchdog(); setVideo(info.hls_url); }catch(err){ console.error('start_watch failed',err); findingCopy('Problem','Couldn’t start watching',((err&&err.message)||(''+err))); clearSeq(); } }
+  if(NATIVE && invoke){ try{ const info=await invoke('start_watch',{ target, key: S.watchKey }); document.getElementById('mPub').textContent=info.publisher; S.lastPeers=0; setTitle(target,true); applyStats({peers:0,rho:0,mode:'p2p',from_seed:0,from_chain:0,latency_s:0,ice:'connecting'}); startWatchWatchdog(); setVideo(info.hls_url); }catch(err){ console.error('start_watch failed',err); findingCopy(STRINGS.watchStartFailedEyebrow,STRINGS.watchStartFailedTitle,((err&&err.message)||(''+err))); clearSeq(); } }
   else { setTimeout(()=>go('live'),1200); }
 }
 

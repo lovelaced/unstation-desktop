@@ -33,9 +33,11 @@ pub fn verify_segment(bytes: &[u8], id: &SegmentId) -> bool {
 /// Signing-context label for manifests + live-edge announcements.
 pub const MANIFEST_CONTEXT: &[u8] = b"unstation-manifest";
 
-/// Verify an sr25519 signature over `msg` by `pubkey`. Returns false on any
-/// malformed input rather than panicking.
-pub fn verify_sr25519(pubkey: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
+/// Verify an sr25519 signature over `msg` by `pubkey` under an explicit signing
+/// `context`. Returns false on any malformed input rather than panicking. The
+/// context is schnorrkel's domain separation: a signature made under one label
+/// (manifest/edge vs recruitment) can never verify under another.
+pub fn verify_sr25519_ctx(context: &[u8], pubkey: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
     let pk = match schnorrkel::PublicKey::from_bytes(pubkey) {
         Ok(p) => p,
         Err(_) => return false,
@@ -44,8 +46,14 @@ pub fn verify_sr25519(pubkey: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
         Ok(s) => s,
         Err(_) => return false,
     };
-    let ctx = schnorrkel::signing_context(MANIFEST_CONTEXT);
+    let ctx = schnorrkel::signing_context(context);
     pk.verify(ctx.bytes(msg), &s).is_ok()
+}
+
+/// Verify an sr25519 signature over `msg` by `pubkey` under [`MANIFEST_CONTEXT`]
+/// (manifests + live-edge announcements).
+pub fn verify_sr25519(pubkey: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
+    verify_sr25519_ctx(MANIFEST_CONTEXT, pubkey, msg, sig)
 }
 
 /// Deterministic keypair from a 32-byte seed. The shipping publisher signs via
@@ -60,9 +68,15 @@ pub fn public_bytes(kp: &schnorrkel::Keypair) -> [u8; 32] {
     kp.public.to_bytes()
 }
 
-pub fn sign_sr25519(kp: &schnorrkel::Keypair, msg: &[u8]) -> [u8; 64] {
-    let ctx = schnorrkel::signing_context(MANIFEST_CONTEXT);
+/// Sign `msg` under an explicit signing `context` (see [`verify_sr25519_ctx`]).
+pub fn sign_sr25519_ctx(kp: &schnorrkel::Keypair, context: &[u8], msg: &[u8]) -> [u8; 64] {
+    let ctx = schnorrkel::signing_context(context);
     kp.sign(ctx.bytes(msg)).to_bytes()
+}
+
+/// Sign `msg` under [`MANIFEST_CONTEXT`] (manifests + live-edge announcements).
+pub fn sign_sr25519(kp: &schnorrkel::Keypair, msg: &[u8]) -> [u8; 64] {
+    sign_sr25519_ctx(kp, MANIFEST_CONTEXT, msg)
 }
 
 // ---- signaling-envelope confidentiality (Tier 0 privacy) ------------------------------

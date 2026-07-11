@@ -21,8 +21,9 @@ export function resumeAfterSignIn(){
   go('entry');
 }
 
-/* QR — real, scannable (the `qrcode` lib). Encodes the SSO pairing payload;
-   until host-papp provides the real payload (SSO-2) this renders a placeholder URI. */
+/* QR — real, scannable (the `qrcode` lib). The live pairing payload arrives via
+   sso.signIn's onPairing callback (see beginPairing below); the placeholder URI
+   only renders at module load (pre-pairing) and in browser preview. */
 export async function renderQr(payload){
   try {
     const svg = await QRCode.toString(payload || 'polkadot://unstation/pair?v=1', {
@@ -32,7 +33,7 @@ export async function renderQr(payload){
     document.getElementById('qrBox').innerHTML = svg;
   } catch(e){ console.error('qr render failed', e); }
 }
-window.__renderPairingQr = renderQr;   // SSO-2 calls this with the live pairing payload
+window.__renderPairingQr = renderQr;   // Android-shim seam: renders the live pairing payload
 renderQr();
 
 // Real Polkadot-app pairing (native only): show the live pairing QR, advance on approval.
@@ -45,6 +46,29 @@ export function onboardingStatus(txt, show=true){
   if(t) t.textContent = txt;
 }
 export function showRetry(show){ const r=document.getElementById('allowRetry'); if(r) r.style.display = show ? 'flex' : 'none'; }
+
+// "Taking a while?" affordance: if the QR sits unscanned for 60s (codes expire after
+// ~2 minutes), offer a one-tap fresh code instead of letting the user scan a dead one.
+// The #scanHint div is created on demand (additive DOM — the Android shim only touches
+// `.qr-copy p`, so this is seam-safe).
+let scanHintTimer = 0;
+function showScanHint(show){
+  let el = document.getElementById('scanHint');
+  if(!el){
+    if(!show) return;
+    const status = document.getElementById('pairStatus');
+    if(!status || !status.parentNode) return;
+    el = document.createElement('div');
+    el.id = 'scanHint';
+    el.style.cssText = 'margin-top:10px;font-size:12.5px;color:var(--faint);display:flex;gap:10px;align-items:center;justify-content:center;flex-wrap:wrap;';
+    el.innerHTML = 'Taking a while? Codes expire after a couple of minutes. <button type="button" class="btn ghost" id="freshCodeBtn">Get a fresh code</button>';
+    status.parentNode.insertBefore(el, status.nextSibling);
+    el.querySelector('#freshCodeBtn').addEventListener('click', ()=>{ showScanHint(false); try{ sso.abort(); }catch(e){} beginPairing(); });
+  }
+  el.style.display = show ? 'flex' : 'none';
+}
+function armScanHint(){ clearTimeout(scanHintTimer); scanHintTimer = setTimeout(()=>showScanHint(true), 60000); }
+function disarmScanHint(){ clearTimeout(scanHintTimer); scanHintTimer = 0; showScanHint(false); }
 
 // Sign-in is required to watch or publish — every mesh write (presence, signaling,
 // edge) needs the paired statement-store allowance. Soft-gate the entry points:
@@ -73,15 +97,16 @@ export async function beginPairing(){
       payload => { renderQr(payload); if (window.__onPairingPayload) window.__onPairingPayload(payload); },
       s => {
         console.log('[sso] pairingStatus:', s.step, s);
-        if(s.step==='pairing') setStatus('Waiting for you to scan…');
-        else if(s.step==='pending') setStatus('Finishing sign-in' + (s.stage ? (' · ' + s.stage) : '') + '…');
-        else if(s.step==='finished') setStatus('Linked ✓');
-        else if(s.step==='pairingError') setStatus('Error: ' + (s.message || 'pairing failed'));
+        if(s.step==='pairing'){ setStatus('Waiting for you to scan…'); armScanHint(); }
+        else if(s.step==='pending'){ setStatus('Finishing sign-in' + (s.stage ? (' · ' + s.stage) : '') + '…'); disarmScanHint(); }
+        else if(s.step==='finished'){ setStatus('Linked ✓'); disarmScanHint(); }
+        else if(s.step==='pairingError'){ setStatus('Error: ' + (s.message || 'pairing failed')); disarmScanHint(); }
       }
     );
     console.log('[sso] signIn result:', res);
+    disarmScanHint();
     if(res && res.ok){
-      setStatus('Linked ✓ — one more step on your phone');
+      setStatus('Linked ✓ · one more step on your phone');
       // Let the phone leave its pairing screen before we request the allowance:
       // firing it instantly races the pairing-complete transition and the
       // approval prompt flashes away before it can be acted on.
@@ -92,7 +117,7 @@ export async function beginPairing(){
       // onboarding screen so the QR + "I've scanned it" remain for a retry.
     }
     else if(explain){ explain.textContent = 'Sign-in didn’t finish' + (res && res.error ? (' (' + res.error + ')') : '') + '. You can Skip for now and try again later.'; }
-  } catch(e){ console.error('[sso] beginPairing threw', e); setStatus('Error: ' + ((e && e.message) || e)); }
+  } catch(e){ console.error('[sso] beginPairing threw', e); disarmScanHint(); setStatus('Error: ' + ((e && e.message) || e)); }
 }
 
 // Bridge the paired statement-store allowance to the Rust signer: extract the

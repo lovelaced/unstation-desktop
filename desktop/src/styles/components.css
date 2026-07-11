@@ -12,16 +12,19 @@
   @keyframes drift1 { to { transform: translate(14%, 10%) scale(1.12); } }
   @keyframes drift2 { to { transform: translate(-12%, -8%) scale(1.1); } }
   body.paused .ambient .glow { animation-play-state: paused; }
-  /* Finding scene — one calm motif (a slow expanding ring + steady brand dot)
-     instead of the old constellation flood. */
+  /* Finding scene — a static brand mark. The view's ONE animated element is the
+     active step's blinking dot (one pulse per view; the progress dot is the
+     informative one, so the orb stays still). */
   .finding-orb { position: relative; width: 54px; height: 54px; display: grid; place-items: center; margin-bottom: 4px; }
-  .finding-orb::before { content: ""; position: absolute; inset: 0; border-radius: 50%; border: 1px solid var(--brand); opacity: .5; animation: orbring 2.4s var(--ease) infinite; }
+  .finding-orb::before { content: ""; position: absolute; inset: 0; border-radius: 50%; border: 1px solid var(--brand); opacity: .35; }
   .finding-orb::after { content: ""; width: 10px; height: 10px; border-radius: 50%; background: var(--brand-grad); box-shadow: 0 0 16px rgba(255,92,122,.6); }
-  @keyframes orbring { 0% { transform: scale(.5); opacity: .6; } 100% { transform: scale(1.5); opacity: 0; } }
 
   .scene { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 22px; padding: 40px; text-align: center; opacity: 0; transform: scale(.985) translateY(6px); pointer-events: none; transition: opacity .5s var(--ease), transform .6s var(--spring); z-index: 2; }
   .scene.show { opacity: 1; transform: none; pointer-events: auto; }
-  .eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: 2.4px; text-transform: uppercase; color: var(--faint); }
+  /* Scene kicker: quiet sentence-case text, deliberately NOT the templated
+     small-caps/letter-spaced "eyebrow" look. Class name is load-bearing (the
+     Android shim styles .eyebrow) — restyle, never rename. */
+  .eyebrow { font-size: 13px; color: var(--dim); }
   h1.display { margin: 0; font-family: var(--display); font-weight: 700; letter-spacing: -.005em; line-height: 1.02; font-size: clamp(31px, 5vw, 48px); }
   .sub { margin: 0; color: var(--dim); font-size: 15.5px; line-height: 1.5; max-width: 32ch; }
 
@@ -89,9 +92,12 @@
       radial-gradient(60% 120% at 20% 10%, #2a1420, transparent 60%), radial-gradient(50% 120% at 85% 80%, #2a2018, transparent 60%), linear-gradient(120deg, #141016, #0c0a10);
     background-size: 200% 200%; animation: drift 18s var(--ease) infinite alternate; }
   /* `contain`, not `cover`: a stream whose aspect differs from the frame (a vertical
-     phone stream in the 16:9 card, or any stream once the phone's portrait layout sizes
-     the frame from --vid-ar) letterboxes like a normal player instead of cropping to a
-     slice. For matching aspects the two are pixel-identical. */
+     phone stream in the 16:9 card) letterboxes like a normal player instead of cropping
+     to a slice. For matching aspects the two are pixel-identical. The --vid-ar variable
+     player.js publishes on <html> is consumed by the ANDROID portrait layout
+     (unstation-android/ui/android.css, .frame height rule) to size the box from the
+     content; desktop keeps the full-stage frame + letterbox, which renders identically
+     on the black stage. */
   .frame video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; z-index: 1; background: transparent; display: none;
     /* Invisible until frames actually render: the WebView paints an ugly stretched
        play-glyph placeholder on an attached-but-not-yet-playing <video>. player.js
@@ -100,9 +106,13 @@
   .frame video.playing { opacity: 1; background: #000; /* classic letterbox bars */ }
   @keyframes drift { to { background-position: 100% 100%, 0% 0%, 50% 50%; } }
   .frame .grain { position: absolute; inset: 0; opacity: .5; mix-blend-mode: overlay; background-image: radial-gradient(rgba(255,255,255,.06) .5px, transparent .5px); background-size: 3px 3px; }
+  /* The viewport is sacred while video plays: the grain + scanline textures are
+     pre-play set dressing only, never laid over actual frames. */
+  .frame:has(video.playing) .grain, .frame:has(video.playing)::after { display: none; }
+  /* No flicker animation here: the tag's .live-dot pulse is the watch view's ONE
+     animated element (one pulse per view — decoration never competes with it). */
   .frame .live-tag { position: absolute; top: 12px; left: 12px; z-index: 3; display: flex; align-items: center; gap: 7px; padding: 5px 10px 5px 9px; border-radius: var(--r-pill); background: rgba(8,10,15,.55); backdrop-filter: blur(10px); font-family: var(--mono); font-size: 11px; letter-spacing: 1.2px;
-    text-shadow: -0.6px 0 rgba(255,90,90,.5), 0.6px 0 rgba(90,200,255,.5); animation: livecue 5s steps(1,end) infinite; }
-  @keyframes livecue { 0%, 96%, 100% { opacity: 1; } 97% { opacity: .55; } 98% { opacity: 1; } 99% { opacity: .7; } }
+    text-shadow: -0.6px 0 rgba(255,90,90,.5), 0.6px 0 rgba(90,200,255,.5); }
   /* Fast-tier badge: honest label that this feed is the unverified, direct low-latency path. */
   .frame .fast-badge { position: absolute; top: 12px; right: 12px; z-index: 3; padding: 5px 10px; border-radius: var(--r-pill);
     background: rgba(8,10,15,.55); backdrop-filter: blur(10px); font-family: var(--mono); font-size: 10.5px; letter-spacing: .4px;
@@ -110,7 +120,8 @@
   /* Faint CRT scanlines over the video — a quiet "this is a transmission" texture. */
   .frame::after { content: ""; position: absolute; inset: 0; z-index: 1; pointer-events: none; opacity: .35; mix-blend-mode: multiply;
     background: repeating-linear-gradient(180deg, rgba(0,0,0,.10) 0 1px, transparent 1px 3px); }
-  .frame .scrim { position: absolute; inset: auto 0 0 0; height: 46%; z-index: 2; background: var(--scrim-bottom); }
+  /* Just enough gradient for HUD legibility — not a 46% curtain over the picture. */
+  .frame .scrim { position: absolute; inset: auto 0 0 0; height: 26%; z-index: 2; background: var(--scrim-bottom); opacity: .8; }
   .frame .catchup { position: absolute; inset: 0; display: none; place-items: center; z-index: 3; background: rgba(5,7,11,.4); backdrop-filter: blur(2px); font-family: var(--mono); font-size: 12.5px; letter-spacing: .4px; }
   .frame .catchup .spin { width: 15px; height: 15px; margin-right: 9px; border: 2px solid rgba(255,255,255,.25); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; display: inline-block; vertical-align: middle; }
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -127,6 +138,10 @@
   /* Native full-bleed frame: the HUD overlays the frame bottom — lift the pill above it. */
   body.native #player .sound-pill { bottom: 88px; }
   .live-dot { width: 7px; height: 7px; border-radius: 50%; background: #ff5f57; box-shadow: 0 0 8px #ff5f57; animation: pulse 1.6s var(--ease) infinite; }
+  /* ONE pulse per view. The pulse keyframe is reserved for the single most
+     important live indicator in each view: the LIVE dot while watching/broadcasting,
+     the await dot while an operation is in flight, the catchup spinner while
+     stalled. Status dots elsewhere say their piece with static color only. */
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
 
   .hud { position: absolute; left: 0; right: 0; bottom: 0; z-index: 4; display: flex; gap: 10px; justify-content: center; align-items: center; padding: 18px; pointer-events: none; opacity: 0; transform: translateY(8px); transition: opacity .5s var(--ease), transform .5s var(--spring); }
@@ -203,15 +218,14 @@
   /* Fast-tier toggle: amber when on, a soft pulse while connecting. */
   .hud .fast-btn .fast-ico { font-size: 14px; line-height: 1; }
   .hud .fast-btn.on { color: #ffd27a; border-color: rgba(255,180,60,.5); background: rgba(255,180,60,.12); }
-  .hud .fast-btn.pending { opacity: .8; animation: fastpulse 1.1s ease-in-out infinite; }
-  @keyframes fastpulse { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
+  .hud .fast-btn.pending { opacity: .65; } /* static dim while connecting — the LIVE dot owns the view's pulse */
 
   /* Viewer "your connection" popup — plain-language health, no P2P jargon. */
   .health-row { display: flex; align-items: flex-start; gap: 13px; margin-bottom: 18px; }
   .health-badge { width: 13px; height: 13px; border-radius: 50%; margin-top: 4px; flex: 0 0 auto; background: var(--faint); transition: all .4s var(--ease); }
   .health-badge[data-h="good"], .pill .health-dot[data-h="good"] { background: var(--ok); box-shadow: 0 0 12px var(--ok); }
   .health-badge[data-h="ok"], .pill .health-dot[data-h="ok"] { background: var(--seed); box-shadow: 0 0 12px var(--seed); }
-  .health-badge[data-h="wait"], .pill .health-dot[data-h="wait"] { background: var(--faint); animation: pulse 1.4s var(--ease) infinite; }
+  .health-badge[data-h="wait"], .pill .health-dot[data-h="wait"] { background: var(--faint); } /* static: color carries the state */
   .health-verdict { font-size: 17px; font-weight: 600; letter-spacing: .1px; }
   .health-note { font-size: 12.5px; color: var(--dim); line-height: 1.5; margin-top: 3px; max-width: 44rem; }
   .vmetrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 14px 18px; }
@@ -224,7 +238,7 @@
   .ph-row { display: flex; align-items: flex-start; gap: 11px; }
   .ph-dot { width: 11px; height: 11px; border-radius: 50%; margin-top: 4px; flex: 0 0 auto; background: var(--faint); transition: all .4s var(--ease); }
   .ph-dot[data-h="live"] { background: var(--ok); box-shadow: 0 0 12px var(--ok); }
-  .ph-dot[data-h="wait"] { background: var(--accent-2); box-shadow: 0 0 10px var(--accent-2); animation: pulse 1.5s var(--ease) infinite; }
+  .ph-dot[data-h="wait"] { background: var(--accent-2); box-shadow: 0 0 10px var(--accent-2); } /* static: #pubWaiting's await dot owns the console's pulse */
   .ph-status { font-size: 15px; font-weight: 600; }
   .ph-note { font-size: 12px; color: var(--dim); line-height: 1.45; margin-top: 2px; }
   .ph-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
@@ -235,8 +249,10 @@
   /* Settings status rows — live dot + text. */
   .set-status { display: inline-flex; align-items: center; gap: 8px; }
   .set-status .sdot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); flex: 0 0 auto; }
-  .set-status .sdot[data-h="good"] { background: var(--ok); box-shadow: 0 0 10px var(--ok); }
-  .set-status .sdot[data-h="wait"] { background: var(--accent-2); box-shadow: 0 0 8px var(--accent-2); }
+  /* Seven of these sit side by side in Settings: solid color only, no glow —
+     a wall of glowing dots reads as a mixing desk, not a status list. */
+  .set-status .sdot[data-h="good"] { background: var(--ok); }
+  .set-status .sdot[data-h="wait"] { background: var(--accent-2); }
   /* Go Live console: video hero (fills the stage) + a side rail for ingest, share,
      and the explicit End control — mirrors the watch player's "video is the hero". */
   .pub-live { display: flex; flex-direction: row; align-items: stretch; gap: 18px; width: 100%; height: 100%; }

@@ -19,6 +19,7 @@ const isMobile = () => window.__unstationPlatformType === 'mobile' || document.b
   explain('lendExplain', STRINGS.lendExplain);
   explain('camQExplain', STRINGS.camQExplain);
   explain('fastSetExplain', STRINGS.fastSetExplain);
+  explain('helpersExplain', STRINGS.helpersExplain);
 
   const cap=document.getElementById('lendCap');
   if(cap){
@@ -36,6 +37,9 @@ const isMobile = () => window.__unstationPlatformType === 'mobile' || document.b
   if(q){
     q.value = localStorage.getItem('camQuality') || '720';
     if(![...q.options].some(o=>o.value===q.value)) q.value='720';
+    // localStorage is the whole contract: the Android shim reads `camQuality` on
+    // __onPublishStarted and passes it to camera_start({quality}) — so this DOES
+    // take effect (at the next go-live), no backend push needed here.
     q.addEventListener('change', ()=>{ localStorage.setItem('camQuality', q.value); });
   }
 
@@ -59,14 +63,48 @@ const isMobile = () => window.__unstationPlatformType === 'mobile' || document.b
       render();
     });
   }
+
+  // Volunteer relays: whether a broadcast may recruit volunteer seeds to help carry
+  // it. Broadcaster-relevant on BOTH platforms (phones go live too), so unlike fast
+  // connect the row is never hidden. Default on; origin-shield forces the effective
+  // value on in the backend regardless of this preference.
+  const ht=document.getElementById('helpersToggle');
+  if(ht){
+    const render=()=>{
+      const off = localStorage.getItem('useHelpers')==='off';
+      const set=(id,t)=>{ const el=document.getElementById(id); if(el) el.textContent=t; };
+      set('setHelpers', off ? STRINGS.helpersOff : STRINGS.helpersOn);
+      const d=document.getElementById('setHelpersDot'); if(d) d.dataset.h = off ? '' : 'good';
+      ht.textContent = off ? 'Turn on' : 'Turn off';
+    };
+    render();
+    ht.addEventListener('click', ()=>{
+      const off = localStorage.getItem('useHelpers')==='off';
+      localStorage.setItem('useHelpers', off ? 'on' : 'off');
+      if(NATIVE && invoke) invoke('set_use_helpers', { allowed: off }).catch(()=>{});
+      render();
+    });
+  }
 }
+
+// Chain write health (U2), sampled on each settings open: failures that grew since
+// the LAST open, or a dropped subscription while signed in, mean the pass is granted
+// but not actually working — show it degraded with the Grant access recovery button.
+let lastPassFailures = null, passDegraded = false;
 
 // Settings → Network + Connection health, reflecting real state.
 export function updateSettingsStatus(){
   const set=(id,t)=>{ const el=document.getElementById(id); if(el) el.textContent=t; };
   // Network pass = the statement-store allowance that makes sign-in + mesh work.
-  set('setAllow', S.chainReady ? 'Granted' : 'Not granted'); const ad=document.getElementById('setAllowDot'); if(ad) ad.dataset.h = S.chainReady ? 'good' : 'wait';
-  const gb=document.getElementById('grantAccessBtn'); if(gb) gb.style.display = S.chainReady ? 'none' : '';
+  const ad=document.getElementById('setAllowDot');
+  const gb=document.getElementById('grantAccessBtn');
+  if(S.chainReady && passDegraded){
+    set('setAllow', STRINGS.settingsPassDegraded); if(ad) ad.dataset.h='wait';
+    if(gb) gb.style.display='';
+  } else {
+    set('setAllow', S.chainReady ? 'Granted' : 'Not granted'); if(ad) ad.dataset.h = S.chainReady ? 'good' : 'wait';
+    if(gb) gb.style.display = S.chainReady ? 'none' : '';
+  }
   // Backup copy = the on-chain copy that lets viewers still find the stream if the
   // broadcaster drops out. Signed by the (optional) Bulletin allowance when granted.
   const bd=document.getElementById('setBackupDot');
@@ -113,7 +151,16 @@ export async function openSettings(){
   // Reflect the LIVE connection state — the mesh-status event is one-shot, so read the
   // current subscription status each time Settings opens rather than trusting stale state.
   if(NATIVE && invoke){ try{ S.chainState = await invoke('chain_status'); }catch(e){} }
+  // Same beat: has the network pass actually been WORKING since the last open?
+  if(NATIVE && invoke){
+    try{
+      const h = await invoke('chain_health');
+      const grew = lastPassFailures!=null && h.write_failures>lastPassFailures;
+      lastPassFailures = h.write_failures;
+      passDegraded = grew || (!h.subscribed && S.chainReady);
+    }catch(e){}
+  }
   let signedIn = false; try { signedIn = await sso.awaitSession(); } catch(e){}
-  el.textContent = S.chainReady ? 'Signed in' : (signedIn ? 'Paired — network access pending' : 'Not signed in');
+  el.textContent = S.chainReady ? 'Signed in' : (signedIn ? 'Paired · network access pending' : 'Not signed in');
   updateSettingsStatus();
 }

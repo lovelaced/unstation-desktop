@@ -15,7 +15,7 @@
 //! `OriginOfRecord`/Bulletin impl land in M1/M2.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -34,6 +34,8 @@ use useragent_native::chain::statement_store as ss;
 
 mod bulletin;
 pub use bulletin::BulletinOrigin;
+pub mod sso_pair;
+pub mod volunteer;
 
 /// The host's signing secret (32-byte seed or 64-byte sr25519 secret), retained when
 /// the identity is initialized so we can sign the stream manifest with the SAME key
@@ -71,14 +73,22 @@ fn identity_secret_bytes() -> Option<Vec<u8>> {
     ss::secret_key_bytes().map(|b| b.to_vec())
 }
 
-/// Sign `payload` with the host identity (the same key as presence/statements) — for
-/// the stream manifest. Uses the manifest signing context, so
-/// [`unstation_core::manifest::SignedManifest::verify`] accepts it. `None` if no
-/// identity has been initialized.
-pub fn sign_with_identity(payload: &[u8]) -> Option<[u8; 64]> {
+/// Sign `payload` with the host identity (the same key as presence/statements) under
+/// an explicit sr25519 signing context — the generalization behind
+/// [`sign_with_identity`] (manifest/edge) and the volunteer recruitment signature
+/// ([`unstation_core::volunteer::RECRUIT_CONTEXT`]). `None` if no identity has been
+/// initialized.
+pub fn sign_with_identity_ctx(context: &'static [u8], payload: &[u8]) -> Option<[u8; 64]> {
     let secret = identity_secret_bytes()?;
     let kp = keypair_from_secret(&secret).ok()?;
-    Some(unstation_core::crypto::sign_sr25519(&kp, payload))
+    Some(unstation_core::crypto::sign_sr25519_ctx(&kp, context, payload))
+}
+
+/// Sign `payload` with the host identity — for the stream manifest. Uses the manifest
+/// signing context, so [`unstation_core::manifest::SignedManifest::verify`] accepts
+/// it. `None` if no identity has been initialized.
+pub fn sign_with_identity(payload: &[u8]) -> Option<[u8; 64]> {
+    sign_with_identity_ctx(unstation_core::crypto::MANIFEST_CONTEXT, payload)
 }
 
 /// The host's **personhood** public key (the statement-store account) — the manifest's
@@ -154,6 +164,69 @@ pub fn wait_ready(timeout: Duration) -> bool {
     ss::wait_until_subscribed(timeout)
 }
 
+/// Outcome of [`probe_submit_ready`] — can this identity actually WRITE statements?
+pub enum SubmitReadiness {
+    Ready,
+    /// The chain answered and rejected us: the key has no statement-store allowance
+    /// (never signed in / slot revoked). Carries the last chain error verbatim.
+    NoAllowance(String),
+    /// Never got a definitive answer (endpoint down, WS errors, timeout).
+    Unreachable(String),
+}
+
+/// Probe whether the initialized identity can actually WRITE a statement — the thing
+/// [`wait_ready`] deliberately does not check (it only confirms the read subscription).
+/// A key without an on-chain allowance connects fine and then has every presence and
+/// signaling write rejected, which a headless node must surface at boot instead of
+/// soft-failing forever. Retries every 2s until `timeout` (a freshly granted allowance
+/// needs ~1 block to land, so keep this >= 30s). Blocking (sync WS I/O) — call from
+/// `spawn_blocking` on an async runtime.
+pub fn probe_submit_ready(timeout: Duration) -> SubmitReadiness {
+    let Some(pubkey) = ss::public_key_bytes() else {
+        return SubmitReadiness::Unreachable("no identity initialized".into());
+    };
+    // A per-identity probe topic: harmless, tiny, and last-write-wins on re-probes.
+    let mut input = b"unstation/readiness/".to_vec();
+    input.extend_from_slice(&pubkey);
+    let topic = unstation_core::crypto::blake2b256(&input);
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_err;
+    loop {
+        match ss::submit_fixed_topic(topic, &[topic], b"ready", 0) {
+            Ok(()) => return SubmitReadiness::Ready,
+            Err(e) => last_err = e.to_string(),
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    if last_err.to_ascii_lowercase().contains("noallowance") {
+        SubmitReadiness::NoAllowance(last_err)
+    } else {
+        SubmitReadiness::Unreachable(last_err)
+    }
+}
+
+/// Running count of failed chain writes (presence/signaling/edge/durable submits) in
+/// this process. A long-running node's heartbeat surfaces this so an allowance that
+/// stops working AFTER boot (slot revoked on the phone, allowance exhausted) shows up
+/// as a climbing number instead of only as log spam.
+static SUBMIT_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+pub fn chain_write_failures() -> u64 {
+    SUBMIT_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Counted wrapper around `ss::submit_fixed_topic` — all of this crate's statement
+/// writes go through here so failures tick [`chain_write_failures`].
+fn submit_counted(topic: [u8; 32], data: &[u8], prio: u32) -> Result<(), String> {
+    ss::submit_fixed_topic(topic, &[topic], data, prio).map_err(|e| {
+        SUBMIT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        e.to_string()
+    })
+}
+
 /// Per-**device** mesh `PeerId`: a process-random routing id used for presence,
 /// signaling-envelope addressing, dial targeting, and self-filtering — **not** a
 /// signing key and **not** the personhood/statement-store pubkey.
@@ -207,6 +280,10 @@ fn err<E: std::fmt::Display>(e: E) -> unstation_core::Error {
     unstation_core::Error::Signaling(e.to_string())
 }
 
+/// A decoded presence record paired with its statement's chain-verified proof signer
+/// (`None` when no signer was recoverable) — see [`ChainSignaling::read_presence_signed`].
+pub type SignedPresence = (Presence, Option<[u8; 32]>);
+
 /// [`Signaling`] implemented over the People-chain statement store.
 ///
 /// Cheap to clone; the keypair + live connection live in the process-global SDK client
@@ -254,28 +331,21 @@ impl ChainSignaling {
     fn recipient_enc_key(&self, to: &PeerId) -> Option<[u8; 32]> {
         self.enc_keys.lock().unwrap_or_else(|e| e.into_inner()).get(&to.0).copied()
     }
-}
 
-impl Signaling for ChainSignaling {
-    fn publish_presence(&self, p: Presence) -> BoxFuture<'static, unstation_core::Result<()>> {
-        // Announce into our discovery shard (TECH_SPEC §7.2).
-        let topic = discovery_topic(&self.stream, shard_for(&p.peer_id, self.n_shards));
-        let data = PresenceRecord::from(&p).encode();
-        Box::pin(async move {
-            // SDK statement-store calls are blocking (sync WS I/O) — keep them off
-            // the async reactor.
-            tokio::task::spawn_blocking(move || ss::submit_fixed_topic(topic, &[topic], &data, 0))
-                .await
-                .map_err(err)?
-                .map_err(err)
-        })
-    }
-
-    fn read_presence(
+    /// Like [`Signaling::read_presence`], but keeps each statement's PROOF SIGNER — the
+    /// sr25519 account whose signature the chain verified (against its allowance) when
+    /// it accepted the statement. `None` for statements without a recoverable signer.
+    ///
+    /// This is deliberately NOT the record's `Presence::publisher` field: that is
+    /// self-asserted inside the payload, so anyone can put any key there — while the
+    /// proof signer cannot be forged without the account's secret. Origin-shield's
+    /// allowlist keys off THIS value; using the payload field would let an attacker
+    /// impersonate a recruited volunteer and harvest the shielded publisher's IP.
+    pub fn read_presence_signed(
         &self,
         topic: TopicId,
         max: usize,
-    ) -> BoxFuture<'static, unstation_core::Result<Vec<Presence>>> {
+    ) -> BoxFuture<'static, unstation_core::Result<Vec<SignedPresence>>> {
         Box::pin(async move {
             let statements =
                 tokio::task::spawn_blocking(move || ss::rpc_get_broadcasts(&[topic]))
@@ -287,12 +357,38 @@ impl Signaling for ChainSignaling {
             for st in statements.into_iter().take(max) {
                 // Drop anything that isn't a well-formed presence record.
                 if let Ok(rec) = PresenceRecord::decode(&mut &st.data[..]) {
-                    out.push(rec.into());
+                    out.push((rec.into(), st.proof_pubkey));
                 }
             }
             log::debug!("[sig] read_presence → {raw} raw statement(s), {} presence", out.len());
             Ok(out)
         })
+    }
+}
+
+impl Signaling for ChainSignaling {
+    fn publish_presence(&self, p: Presence) -> BoxFuture<'static, unstation_core::Result<()>> {
+        // Announce into our discovery shard (TECH_SPEC §7.2).
+        let topic = discovery_topic(&self.stream, shard_for(&p.peer_id, self.n_shards));
+        let data = PresenceRecord::from(&p).encode();
+        Box::pin(async move {
+            // SDK statement-store calls are blocking (sync WS I/O) — keep them off
+            // the async reactor.
+            tokio::task::spawn_blocking(move || submit_counted(topic, &data, 0))
+                .await
+                .map_err(err)?
+                .map_err(err)
+        })
+    }
+
+    fn read_presence(
+        &self,
+        topic: TopicId,
+        max: usize,
+    ) -> BoxFuture<'static, unstation_core::Result<Vec<Presence>>> {
+        // One decode path: the signed read does the work, the trait view drops the signer.
+        let signed = self.read_presence_signed(topic, max);
+        Box::pin(async move { Ok(signed.await?.into_iter().map(|(p, _)| p).collect()) })
     }
 
     fn send_signal(
@@ -305,7 +401,7 @@ impl Signaling for ChainSignaling {
         let topic = signaling_topic(&self.stream, &to);
         let data = chat_codec::encode_signal(&msg);
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || ss::submit_fixed_topic(topic, &[topic], &data, 0))
+            tokio::task::spawn_blocking(move || submit_counted(topic, &data, 0))
                 .await
                 .map_err(err)?
                 .map_err(err)
@@ -403,14 +499,15 @@ pub fn identity_enc_public() -> Option<[u8; 32]> {
     identity_enc_keypair().map(|(_, public)| public)
 }
 
-/// Seal a signaling message to `recipient_enc_pub`. `None` if no identity is initialized
-/// (nothing to seal with) — the caller then declines to publish rather than leak.
-fn encode_envelope(from: PeerId, msg: &SignalMsg, recipient_enc_pub: &[u8; 32]) -> Option<Vec<u8>> {
+/// Seal an arbitrary `plaintext` to `recipient_enc_pub` in the `ENVELOPE_SEALED`
+/// framing: `0x02 ‖ sender X25519 pub (clear) ‖ sealed body`. The one framing helper
+/// behind both the signaling envelope ([`encode_envelope`]) and volunteer recruitment
+/// delivery — the body is generic, so new sealed payloads never fork the framing.
+/// `None` if no identity is initialized (nothing to seal with) — the caller then
+/// declines to publish rather than leak.
+pub fn seal_to(recipient_enc_pub: &[u8; 32], plaintext: &[u8]) -> Option<Vec<u8>> {
     let (secret, public) = identity_enc_keypair()?;
-    let mut body = Vec::with_capacity(32 + 96);
-    body.extend_from_slice(&from.0);
-    body.extend_from_slice(&chat_codec::encode_signal(msg));
-    let sealed = unstation_core::crypto::seal(recipient_enc_pub, &secret, &body);
+    let sealed = unstation_core::crypto::seal(recipient_enc_pub, &secret, plaintext);
     let mut out = Vec::with_capacity(1 + 32 + sealed.len());
     out.push(ENVELOPE_SEALED);
     out.extend_from_slice(&public);
@@ -418,15 +515,33 @@ fn encode_envelope(from: PeerId, msg: &SignalMsg, recipient_enc_pub: &[u8; 32]) 
     Some(out)
 }
 
-/// Open a sealed envelope. Returns `(from, msg, sender_enc_pub)` — the sender key so the
-/// reader can cache it and seal replies. `None` on any malformed/undecryptable input.
-fn decode_envelope(bytes: &[u8]) -> Option<(PeerId, SignalMsg, [u8; 32])> {
+/// Open a [`seal_to`]-framed blob addressed to us. Returns `(sender_enc_pub, plaintext)`
+/// — the sender key so the reader can cache it and seal replies. `None` on any
+/// malformed/undecryptable input (or no local identity).
+pub fn open_sealed(bytes: &[u8]) -> Option<([u8; 32], Vec<u8>)> {
     if bytes.first() != Some(&ENVELOPE_SEALED) || bytes.len() < 1 + 32 {
         return None;
     }
     let sender_enc_pub: [u8; 32] = bytes[1..33].try_into().ok()?;
     let (secret, _) = identity_enc_keypair()?;
-    let body = unstation_core::crypto::open(&sender_enc_pub, &secret, &bytes[33..])?;
+    let plaintext = unstation_core::crypto::open(&sender_enc_pub, &secret, &bytes[33..])?;
+    Some((sender_enc_pub, plaintext))
+}
+
+/// Seal a signaling message to `recipient_enc_pub` (the [`seal_to`] framing over a
+/// `from ‖ chat_codec(msg)` body). `None` if no identity is initialized.
+fn encode_envelope(from: PeerId, msg: &SignalMsg, recipient_enc_pub: &[u8; 32]) -> Option<Vec<u8>> {
+    let mut body = Vec::with_capacity(32 + 96);
+    body.extend_from_slice(&from.0);
+    body.extend_from_slice(&chat_codec::encode_signal(msg));
+    seal_to(recipient_enc_pub, &body)
+}
+
+/// Open a sealed signaling envelope: [`open_sealed`] + the `SignalMsg` body parse.
+/// Returns `(from, msg, sender_enc_pub)` — the sender key so the reader can cache it
+/// and seal replies. `None` on any malformed/undecryptable input.
+fn decode_envelope(bytes: &[u8]) -> Option<(PeerId, SignalMsg, [u8; 32])> {
+    let (sender_enc_pub, body) = open_sealed(bytes)?;
     if body.len() < 32 {
         return None;
     }
@@ -478,7 +593,7 @@ impl ChainSignaling {
             list.push(envelope);
             (encode_bundle(list), self.prio.fetch_add(1, Ordering::SeqCst))
         };
-        tokio::task::spawn_blocking(move || ss::submit_fixed_topic(topic, &[topic], &data, prio))
+        tokio::task::spawn_blocking(move || submit_counted(topic, &data, prio))
             .await
             .map_err(err)?
             .map_err(err)
@@ -539,7 +654,7 @@ impl ChainSignaling {
         };
         let data = encode_bundle(&[envelope]);
         let prio = self.prio.fetch_add(1, Ordering::SeqCst);
-        tokio::task::spawn_blocking(move || ss::submit_fixed_topic(topic, &[topic], &data, prio))
+        tokio::task::spawn_blocking(move || submit_counted(topic, &data, prio))
             .await
             .map_err(err)?
             .map_err(err)
@@ -579,7 +694,7 @@ impl ChainSignaling {
         let topic = edge_topic(&self.stream);
         let raw: Vec<(u64, [u8; 32])> = entries.iter().map(|(s, id)| (*s, id.0)).collect();
         let data = raw.encode();
-        tokio::task::spawn_blocking(move || ss::submit_fixed_topic(topic, &[topic], &data, 0))
+        tokio::task::spawn_blocking(move || submit_counted(topic, &data, 0))
             .await
             .map_err(err)?
             .map_err(err)
@@ -598,7 +713,7 @@ impl ChainSignaling {
         let raw: Vec<(u64, Vec<u8>)> =
             entries.into_iter().map(|(s, cid)| (s, cid.into_bytes())).collect();
         let data = raw.encode();
-        tokio::task::spawn_blocking(move || ss::submit_fixed_topic(topic, &[topic], &data, 0))
+        tokio::task::spawn_blocking(move || submit_counted(topic, &data, 0))
             .await
             .map_err(err)?
             .map_err(err)
@@ -644,6 +759,17 @@ impl ChainSignaling {
     }
 }
 
+/// Install a fixed, VALID sr25519 identity secret for tests, no network — and return
+/// the installed bytes. `IDENTITY_SECRET` is a process-global `OnceLock` shared across
+/// test threads, so every test installs the SAME value (whoever wins the race, the
+/// secret is identical) and signing/sealing tests never fight over it.
+#[cfg(test)]
+pub(crate) fn install_test_identity() -> Vec<u8> {
+    let kp = unstation_core::crypto::keypair_from_seed(&[0x11u8; 32]);
+    let _ = IDENTITY_SECRET.set(kp.secret.to_bytes().to_vec());
+    IDENTITY_SECRET.get().expect("just set").clone()
+}
+
 #[cfg(test)]
 mod envelope_tests {
     use super::*;
@@ -651,8 +777,7 @@ mod envelope_tests {
     #[test]
     fn sealed_envelope_round_trips_and_hides_the_sdp() {
         // A local identity gives us the X25519 keypair encode/decode derive from.
-        // (IDENTITY_SECRET is this crate's private OnceLock — set it directly, no network.)
-        let _ = IDENTITY_SECRET.set(vec![0x11u8; 64]);
+        install_test_identity();
         let our_pub = identity_enc_public().expect("enc key");
 
         let from = PeerId::from_u64(99);

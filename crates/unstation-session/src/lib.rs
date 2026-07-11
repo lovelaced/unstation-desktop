@@ -19,9 +19,9 @@
 mod dialer;
 pub use dialer::{Dialer, DIAL_TIMEOUT};
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::time::{interval, sleep};
@@ -41,9 +41,16 @@ use unstation_core::types::{PeerId, SegmentId, Seq, StreamId};
 /// chain reads ~5× — the scarce statement-store slot budget is the real constraint.
 const SIGNAL_POLL_ACTIVE: Duration = Duration::from_millis(800);
 const SIGNAL_POLL_IDLE: Duration = Duration::from_secs(4);
+/// DORMANT cadence: a stream-agnostic volunteer seed parked with zero peers (waiting
+/// for a recruitment, or between assigned streams) has no handshake in flight and
+/// nothing to reconcile — stretch the reconciliation polls to a heartbeat. Safe
+/// because the push wakeups stay live (see [`Session::set_dormant`]); off by default.
+const SIGNAL_POLL_DORMANT: Duration = Duration::from_secs(30);
 const DISCOVERY_POLL: Duration = Duration::from_secs(2);
 /// Maintainer re-evaluation cadence absent any transport event.
 const MAINTAIN_TICK: Duration = Duration::from_secs(1);
+/// Maintainer cadence while dormant with zero peers (see [`SIGNAL_POLL_DORMANT`]).
+const MAINTAIN_TICK_DORMANT: Duration = Duration::from_secs(30);
 const PRESENCE_REFRESH: Duration = Duration::from_secs(10);
 const EDGE_REFRESH: Duration = Duration::from_secs(2);
 const PRESENCE_TTL_S: u32 = 30;
@@ -62,6 +69,10 @@ impl EdgeSigner for IdentityEdgeSigner {
         unstation_chain::sign_with_identity(payload).unwrap_or([0u8; 64])
     }
 }
+
+/// peer id → (chain-verified signer account, last seen), shared between the discovery
+/// writer and the shield gate — see [`Session::chain_relay_accounts`].
+type ChainRelayAccounts = Arc<Mutex<HashMap<[u8; 32], ([u8; 32], Instant)>>>;
 
 /// A running session: the chain-signaling + WebRTC plumbing for one stream.
 #[derive(Clone)]
@@ -91,6 +102,23 @@ pub struct Session {
     /// Viewers refused here fall back to dialing seeds via the normal maintainer. Off by
     /// default; a publisher opts in. Shared so it can be toggled after `start`.
     shield: Arc<std::sync::atomic::AtomicBool>,
+    /// Origin-shield allowlist: the chain ACCOUNTS (statement-store signers) this
+    /// shielded session will answer — the volunteers the publisher itself recruited.
+    /// Empty = legacy shield (any relay-flagged peer); see [`shield_admits`]. Set via
+    /// [`Session::set_shield_allow`] as the recruiter's set changes.
+    shield_allow: Arc<Mutex<HashSet<[u8; 32]>>>,
+    /// peer id → (chain-verified signer account, last seen) for relay-flagged presence
+    /// read from the CHAIN. SECURITY PROPERTY: written ONLY by
+    /// [`Session::spawn_relay_discovery`] from statement proofs the chain verified —
+    /// in-mesh gossip must NEVER write it, or an attacker could vouch a fake signer
+    /// for its own peer id and walk through the shield allowlist.
+    chain_relay_accounts: ChainRelayAccounts,
+    /// Dormant mode (stream-agnostic volunteer seed): with zero connected peers, the
+    /// signaling/edge reconciliation polls and the maintainer tick stretch to the
+    /// `*_DORMANT` cadences — a parked seed shouldn't hammer the chain. Push wakeups
+    /// stay live, so inbound work still lands promptly. Off by default; desktop and
+    /// mobile never touch it. Same shared-toggle pattern as `shield`.
+    dormant: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Session {
@@ -129,6 +157,9 @@ impl Session {
         let bans = BanList::new();
         let book = PresenceBook::new();
         let shield = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shield_allow = Arc::new(Mutex::new(HashSet::new()));
+        let chain_relay_accounts = Arc::new(Mutex::new(HashMap::new()));
+        let dormant = Arc::new(std::sync::atomic::AtomicBool::new(false));
         tokio::spawn(relay_outbound(sig_rx, signaling.clone(), my_peer));
         tokio::spawn(relay_inbound(
             signaling.clone(),
@@ -137,6 +168,9 @@ impl Session {
             bans.clone(),
             book.clone(),
             shield.clone(),
+            shield_allow.clone(),
+            chain_relay_accounts.clone(),
+            dormant.clone(),
         ));
 
         Ok(Self {
@@ -146,6 +180,9 @@ impl Session {
             signaling,
             transport,
             shield,
+            shield_allow,
+            chain_relay_accounts,
+            dormant,
             manifest_cid: Arc::new(Mutex::new(None)),
             book,
             bans,
@@ -164,6 +201,22 @@ impl Session {
     /// to answer only relay volunteers, keeping its IP off the audience's peer list.
     pub fn set_shield(&self, on: bool) {
         self.shield.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Replace the origin-shield allowlist with `accounts` — the chain accounts of the
+    /// volunteers this publisher recruited (see [`Session::shield_allow`]). While the
+    /// set is non-empty, a shielded session answers ONLY offers from peers whose
+    /// chain-verified presence signer is in it; an empty set falls back to the legacy
+    /// relay-flag gate. The app pushes the current set after every recruitment.
+    pub fn set_shield_allow(&self, accounts: HashSet<[u8; 32]>) {
+        *self.shield_allow.lock().unwrap_or_else(|e| e.into_inner()) = accounts;
+    }
+
+    /// Enable/disable dormant mode (see [`Session::dormant`]). A stream-agnostic
+    /// volunteer seed turns this on while it has no assigned stream; the moment it has
+    /// peers (or the flag is cleared) every cadence is back to normal.
+    pub fn set_dormant(&self, on: bool) {
+        self.dormant.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// A clone of the chain signaling handle — for the opt-in WebRTC media fast tier (W3),
@@ -286,11 +339,16 @@ impl Session {
     /// relay-capable anchors (the volunteer seeds) into the presence book, so
     /// [`relay_inbound`]'s shield gate can recognize a seed's offer. A publisher does not
     /// otherwise do discovery (it is the answerer), so without this its book holds only
-    /// itself and shield would refuse everyone. Also caches each seed's signaling key.
-    /// Only needed while shielded; spawn it alongside `set_shield(true)`.
+    /// itself and shield would refuse everyone. Also caches each seed's signaling key,
+    /// and — for the hardened allowlist gate — records each relay peer's CHAIN-VERIFIED
+    /// signer account. This task is the ONLY writer of that map (see
+    /// [`Session::chain_relay_accounts`]): the signer comes from the statement proof the
+    /// chain checked, never from gossip. Only needed while shielded; spawn it alongside
+    /// `set_shield(true)`.
     pub fn spawn_relay_discovery(&self) -> tokio::task::JoinHandle<()> {
         let signaling = self.signaling.clone();
         let book = self.book.clone();
+        let chain_relay_accounts = self.chain_relay_accounts.clone();
         let stream = self.stream;
         let n_shards = self.n_shards;
         tokio::spawn(async move {
@@ -299,15 +357,28 @@ impl Session {
                 tick.tick().await;
                 for shard in 0..n_shards {
                     let topic = discovery_topic(&stream, shard);
-                    if let Ok(list) = signaling.read_presence(topic, 32).await {
-                        for p in list {
+                    if let Ok(list) = signaling.read_presence_signed(topic, 32).await {
+                        for (p, signer) in list {
                             if p.relay {
                                 signaling.note_enc_key(p.peer_id, p.enc_pub);
                                 book.insert(PresenceRecord::from(&p));
+                                if let Some(signer) = signer {
+                                    chain_relay_accounts
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .insert(p.peer_id.0, (signer, Instant::now()));
+                                }
                             }
                         }
                     }
                 }
+                // Prune signer records the chain has stopped delivering (~3 ticks): a
+                // retired presence statement must not vouch for its peer id forever.
+                let ttl = 3 * DISCOVERY_POLL;
+                chain_relay_accounts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|_, (_, seen)| seen.elapsed() <= ttl);
             }
         })
     }
@@ -446,6 +517,7 @@ impl Session {
     ) -> tokio::task::JoinHandle<()> {
         let transport = self.transport.clone();
         let session = self.clone();
+        let dormant = self.dormant.clone();
         let dialer = Dialer::new();
         let (ev_tx, mut ev_rx) = unbounded_channel::<TransportEvent>();
         transport.set_event_sink(ev_tx);
@@ -503,14 +575,26 @@ impl Session {
                 }
                 // Sleep until something changes: a lifecycle event (a drop triggers an
                 // immediate re-evaluation — this kills the old fixed reconnect lag) or
-                // the periodic tick (ages stalled dials + retries after backoff).
+                // the periodic tick (ages stalled dials + retries after backoff). A
+                // DORMANT session with zero peers stretches the tick to the heartbeat
+                // cadence — safe because lifecycle events still wake this select
+                // immediately, and a parked seed has no stalled dials or backoffs for
+                // the tick to age (per the poll-cadence header comment, the tick is
+                // reconciliation only).
+                let tick = if dormant.load(std::sync::atomic::Ordering::Relaxed)
+                    && transport.peer_count() == 0
+                {
+                    MAINTAIN_TICK_DORMANT
+                } else {
+                    MAINTAIN_TICK
+                };
                 tokio::select! {
                     ev = ev_rx.recv() => match ev {
                         Some(TransportEvent::Connected(p)) => { connected.insert(p); dialer.record_connected(&p); }
                         Some(TransportEvent::Disconnected(p)) => { connected.remove(&p); dialer.record_failed(p); }
                         None => break,
                     },
-                    _ = sleep(MAINTAIN_TICK) => {}
+                    _ = sleep(tick) => {}
                 }
                 // Coalesce any burst before re-evaluating.
                 while let Ok(ev) = ev_rx.try_recv() {
@@ -542,17 +626,19 @@ impl Session {
         // Push-based signaling: new edge statements wake the read immediately —
         // the periodic read below is only reconciliation for anything push missed.
         let mut push = self.signaling.subscribe_edge_push();
+        let dormant = self.dormant.clone();
         tokio::spawn(async move {
             let mut seen: HashSet<Seq> = HashSet::new();
             loop {
                 // Adaptive: poll fast until connected (the first edge must land quickly),
                 // then back off — once in-mesh, pushes + signed edge gossip deliver new
                 // segments immediately and this chain read is only reconciliation.
-                let period = if transport.peer_count() == 0 {
-                    SIGNAL_POLL_ACTIVE
-                } else {
-                    SIGNAL_POLL_IDLE
-                };
+                // Stretching to the dormant cadence is safe for the same reason the idle
+                // backoff is (the header comment on these constants): the edge push above
+                // stays live and wakes the read the moment a statement lands — the sleep
+                // only paces the reconciliation fallback.
+                let period =
+                    poll_period(dormant.load(std::sync::atomic::Ordering::Relaxed), transport.peer_count());
                 tokio::select! {
                     _ = sleep(period) => {}
                     Some(_) = push.recv() => {
@@ -572,6 +658,47 @@ impl Session {
                 }
             }
         })
+    }
+}
+
+/// Reconciliation-poll cadence for the signaling/edge readers. Pure so the truth table
+/// is unit-testable. Peers win over dormancy: a dormant flag left set while a
+/// recruitment connects peers must never slow a live mesh (it just lands on the normal
+/// idle pace); and with zero peers, dormant stretches the ACTIVE fast-poll to the
+/// heartbeat — which is safe only because the push subscriptions
+/// (`subscribe_edge_push`/`subscribe_signals_push`) remain live at any cadence.
+fn poll_period(dormant: bool, connected_peers: usize) -> Duration {
+    if connected_peers > 0 {
+        SIGNAL_POLL_IDLE
+    } else if dormant {
+        SIGNAL_POLL_DORMANT
+    } else {
+        SIGNAL_POLL_ACTIVE
+    }
+}
+
+/// Origin-shield admission gate, pure so the truth table is unit-testable.
+///
+/// * `!shield` → everyone is admitted (the shield is off).
+/// * `shield` with a non-empty `allow` (hardened): admit only a peer whose
+///   CHAIN-VERIFIED presence signer maps into the allowlist — the volunteers this
+///   publisher recruited. The self-asserted relay flag is deliberately ignored here:
+///   it rides unsigned gossip, so an attacker can set it on itself.
+/// * `shield` with an empty `allow` (legacy, env-forced shield without a recruiter):
+///   fall back to the relay flag — weaker, but better than refusing everyone.
+fn shield_admits(
+    shield: bool,
+    allow: &HashSet<[u8; 32]>,
+    signer_of_peer: Option<&[u8; 32]>,
+    is_relay_flagged: bool,
+) -> bool {
+    if !shield {
+        return true;
+    }
+    if !allow.is_empty() {
+        signer_of_peer.is_some_and(|s| allow.contains(s))
+    } else {
+        is_relay_flagged
     }
 }
 
@@ -613,6 +740,7 @@ async fn relay_outbound(
 /// handler works for both roles: a viewer never receives an `Offer`, a publisher
 /// never receives an `Answer`. Offers are applied before candidates so the peer
 /// connection exists first (the transport also buffers early candidates).
+#[allow(clippy::too_many_arguments)] // session-local shared state, threaded once from `start`
 async fn relay_inbound(
     signaling: ChainSignaling,
     me: PeerId,
@@ -620,6 +748,9 @@ async fn relay_inbound(
     bans: BanList,
     book: PresenceBook,
     shield: Arc<std::sync::atomic::AtomicBool>,
+    shield_allow: Arc<Mutex<HashSet<[u8; 32]>>>,
+    chain_relay_accounts: ChainRelayAccounts,
+    dormant: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     // Push-based signaling: an SDP/ICE statement addressed to us wakes the read
@@ -628,8 +759,11 @@ async fn relay_inbound(
     loop {
         // Adaptive: while establishing (no live peer) poll fast so SDP/ICE round-trips
         // promptly; once connected, pushes handle new offers instantly and the idle
-        // poll is only reconciliation.
-        let period = if transport.peer_count() == 0 { SIGNAL_POLL_ACTIVE } else { SIGNAL_POLL_IDLE };
+        // poll is only reconciliation. A DORMANT seed with zero peers drops to the
+        // heartbeat cadence — safe because the signals push above stays live, so an
+        // inbound offer still wakes this read the moment its statement lands.
+        let period =
+            poll_period(dormant.load(std::sync::atomic::Ordering::Relaxed), transport.peer_count());
         tokio::select! {
             _ = sleep(period) => {}
             Some(_) = push.recv() => {
@@ -648,21 +782,49 @@ async fn relay_inbound(
             if bans.contains(&from) {
                 continue; // convicted by the node — its offers/answers are refused
             }
-            if !seen.insert(dedup_key(&from, &msg)) {
+            let key = dedup_key(&from, &msg);
+            if seen.contains(&key) {
                 continue;
             }
+            // Origin-shield: a shielded publisher answers only its seed tier, so its IP
+            // never reaches an ordinary viewer. A refused viewer's dial simply times out
+            // and it connects to a seed instead (the maintainer already prefers relay
+            // peers). See [`shield_admits`] for the policy: with an allowlist the gate
+            // keys off the CHAIN-VERIFIED presence signer (only `spawn_relay_discovery`
+            // writes that map — gossip can't), so a self-flagged attacker can't get
+            // answered.
+            if matches!(msg, SignalMsg::Offer { .. })
+                && shield.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                let allow = shield_allow.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let signer = chain_relay_accounts
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&from.0)
+                    .map(|(signer, _)| *signer);
+                if !shield_admits(true, &allow, signer.as_ref(), book.is_relay(&from)) {
+                    let reason = if allow.is_empty() {
+                        "not relay-flagged"
+                    } else if signer.is_none() {
+                        "no chain-verified signer"
+                    } else {
+                        "signer not in the allowlist"
+                    };
+                    // Deliberately NOT marked seen: the offer stays in the sender's
+                    // signal bundle, so the next read re-evaluates it. A recruited seed
+                    // dials the instant it discovers us — often BEFORE our discovery
+                    // tick has read its chain presence back — and consuming that first
+                    // offer would cost the seed its whole 90s dial timeout before a
+                    // retry. Deferring admits it one poll after discovery catches up;
+                    // a truly unwanted peer is just re-refused at debug level until
+                    // its bundle expires.
+                    log::debug!("[session] ⊘ Offer from {from:?} refused (origin-shield: {reason})");
+                    continue;
+                }
+            }
+            seen.insert(key);
             match msg {
                 SignalMsg::Offer { sdp } => {
-                    // Origin-shield: a shielded publisher answers only relay-advertising
-                    // peers (its seed tier), so its IP never reaches an ordinary viewer.
-                    // A refused viewer's dial simply times out and it connects to a seed
-                    // instead (the maintainer already prefers relay peers). Relay status
-                    // is read from presence — a hint, so this is a privacy control, not a
-                    // trust boundary (the seed still hash-verifies everything it serves).
-                    if shield.load(std::sync::atomic::Ordering::Relaxed) && !book.is_relay(&from) {
-                        log::info!("[session] ⊘ Offer from {from:?} refused (origin-shield: not a relay)");
-                        continue;
-                    }
                     log::info!("[session] ← Offer from {from:?}");
                     transport.accept(from, sdp);
                 }
@@ -741,7 +903,44 @@ mod tests {
     }
 
     #[test]
+    fn poll_period_truth_table() {
+        // Establishing (no peers, not dormant): fast, so SDP/ICE round-trips promptly.
+        assert_eq!(poll_period(false, 0), SIGNAL_POLL_ACTIVE);
+        // Parked volunteer seed (no peers, dormant): heartbeat reconciliation only.
+        assert_eq!(poll_period(true, 0), SIGNAL_POLL_DORMANT);
+        // Connected: idle reconciliation, and peers WIN over a stale dormant flag —
+        // a recruited seed serving a stream must never be slowed by it.
+        assert_eq!(poll_period(false, 1), SIGNAL_POLL_IDLE);
+        assert_eq!(poll_period(true, 1), SIGNAL_POLL_IDLE);
+        assert_eq!(poll_period(true, 7), SIGNAL_POLL_IDLE);
+    }
+
+    #[test]
     fn offers_sort_before_candidates() {
         assert!(sig_order(&SignalMsg::Offer { sdp: vec![] }) < sig_order(&SignalMsg::IceCandidate { offer_id: String::new(), sdp: vec![] }));
+    }
+
+    #[test]
+    fn shield_admits_truth_table() {
+        let recruited = [0xAAu8; 32];
+        let stranger = [0xBBu8; 32];
+        let allow: HashSet<[u8; 32]> = [recruited].into_iter().collect();
+        let empty: HashSet<[u8; 32]> = HashSet::new();
+
+        // Shield off: everyone is admitted, whatever the other inputs say.
+        assert!(shield_admits(false, &empty, None, false));
+        assert!(shield_admits(false, &allow, Some(&stranger), false));
+
+        // Hardened (allowlist set): ONLY a chain-verified signer in the allowlist
+        // passes — the self-asserted relay flag is ignored in both directions.
+        assert!(shield_admits(true, &allow, Some(&recruited), false));
+        assert!(shield_admits(true, &allow, Some(&recruited), true));
+        assert!(!shield_admits(true, &allow, Some(&stranger), true));
+        assert!(!shield_admits(true, &allow, None, true), "no chain signer → refused");
+
+        // Legacy (env-only shield, no recruiter yet): fall back to the relay flag.
+        assert!(shield_admits(true, &empty, None, true));
+        assert!(!shield_admits(true, &empty, None, false));
+        assert!(!shield_admits(true, &empty, Some(&recruited), false), "signer alone can't pass the legacy gate");
     }
 }

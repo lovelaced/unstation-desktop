@@ -1048,6 +1048,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "chacha20poly1305"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
+dependencies = [
+ "aead",
+ "chacha20",
+ "cipher",
+ "poly1305",
+ "zeroize",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7496,6 +7509,7 @@ dependencies = [
  "hls-server",
  "jni",
  "log",
+ "parity-scale-codec",
  "schnorrkel",
  "segmenter",
  "serde",
@@ -7518,12 +7532,16 @@ name = "unstation-chain"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "hex",
  "log",
  "parity-scale-codec",
  "schnorrkel",
+ "serde_json",
  "tokio",
  "unstation-core",
  "useragent-native",
+ "useragent-sso",
+ "zeroize",
 ]
 
 [[package]]
@@ -7533,6 +7551,7 @@ dependencies = [
  "bitvec",
  "blake2",
  "bytes",
+ "chacha20poly1305",
  "log",
  "parity-scale-codec",
  "rand 0.8.6",
@@ -7541,6 +7560,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -7744,6 +7764,28 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "toml 1.1.2+spec-1.1.0",
+]
+
+[[package]]
+name = "useragent-sso"
+version = "0.4.36"
+dependencies = [
+ "aes-gcm",
+ "blake2",
+ "getrandom 0.2.17",
+ "hex",
+ "hkdf",
+ "log",
+ "p256",
+ "rand_core 0.6.4",
+ "schnorrkel",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "useragent-encoding",
+ "useragent-wallet",
+ "zeroize",
 ]
 
 [[package]]

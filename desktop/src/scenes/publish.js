@@ -24,9 +24,15 @@ export function fmtKbps(k){ k=k|0; if(k<=0) return '—'; return k>=1000 ? (k/10
 const progressWarn = {};   // step → degradation detail, cleared when the step later succeeds
 let encoderOk = false;
 function setStep(k, cls){ const el=document.querySelector('#pubSteps .step[data-k="'+k+'"]'); if(el) el.className='step'+(cls?' '+cls:''); }
-function resetPublishProgress(){ ['identity','announced','encoder'].forEach(k=>{ delete progressWarn[k]; setStep(k,''); }); encoderOk=false; }
+function resetPublishProgress(){ ['identity','announced','encoder'].forEach(k=>{ delete progressWarn[k]; setStep(k,''); }); encoderOk=false; announcedUnderlying=null; chainWarn=false; }
 export function applyPublishProgress(p){
   if(!p || !p.step) return;
+  if(p.step==='announced'){
+    // Remember the backend's own verdict so a clean chain-health poll can restore it,
+    // and let an ACTIVE chain-health warning outrank the one-shot event meanwhile.
+    announcedUnderlying = { ok: !!p.ok, detail: p.detail||'' };
+    if(chainWarn){ updatePubHealth(); return; }
+  }
   if(p.ok){
     delete progressWarn[p.step];
     setStep(p.step,'done');
@@ -38,6 +44,40 @@ export function applyPublishProgress(p){
   }
   updatePubHealth();
 }
+
+/* ---- chain health poll (U2): are our network announcements actually landing? ---- */
+// A publisher whose statement-store writes fail is silently undiscoverable — the
+// stream looks live locally while no new viewer can find it. While publishing, poll
+// the backend every 10s; growing write failures (or a dropped subscription) overlay a
+// warning on the Announced step, and a clean poll restores whatever the backend's own
+// publish-progress verdict was. The same beat refreshes the Network stat cell.
+let chainHealthTimer=null, lastWriteFailures=null, chainWarn=false;
+let announcedUnderlying=null; // last publish-progress verdict for the announced step
+function applyAnnouncedUnderlying(){
+  if(announcedUnderlying && announcedUnderlying.ok){ delete progressWarn.announced; setStep('announced','done'); }
+  else if(announcedUnderlying){ setStep('announced','warn'); if(announcedUnderlying.detail) progressWarn.announced=announcedUnderlying.detail; else delete progressWarn.announced; }
+  else { delete progressWarn.announced; setStep('announced',''); }
+}
+async function chainHealthTick(){
+  if(!(NATIVE && invoke) || !S.publishing) return;
+  try{
+    const h = await invoke('chain_health');
+    try{ S.chainState = await invoke('chain_status'); }catch(e){}
+    const grew = lastWriteFailures!=null && h.write_failures>lastWriteFailures;
+    lastWriteFailures = h.write_failures;
+    if(grew || !h.subscribed){
+      chainWarn = true;
+      progressWarn.announced = STRINGS.pubDiscoverWarn;
+      setStep('announced','warn');
+    } else if(chainWarn){
+      chainWarn = false;
+      applyAnnouncedUnderlying();
+    }
+    updatePubHealth();
+  }catch(e){}
+}
+function armChainHealth(){ cancelChainHealth(); lastWriteFailures=null; if(NATIVE && invoke){ chainHealthTick(); chainHealthTimer=setInterval(chainHealthTick, 10000); } }
+function cancelChainHealth(){ if(chainHealthTimer){ clearInterval(chainHealthTimer); chainHealthTimer=null; } }
 
 /* ---- publish-stats: viewers + real bitrates, with quiet advisories ---- */
 let lowIngestRuns = 0;     // consecutive stats updates with ingest below 300 kbps while live
@@ -56,21 +96,25 @@ export function applyPublishStats(p){
 }
 
 // Streamer-facing Go Live health: live/waiting + viewers + uptime + bitrates + network.
-// The note line shows ONE thing, in priority order: struggling encoder → nobody watching
-// yet → a preflight degradation detail → the plain connected/waiting copy.
+// The note line shows ONE thing, in priority order: struggling encoder → a preflight/
+// chain degradation detail → nobody watching yet → the plain connected/waiting copy.
+// The degradation outranks the no-viewers advisory: failing announcements are often
+// WHY nobody is watching, and "send your invite link" would be false reassurance.
 export function updatePubHealth(){
   const set=(id,t)=>{ const el=document.getElementById(id); if(el) el.textContent=t; };
   const dot=document.getElementById('phDot');
   const warnNote = progressWarn.encoder || progressWarn.announced || progressWarn.identity || '';
   if(S.pubLive){
     if(dot) dot.dataset.h='live'; set('phStatus','You’re live');
-    let note = 'Your encoder is connected — viewers can tune in with your stream name.';
+    let note = 'Your encoder is connected. Viewers can tune in with your stream name.';
     if(lowIngestRuns >= 2) note = STRINGS.advEncoderStruggling;
-    else if(zeroViewersSince && Date.now()-zeroViewersSince > 120000) note = STRINGS.advNoViewers;
     else if(warnNote) note = warnNote;
+    // Shielded: nobody CAN connect until a volunteer relay picks the stream up, so
+    // "send your invite link" would be false reassurance — say what's really happening.
+    else if(zeroViewersSince && Date.now()-zeroViewersSince > 120000) note = S.pubShield ? STRINGS.shieldWaitingRelay : STRINGS.advNoViewers;
     set('phNote', note);
   }
-  else { if(dot) dot.dataset.h='wait'; set('phStatus','Waiting for your encoder'); set('phNote', warnNote || 'Point OBS at the server above and start streaming — it goes live on its own.'); }
+  else { if(dot) dot.dataset.h='wait'; set('phStatus','Waiting for your encoder'); set('phNote', warnNote || 'Point OBS at the server above and start streaming. It goes live on its own.'); }
   set('phViewers', String(S.lastViewers));
   set('phUptime', S.pubLiveSince ? fmtDur(Date.now()-S.pubLiveSince) : '—');
   set('phNet', netLabel().t);
@@ -152,7 +196,7 @@ async function switchIngest(){
   ingestMode = ingestMode === 'whip' ? 'rtmp' : 'whip';
   try{
     await invoke('stop_publish');
-    const info = await invoke('start_publish', { title: S.pubName, ingestMode, key: S.pubKey || undefined });
+    const info = await invoke('start_publish', { title: S.pubName, ingestMode, key: S.pubKey || undefined, shield: S.pubShield });
     S.pubHlsUrl = info.hls_url;
     renderIngestCard(info);
   }catch(err){ publishStartFailed(err); }
@@ -250,6 +294,7 @@ const titleEl = document.getElementById('streamTitle');
 const startStreamBtn = document.getElementById('startStream');
 const unlistedToggle = document.getElementById('unlistedToggle');
 const encryptedToggle = document.getElementById('encryptedToggle');
+const shieldToggle = document.getElementById('shieldToggle');
 
 // A 256-bit invite-only stream key as 64 hex chars. Generated when the broadcaster
 // enables encryption; it rides in the share link's #k= fragment (never on the chain),
@@ -325,6 +370,8 @@ async function goLiveStartInner(){
   S.pubName = effectiveName();
   // Lock the invite-only key if encryption is on (else clear it).
   S.pubKey = (encryptedToggle && encryptedToggle.checked) ? (S.pubKey || freshStreamKey()) : '';
+  // Hide my connection (origin-shield): locked in at go-live like the key above.
+  S.pubShield = !!(shieldToggle && shieldToggle.checked);
   titleEl.value = S.pubName;
   titleEl.readOnly = true;
   document.getElementById('shareLink').textContent = S.pubName;
@@ -334,10 +381,11 @@ async function goLiveStartInner(){
   document.getElementById('pubLive').hidden = false;
   resetPublishProgress(); showCamRecovery(false);
   armObsTimer();
+  armChainHealth();
   applyPublishState(false); // enter the console in the waiting state
   if(NATIVE && invoke){
     try {
-      const info = await invoke('start_publish', { title: S.pubName, ingestMode, key: S.pubKey || undefined });
+      const info = await invoke('start_publish', { title: S.pubName, ingestMode, key: S.pubKey || undefined, shield: S.pubShield });
       S.pubHlsUrl = info.hls_url; S.pubActive = true; refreshGoLiveBadge();
       renderIngestCard(info);
       // Android: start_publish has opened the AU intake; now start the camera capture
@@ -420,6 +468,7 @@ export async function enterGoLive(){
     document.getElementById('pubLive').hidden = false;
     refreshGoLiveBadge();
     if(!status.live) armObsTimer();
+    armChainHealth();
     // Re-attach (e.g. a webview reload) gets no replayed progress events — synthesize
     // what the session's existence proves: identity booted; encoder ok iff live now.
     applyPublishProgress({ step:'identity', ok:true, detail:'' });
@@ -433,8 +482,8 @@ export async function enterGoLive(){
 }
 
 export function endPublish(){
-  S.publishing = false; S.pubActive = false; S.pubName = ''; S.pubLive = false; S.pubLiveSince = 0; S.lastViewers = 0; S.ingestKbps = 0; S.uplinkKbps = 0; clearInterval(pubViewersTimer);
-  cancelObsTimer(); resetPublishProgress(); showCamRecovery(false); hideInviteQr();
+  S.publishing = false; S.pubActive = false; S.pubName = ''; S.pubShield = false; S.pubLive = false; S.pubLiveSince = 0; S.lastViewers = 0; S.ingestKbps = 0; S.uplinkKbps = 0; clearInterval(pubViewersTimer);
+  cancelObsTimer(); cancelChainHealth(); resetPublishProgress(); showCamRecovery(false); hideInviteQr();
   lowIngestRuns = 0; zeroViewersSince = 0;
   if(window.__keepAwake) window.__keepAwake(false);
   refreshGoLiveBadge();

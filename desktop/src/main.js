@@ -4,12 +4,13 @@ import { invoke, listen, NATIVE, appWindow } from './tauri.js';
 import { renderViewerHealth } from './health.js';
 import { S, go, win, hud, refreshGoLiveBadge } from './state.js';
 import { wireAspectVar, wireVideoDiag } from './player.js';
-import { applyStats, applyWatchPhase, enterWatch, leaveWatch, selfWatch, startWatch } from './scenes/watch.js';
+import { applyStats, applyWatchPhase, applyMeshError, enterWatch, leaveWatch, selfWatch, startWatch } from './scenes/watch.js';
 import { enterGoLive, goLiveStart, endPublish, applyPublishState, updatePubHealth, applyPublishStats, applyPublishProgress } from './scenes/publish.js';
 import { beginPairing, pushChainIdentity, onboardingStatus, showRetry, resumeAfterSignIn, ensureSignedIn } from './scenes/onboarding.js';
 import { openSettings, updateSettingsStatus , applySeedStats } from './scenes/settings.js';
 import { applyFastAnswer, applyFastClosed } from './fasttier.js';
 import { parseInviteLink } from './invite.js';
+import { STRINGS } from './copy.js';
 
 // G: keep the screen awake while something live is on screen (watch or publish).
 // One neutral seam for both platforms — `set_keep_awake` is a no-op on desktop and
@@ -68,7 +69,7 @@ wireVideoDiag('vid','vidDiag', false);
 wireAspectVar('vid');
 wireAspectVar('fastVid');
 
-document.getElementById('pairedBtn').addEventListener('click', async ()=>{ if(NATIVE && invoke){ try{ await invoke('complete_signin'); }catch(e){} } go('entry'); });
+document.getElementById('pairedBtn').addEventListener('click', ()=>{ go('entry'); });
 document.getElementById('tabWatch').addEventListener('click', enterWatch);
 document.getElementById('tabGoLive').addEventListener('click', enterGoLive);
 document.getElementById('tabSettings').addEventListener('click', openSettings);
@@ -79,7 +80,7 @@ document.getElementById('fsBtn').addEventListener('click', toggleFullscreen);
 // watch form (a full start_watch). No target (e.g. preview dock) → back to entry.
 { const rj=document.getElementById('rejoinBtn'); if(rj) rj.addEventListener('click', ()=>{ if(S.watchTarget) startWatch(S.watchTarget, S.watchKey); else go('entry'); }); }
 { const pv=document.getElementById('previewSelf'); if(pv) pv.addEventListener('click', ()=>{ if(S.pubName) selfWatch(S.pubName); }); }
-{ const sb=document.getElementById('stopSeedBtn'); if(sb) sb.addEventListener('click', ()=>{ if(NATIVE && invoke) invoke('stop_seed').catch(()=>{}); sb.style.display='none'; const l=document.getElementById('setLend'); if(l) l.textContent='Off \u2014 not watching anything right now.'; }); }
+{ const sb=document.getElementById('stopSeedBtn'); if(sb) sb.addEventListener('click', ()=>{ if(NATIVE && invoke) invoke('stop_seed').catch(()=>{}); sb.style.display='none'; const l=document.getElementById('setLend'); if(l) l.textContent=STRINGS.lendOff; }); }
   document.getElementById('rePairBtn').addEventListener('click', ()=>{ S.chainReady=false; try{ sso.resetPairing(); }catch(e){} const pb=document.getElementById('pairedBtn'); if(pb) pb.style.display=''; go('onboarding'); beginPairing(); });
 // Onboarding failure affordances: "Try again" re-requests the allowance on the EXISTING
 // session (no resetPairing → reuses the cached grant, no slot churn); "Re-pair from
@@ -110,6 +111,8 @@ async function boot(){
     document.body.classList.add('native');
     let plat='macos'; try{ plat = await invoke('platform'); }catch(e){}
     document.body.classList.add('plat-'+plat);
+    // About row: the real app version (tauri.conf.json is the single source).
+    try{ const v = await window.__TAURI__.app.getVersion(); const el=document.getElementById('aboutVersion'); if(el) el.textContent = 'v'+v; }catch(e){}
     // Windows/Linux use a custom titlebar; wire its min/max/close to the native window.
     if(appWindow){ const wire=(id,fn)=>{ const b=document.getElementById(id); if(b) b.onclick=()=>{ try{ fn(); }catch(e){} }; }; wire('wcMin',()=>appWindow.minimize()); wire('wcMax',()=>appWindow.toggleMaximize()); wire('wcClose',()=>appWindow.close()); }
     if(listen){ try{
@@ -122,17 +125,19 @@ async function boot(){
       await listen('seed-stats', e=>applySeedStats(e.payload));
       await listen('fast-answer', e=>applyFastAnswer(e.payload));
       await listen('fast-closed', ()=>applyFastClosed());
-        await listen('mesh-status', e=>{ const p=e&&e.payload; if(!p) return; console.log('[mesh-status]', p.state, p.detail); S.chainState=p.state; S.chainDetail=p.detail||''; updatePubHealth(); if(S.curState==='settings') updateSettingsStatus(); if(p.state==='error'){ const b=document.querySelector('#pubWaiting b'); if(b && !document.getElementById('pubLive').hidden) b.textContent=p.detail; } });
+        await listen('mesh-status', e=>{ const p=e&&e.payload; if(!p) return; console.log('[mesh-status]', p.state, p.detail); S.chainState=p.state; S.chainDetail=p.detail||''; updatePubHealth(); if(S.curState==='settings') updateSettingsStatus(); if(p.state==='error'){ const b=document.querySelector('#pubWaiting b'); if(b && !document.getElementById('pubLive').hidden) b.textContent=p.detail; } applyMeshError(p); });
     }catch(e){} }
     // Re-attach: if a publish session is still running in the backend (a webview
     // reload, or relaunch while the process lived), light the Go-Live tab badge so
     // the user can tab straight back into it.
     if(invoke){ try{ const ps = await invoke('publish_status'); if(ps){ S.pubActive = true; S.pubName = ps.name; S.pubHlsUrl = ps.info.hls_url; S.publishing = true; refreshGoLiveBadge(); } }catch(e){} }
     // Push saved preferences to the backend (it holds no persistent store of its own):
-    // the upload-sharing cap and whether fast-connect invites are honored.
+    // the upload-sharing cap, whether fast-connect invites are honored, and whether
+    // volunteer relays may be recruited to help carry a broadcast.
     if(invoke){
       try{ const cap = parseInt(localStorage.getItem('lendCap')||'0',10); if(cap>=0) invoke('set_lend_cap',{ bps: cap }).catch(()=>{}); }catch(e){}
       try{ const off = localStorage.getItem('fastConnect')==='off'; invoke('set_fast_connect',{ allowed: !off }).catch(()=>{}); }catch(e){}
+      try{ const hoff = localStorage.getItem('useHelpers')==='off'; invoke('set_use_helpers',{ allowed: !hoff }).catch(()=>{}); }catch(e){}
     }
     try {
       // Wait for the saved session to hydrate from storage (async) before

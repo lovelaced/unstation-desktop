@@ -3,22 +3,37 @@
 # hand-edit /etc/systemd/system/unstation-seed.service and `systemctl daemon-reload
 # && systemctl restart unstation-seed` to change the stream or budget later.
 [Unit]
-Description=Unstation volunteer seed (@STREAM@)
+Description=Unstation volunteer seed (@MODE@)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 User=unstation
 Group=unstation
-ExecStart=/usr/local/bin/unstation-node @STREAM@
-Restart=always
-RestartSec=5
+# Bare (no args) = open relay: announces spare capacity and serves whatever streams
+# publishers recruit it onto. `--stream <name>` pins specific streams instead.
+ExecStart=/usr/local/bin/unstation-node @STREAM_ARGS@
+Restart=on-failure
+RestartSec=10
+# SIGINT (not the default SIGTERM) so shutdown withdraws from the volunteer
+# rendezvous and closes peer connections cleanly; give it time to do so.
+KillSignal=SIGINT
+TimeoutStopSec=20
+# Exit 78 = identity not signed in / misconfigured — restarting cannot fix it. Run
+# `sudo -u unstation UNSTATION_NODE_KEY_DIR=/var/lib/unstation-seed unstation-node pair`
+# (the journal shows the exact command), then `systemctl restart unstation-seed`.
+RestartPreventExitStatus=78
 
-# The seed's persistent statement-store identity lives here (auto-provisioned on the
-# public testnet on first run — keep the dir to keep the identity).
+# The seed's identity lives here: a phone-paired slot key written by
+# `unstation-node pair` (public chain), or a generated key (dev chains).
+# Keep the dir to keep the identity.
 Environment=UNSTATION_NODE_KEY_DIR=/var/lib/unstation-seed
-# Uplink to donate, in Mbps (aggregate across the viewers this seed serves).
+# Optional operator-provided secrets (e.g. UNSTATION_NODE_MNEMONIC) — 0600, may be absent.
+EnvironmentFile=-/var/lib/unstation-seed/env
+# Total uplink to donate, in Mbps, shared across every stream this seed serves.
 Environment=UNSTATION_NODE_BUDGET_MBPS=@BUDGET@
+# Most streams served at once (open relay; each needs ~4 Mbps of the budget).
+Environment=UNSTATION_NODE_MAX_STREAMS=@MAX_STREAMS@
 Environment=RUST_LOG=info
 
 # Containment: the seed needs nothing but its key dir and the network.

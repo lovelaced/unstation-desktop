@@ -1,0 +1,49 @@
+name: Docs
+
+# Build and publish the docs/ site to GitHub Pages. A tiny Python static build
+# (docs/build.py) renders the markdown into styled HTML; no Jekyll, no Ruby. Runs
+# on changes to the docs (or this workflow), and can be triggered by hand. Enable
+# Pages once in the repo settings with "Source: GitHub Actions" for the first
+# deploy to take.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "docs/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; don't cancel an in-flight publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install markdown
+      - run: python3 docs/build.py
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/_site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

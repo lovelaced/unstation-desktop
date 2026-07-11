@@ -64,6 +64,7 @@ export const S = {
   pubActive: false,     // a publish session exists in the backend (live or waiting)
   pubName: '',
   pubKey: '',            // invite-only stream key (hex) for the current publish; embedded in the share link's #k=
+  pubShield: false,      // "Hide my connection" (origin-shield) locked in at go-live: serve viewers via recruited relays only
   pubHlsUrl: null,
   pubLive: false,
   pubLiveSince: 0,
@@ -118,12 +119,15 @@ export function go(state){ clearSeq(); S.curState=state;
   setActiveTab(state);
   player.classList.toggle('show', isLive); hud.classList.toggle('show', isLive);
   document.getElementById('catchup').style.display = state==='catchup'?'grid':'none';
+  // While stalled, the catchup spinner is the view's one animated element — and a
+  // pulsing LIVE tag over frozen video would be dishonest anyway.
+  { const lt=document.querySelector('#player .live-tag'); if(lt) lt.style.visibility = state==='catchup'?'hidden':''; }
   // Hold the screen awake only while video actually plays (live/seed) — NOT in
   // catchup/connecting. A watch stuck on "Connecting…" used to pin the screen on
   // indefinitely (keep-awake + active polling + cellular radio = the thermal-warning
   // combo measured on-device); if a stall outlasts the system screen timeout, dimming
   // is the correct behavior.
-  if(isLive){ if(window.__keepAwake) window.__keepAwake(state!=='catchup'); const mode=state==='seed'?'seed':'p2p'; win.dataset.health=mode; setAmbient(false); document.getElementById('modeText').textContent=state==='seed'?STRINGS.modeLiveHelper:STRINGS.modeLiveP2p; showScene(''); if(!NATIVE){ setTitle('hardfork.dot',true); renderViewerHealth({peers: state==='seed'?6:23, playing:true, mode, publisher:'hardfork.dot'}); } return; }
+  if(isLive){ if(window.__keepAwake) window.__keepAwake(state!=='catchup'); const mode=state==='seed'?'seed':'p2p'; win.dataset.health=mode; setAmbient(false); document.getElementById('modeText').textContent=state==='seed'?STRINGS.modeLiveBackup:STRINGS.modeLiveP2p; showScene(''); if(!NATIVE){ setTitle('hardfork.dot',true); renderViewerHealth({peers: state==='seed'?6:23, playing:true, mode, publisher:'hardfork.dot'}); } return; }
   setAmbient(state==='entry'||state==='onboarding'||state==='ended'||state==='settings'); win.dataset.net='closed'; if(state!=='finding') setTitle('Unstation',false);
   if(state==='finding'){ showScene('finding'); if(findingHook) findingHook(); return; } showScene(state); }
 

@@ -31,10 +31,22 @@ dist/
 /scratch/
 /tmp/
 
+# --- Docs site ---
+# Generated static output of docs/build.py (published by the Pages workflow; never committed).
+docs/_site/
+
 # --- Local design docs ---
-# Only the README is published; specs, notes, and other markdown stay local.
+# Internal specs, research, and notes stay local; only the README and the curated
+# public docs site (docs/, published to GitHub Pages) are tracked.
 *.md
 !README.md
+!docs/index.md
+!docs/how-it-works.md
+!docs/protocol.md
+!docs/security.md
+!docs/faq.md
+!docs/run-a-relay.md
+!docs/contributing.md
 
 # Local cross-builds of the seed binary (Docker; see crates/unstation-node/README.md)
 /target-linux-*

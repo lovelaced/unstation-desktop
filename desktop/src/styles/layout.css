@@ -25,7 +25,9 @@
     transition: color .15s var(--ease), background .15s var(--ease), border-color .15s var(--ease); }
   .tab:hover { color: var(--text); background: rgba(255,255,255,.05); }
   .tab.active { color: var(--brand); background: rgba(255,92,122,.12); border-color: rgba(255,92,122,.3); }
-  .tab .rec { width: 7px; height: 7px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 8px var(--bad); animation: pulse 1.6s var(--ease) infinite; }
+  /* Static red: titlebar chrome is visible in every view and must never compete
+     with the view's own single pulse. A steady red dot still reads "recording". */
+  .tab .rec { width: 7px; height: 7px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 8px var(--bad); }
   .tab .rec[hidden] { display: none; }
   /* Brand / current-stream title — pushed to the right edge, truncates instead of
      colliding with the nav on narrow windows. */

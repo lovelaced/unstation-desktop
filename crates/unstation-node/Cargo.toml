@@ -17,6 +17,8 @@ unstation-session = { path = "../unstation-session" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }
 log = "0.4"
 env_logger = "0.11"
+qrcode = { version = "0.14", default-features = false }
+zeroize = "1"
 
 [dev-dependencies]
 bytes = "1"

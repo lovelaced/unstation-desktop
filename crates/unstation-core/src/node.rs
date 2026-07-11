@@ -920,12 +920,13 @@ impl MeshNode {
             }
         }
 
-        // Live viewers slide their retention window with playback: prune the store
-        // (memory + disk spill), the seq→id map, and the local buffer map below
+        // Live viewers and seeds slide their retention window with playback: prune the
+        // store (memory + disk spill), the seq→id map, and the local buffer map below
         // `play − window`. Without this a multi-hour stream grows all three without
         // bound — and re-advertises an ever-longer bitfield to every peer. Publishers
-        // keep everything (they're the origin); a seed's play head stays 0, so its
-        // cache is bounded by the store's own capacity instead.
+        // keep everything (they're the origin); a seed has no player, but its cursor is
+        // pinned to `head − window/2` above, so this same prune keeps its retention
+        // window-bounded as the stream runs on.
         if matches!(self.eng.cfg.mode, Mode::Live) && !matches!(self.eng.cfg.role, Role::Publisher)
         {
             // Cap the floor at what we've actually DELIVERED, not the play cursor: when the

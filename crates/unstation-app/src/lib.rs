@@ -26,7 +26,7 @@ mod camera;
 // The opt-in WebRTC media fast tier (W3): publisher-direct sub-second egress + its signaling.
 mod fasttier;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -42,6 +42,10 @@ use unstation_core::media::MediaSink;
 use unstation_core::node::MeshNode;
 use unstation_core::transport::EngineEvent;
 use unstation_core::types::{PeerId, SegmentId, Seq, StreamId};
+use unstation_core::volunteer::{
+    RecruitAction, Recruitment, VolunteerRecord, RECRUIT_CONTEXT, RECRUITMENT_VERSION,
+};
+use parity_scale_codec::Encode;
 use unstation_chain::BulletinOrigin;
 use unstation_session::{IdentityEdgeSigner, Session};
 
@@ -52,13 +56,17 @@ const TICK: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
 struct AppState {
-    signed_in: Mutex<bool>,
     /// Upload-sharing cap in bits/sec, from Settings ("Sharing your connection").
     /// 0 = Auto (the health monitor's ladder unclamped); 1 ≈ Off (the token bucket
     /// effectively never refills); anything else clamps the ladder.
     lend_cap_bps: Arc<AtomicU64>,
     /// Settings kill-switch for fast-connect invites (default OFF = invites honored).
     fast_off: Arc<AtomicBool>,
+    /// Settings preference: may a publish recruit volunteer relays to help carry the
+    /// stream? Defaults from `UNSTATION_HELPERS` (see [`use_helpers`], set in
+    /// [`builder`]). The EFFECTIVE value ORs with origin-shield at publish start — a
+    /// shielded publisher serves only relays, so it can't run without them.
+    helpers_allowed: Arc<AtomicBool>,
     watch: Mutex<Option<WatchSession>>,
     /// A background seed (seed-by-default): the converted remains of a watch whose
     /// player left — still caching + resharing the live window for the mesh.
@@ -112,6 +120,11 @@ struct SeedSession {
     tasks: Vec<JoinHandle<()>>,
 }
 
+/// peer id → (sealing key, chain account) of the volunteers recruited this session,
+/// shared between the recruiter, the shield allowlist push, and teardown's Release.
+#[cfg(feature = "publish")]
+type Recruited = Arc<Mutex<HashMap<[u8; 32], ([u8; 32], [u8; 32])>>>;
+
 /// An active publish: RTMP ingest, the self-preview HLS, the feeder task, the
 /// publisher node's inbox, and the session.
 #[cfg(feature = "publish")]
@@ -131,6 +144,16 @@ struct PublishSession {
     /// Whether fresh fragments are arriving right now (the feeder updates this);
     /// read by `publish_status` so a re-attaching UI gets the true live state.
     live: Arc<AtomicBool>,
+    /// The stream id — teardown needs it to Release recruited volunteers (R5).
+    stream: StreamId,
+    /// The published manifest's Bulletin CID, filled by `spawn_manifest_publish` and
+    /// read by the volunteer recruiter (a `Recruitment` names it so the volunteer can
+    /// verify the stream before seeding a byte) and by the teardown Release.
+    manifest_cid: Arc<Mutex<Option<String>>>,
+    /// peer id → (sealing key, chain account) of every volunteer recruited THIS
+    /// session: teardown sends each one a best-effort Release, and while shielded the
+    /// accounts feed the session's origin-shield allowlist (only recruits get answered).
+    recruited: Recruited,
 }
 
 /// A no-op sink for nodes that only cache + serve (publisher/seed), never render.
@@ -185,12 +208,6 @@ impl MediaSink for DecryptingSink {
     fn on_play_head(&self) -> u64 {
         self.inner.on_play_head()
     }
-}
-
-#[derive(Serialize, Clone)]
-struct SigninInfo {
-    uri: String,
-    signed_in: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -252,6 +269,20 @@ struct PublishStateMsg {
 struct MeshStatusMsg {
     state: String,
     detail: String,
+    /// Machine-readable reason the UI can branch on ("" for generic status):
+    /// `invite_key_missing` (invite-only stream opened without its key) or
+    /// `verify_failed` (a candidate broadcaster's manifest failed verification).
+    code: String,
+}
+
+/// Chain write/subscription health (U2), polled by the publisher console and the
+/// Settings screen: the failed-write counter climbing (or the subscription dropping)
+/// means announcements aren't landing — new viewers can't find the stream — which
+/// would otherwise stay log-only.
+#[derive(Serialize, Clone)]
+struct ChainHealthMsg {
+    write_failures: u64,
+    subscribed: bool,
 }
 
 /// Lending-bandwidth status (seed-by-default, health-gated). Emitted by the watch
@@ -420,24 +451,6 @@ fn stream_id_from(name: &str) -> StreamId {
 #[tauri::command]
 fn platform() -> &'static str {
     std::env::consts::OS
-}
-
-#[tauri::command]
-fn signin_status(state: State<'_, AppState>) -> bool {
-    *state.signed_in.lock().unwrap()
-}
-
-#[tauri::command]
-fn begin_signin() -> SigninInfo {
-    // Real QR pairing (host-papp) runs in the webview (sso.js). This Rust command
-    // remains a UI seam; the phone-granted session is threaded to the signer in M4.
-    SigninInfo { uri: "polkadot://unstation/pair?v=1".into(), signed_in: false }
-}
-
-#[tauri::command]
-fn complete_signin(state: State<'_, AppState>) -> bool {
-    *state.signed_in.lock().unwrap() = true;
-    true
 }
 
 #[tauri::command]
@@ -722,7 +735,7 @@ async fn start_watch(
                             if m.manifest.encrypted && !have_key {
                                 let _ = appc.emit(
                                     "mesh-status",
-                                    MeshStatusMsg { state: "error".into(), detail: "This stream is invite-only — open it with the full invite link.".into() },
+                                    MeshStatusMsg { state: "error".into(), detail: "This stream is invite-only — open it with the full invite link.".into(), code: "invite_key_missing".into() },
                                 );
                                 return false;
                             }
@@ -766,7 +779,7 @@ async fn start_watch(
                         Ok(_) => {
                             let _ = appc.emit(
                                 "mesh-status",
-                                MeshStatusMsg { state: "error".into(), detail: "Couldn’t verify a broadcaster — skipping.".into() },
+                                MeshStatusMsg { state: "error".into(), detail: "Couldn’t verify a broadcaster — skipping.".into(), code: "verify_failed".into() },
                             );
                             false
                         }
@@ -855,7 +868,7 @@ async fn start_watch(
                 if peers == 0 {
                     let _ = appc.emit(
                         "mesh-status",
-                        MeshStatusMsg { state: "connecting".into(), detail: "Reaching the mesh…".into() },
+                        MeshStatusMsg { state: "connecting".into(), detail: "Reaching the mesh…".into(), code: String::new() },
                     );
                 }
                 let ns = stats_rx.borrow().clone();
@@ -950,6 +963,41 @@ fn seed_by_default() -> bool {
 #[cfg(feature = "publish")]
 fn shield_publish() -> bool {
     std::env::var("UNSTATION_SHIELD").map(|v| v == "1" || v == "true").unwrap_or(false)
+}
+
+/// Volunteer helpers (R5): may a publish recruit volunteer seeds to help carry the
+/// stream? On unless explicitly disabled — mirrors [`seed_by_default`]. This is only
+/// the boot default for [`AppState::helpers_allowed`]; Settings overrides it at
+/// runtime, and origin-shield forces the effective value on.
+fn use_helpers() -> bool {
+    std::env::var("UNSTATION_HELPERS").map(|v| v != "0").unwrap_or(true)
+}
+
+/// How many relay-flagged helpers the recruiter tries to keep on a stream
+/// (`UNSTATION_HELPERS_K`, default 2).
+#[cfg(feature = "publish")]
+fn helpers_target() -> usize {
+    std::env::var("UNSTATION_HELPERS_K").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
+}
+
+/// Statement priority for a recruitment, mirroring `unstation_chain::volunteer`'s
+/// announce clock (seconds since its fixed 2025 epoch, shifted one bit) so a
+/// publisher's successive posts into ONE volunteer's inbox are strictly
+/// later-wins. A Release takes the odd slot: it beats the SAME second's Recruit
+/// without ever outranking a later re-recruit.
+#[cfg(feature = "publish")]
+fn recruit_prio(issued_at: u64, release: bool) -> u32 {
+    let base = ((issued_at.saturating_sub(1_750_000_000) & 0x7FFF_FFFF) as u32) << 1;
+    if release { base | 1 } else { base }
+}
+
+/// Unix seconds now (recruitments carry a fresh `issued_at` — the seeds dedup on it).
+#[cfg(feature = "publish")]
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Background-seed contribution ceiling (bits/sec) once the player is gone.
@@ -1099,6 +1147,7 @@ fn set_chain_identity(
                 } else {
                     "Still connecting to the network…".into()
                 },
+                code: String::new(),
             },
         );
     });
@@ -1183,6 +1232,35 @@ fn set_lend_cap(state: State<'_, AppState>, bps: u64) {
 fn set_fast_connect(state: State<'_, AppState>, allowed: bool) {
     state.fast_off.store(!allowed, Ordering::Relaxed);
     log::info!("[fast] invites {}", if allowed { "honored" } else { "declined (Settings)" });
+}
+
+/// Settings → "Volunteer relays": whether a publish may recruit volunteer seeds to help
+/// carry the stream. The preference is always recorded, but origin-shield FORCES the
+/// effective value on — a shielded publisher serves only relays, so turning helpers off
+/// would leave nobody to carry the stream. Applies from the next publish start.
+#[tauri::command]
+fn set_use_helpers(state: State<'_, AppState>, allowed: bool) {
+    state.helpers_allowed.store(allowed, Ordering::Relaxed);
+    #[cfg(feature = "publish")]
+    if !allowed && shield_publish() {
+        log::warn!(
+            "[helpers] origin-shield is on — volunteer helpers stay on while shielded \
+             (preference saved and applies once the shield is off)"
+        );
+    }
+    log::info!("[helpers] volunteer relays {}", if allowed { "on" } else { "off (Settings)" });
+}
+
+/// Live chain-health snapshot (U2): the process-wide failed-write counter plus whether
+/// the statement-store subscription is connected RIGHT NOW. Non-blocking — the zero
+/// timeout just reads the subscription flag, like [`chain_status`].
+#[tauri::command]
+fn chain_health(state: State<'_, AppState>) -> ChainHealthMsg {
+    ChainHealthMsg {
+        write_failures: unstation_chain::chain_write_failures(),
+        subscribed: *state.chain_ready.lock().unwrap()
+            && unstation_chain::wait_ready(Duration::from_millis(0)),
+    }
 }
 
 /// Fast tier (opt-in, unverified, sub-second): the webview built a recvonly `RTCPeerConnection`
@@ -1393,6 +1471,9 @@ fn spawn_manifest_publish(
     // Invite-only: sealed segments + init. Stamped into the SIGNED manifest so a viewer
     // knows a key is required and a relay can't strip the flag.
     encrypted: bool,
+    // Filled with the manifest's Bulletin CID on success, for the volunteer recruiter
+    // (which skips its tick until a CID exists) and the teardown Release.
+    cid_slot: Arc<Mutex<Option<String>>>,
 ) -> JoinHandle<()> {
     let session_mc = session.clone();
     tokio::spawn(async move {
@@ -1452,7 +1533,8 @@ fn spawn_manifest_publish(
         match BulletinOrigin.put_manifest(SignedManifest { manifest, sig }).await {
             Ok(cid) => {
                 log::info!("[publish] signed manifest on Bulletin: {cid}");
-                session_mc.set_manifest_cid(cid);
+                session_mc.set_manifest_cid(cid.clone());
+                *cid_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(cid);
                 progress(true, "");
             }
             Err(e) => {
@@ -1461,6 +1543,191 @@ fn spawn_manifest_publish(
             }
         }
     })
+}
+
+/// R5 — the publisher-side volunteer recruiter. Every 30s while the stream runs:
+/// count the live relay-flagged helpers already on the stream (presence book, self
+/// excluded); if fewer than the target ([`helpers_target`]), read the volunteer
+/// rendezvous, rank the candidates (least loaded first, then the biggest advertised
+/// pipe, then a random tiebreak), and post each one a signed, sealed [`Recruitment`]
+/// naming the published manifest CID. The signature binds the TARGET volunteer
+/// (signed per volunteer over `signing_payload(&PeerId(vol.peer_id))`), a 60s
+/// per-volunteer cooldown keeps a slow joiner from being spammed, and everyone
+/// recruited lands in `recruited` so teardown can Release them. While the publish is
+/// `shielded`, every recruited-set change also pushes the recruits' chain accounts
+/// into the session's origin-shield allowlist — the shield then answers ONLY peers
+/// whose chain-verified presence signer is one of these accounts.
+#[cfg(feature = "publish")]
+fn spawn_volunteer_recruiter(
+    session: Session,
+    stream: StreamId,
+    manifest_cid: Arc<Mutex<Option<String>>>,
+    recruited: Recruited,
+    shielded: bool,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let target = helpers_target();
+        let book = session.presence_book();
+        let me = session.my_peer;
+        let mut cooldown: HashMap<[u8; 32], std::time::Instant> = HashMap::new();
+        let mut warned_no_identity = false;
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            // No manifest on Bulletin yet → a volunteer couldn't verify the stream
+            // (the seeds refuse a recruitment whose CID doesn't resolve). Wait.
+            let Some(cid) = manifest_cid.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            else {
+                continue;
+            };
+            // Coverage: live relay-flagged peers already helping (never count ourselves).
+            let relays = book
+                .snapshot()
+                .into_iter()
+                .filter(|r| r.relay && PeerId(r.peer_id) != me)
+                .count();
+            if relays >= target {
+                continue;
+            }
+            let Some(publisher) = unstation_chain::identity_public() else {
+                if !warned_no_identity {
+                    warned_no_identity = true;
+                    log::warn!("[recruit] no chain identity — cannot sign recruitments");
+                }
+                continue;
+            };
+            let now = unix_now();
+            let mut cands = match unstation_chain::volunteer::read_volunteers(64, now).await {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("[recruit] volunteer rendezvous read failed: {e:?}");
+                    continue;
+                }
+            };
+            cooldown.retain(|_, t| t.elapsed() < Duration::from_secs(60));
+            cands.retain(|v| !cooldown.contains_key(&v.peer_id) && v.active_streams < v.max_streams);
+            // Rank: load ratio ascending, then caps_upload_bps descending; a fresh
+            // random salt per tick breaks ties so equal volunteers share the load
+            // across the network's publishers instead of everyone picking the same one.
+            let salt = std::collections::hash_map::RandomState::new();
+            let shuffle = |v: &VolunteerRecord| std::hash::BuildHasher::hash_one(&salt, v.peer_id);
+            cands.sort_by(|a, b| {
+                let load = |v: &VolunteerRecord| v.active_streams as f64 / v.max_streams.max(1) as f64;
+                load(a)
+                    .partial_cmp(&load(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(b.caps_upload_bps.cmp(&a.caps_upload_bps))
+                    .then(shuffle(a).cmp(&shuffle(b)))
+            });
+            for vol in cands.into_iter().take(target - relays) {
+                let mut rec = Recruitment {
+                    version: RECRUITMENT_VERSION,
+                    stream_id: stream.0,
+                    manifest_cid: cid.clone(),
+                    publisher,
+                    issued_at: unix_now(),
+                    action: RecruitAction::Recruit,
+                    sig: [0u8; 64],
+                };
+                let Some(sig) = unstation_chain::sign_with_identity_ctx(
+                    RECRUIT_CONTEXT,
+                    &rec.signing_payload(&PeerId(vol.peer_id)),
+                ) else {
+                    break; // identity vanished mid-tick; the next tick handles it
+                };
+                rec.sig = sig;
+                cooldown.insert(vol.peer_id, std::time::Instant::now());
+                let prio = recruit_prio(rec.issued_at, false);
+                match unstation_chain::volunteer::publish_recruitment(
+                    &vol.enc_pub,
+                    &vol.peer_id,
+                    &rec.encode(),
+                    prio,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        log::info!(
+                            "[recruit] recruited volunteer {} ({} of {} helpers present)",
+                            crypto::hex32(&vol.peer_id),
+                            relays,
+                            target
+                        );
+                        recruited
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(vol.peer_id, (vol.enc_pub, vol.account));
+                        if shielded {
+                            // Keep the shield's allowlist in lockstep with the
+                            // recruited set (replace-style, so it's always exact).
+                            let allow: HashSet<[u8; 32]> = recruited
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .values()
+                                .map(|(_, account)| *account)
+                                .collect();
+                            session.set_shield_allow(allow);
+                        }
+                    }
+                    Err(e) => log::warn!("[recruit] recruitment post failed: {e:?}"),
+                }
+            }
+        }
+    })
+}
+
+/// Best-effort Release (R5) to every volunteer recruited this session — fresh
+/// `issued_at`, same per-volunteer signing — so helpers stop seeding a dead stream
+/// instead of waiting out the recruitment freshness window. Spawned on tauri's
+/// runtime handle: `stop_publish` is a sync command on the main thread, where a bare
+/// `tokio::spawn` would panic (no reactor — see `stop_watch`).
+#[cfg(feature = "publish")]
+fn release_recruits(
+    stream: StreamId,
+    manifest_cid: &Arc<Mutex<Option<String>>>,
+    recruited: &Recruited,
+) {
+    let vols: Vec<_> =
+        recruited.lock().unwrap_or_else(|e| e.into_inner()).drain().collect();
+    if vols.is_empty() {
+        return;
+    }
+    let cid =
+        manifest_cid.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
+    let Some(publisher) = unstation_chain::identity_public() else {
+        return; // nothing could have been recruited without an identity anyway
+    };
+    tauri::async_runtime::spawn(async move {
+        for (peer, (enc_pub, _account)) in vols {
+            let mut rec = Recruitment {
+                version: RECRUITMENT_VERSION,
+                stream_id: stream.0,
+                manifest_cid: cid.clone(),
+                publisher,
+                issued_at: unix_now(),
+                action: RecruitAction::Release,
+                sig: [0u8; 64],
+            };
+            let Some(sig) = unstation_chain::sign_with_identity_ctx(
+                RECRUIT_CONTEXT,
+                &rec.signing_payload(&PeerId(peer)),
+            ) else {
+                return;
+            };
+            rec.sig = sig;
+            let prio = recruit_prio(rec.issued_at, true);
+            if let Err(e) = unstation_chain::volunteer::publish_recruitment(
+                &enc_pub,
+                &peer,
+                &rec.encode(),
+                prio,
+            )
+            .await
+            {
+                log::warn!("[recruit] release failed (best-effort): {e:?}");
+            }
+        }
+    });
 }
 
 /// Desktop publish: ffmpeg listens for an RTMP ingest (OBS) and segments it into CMAF.
@@ -1475,6 +1742,10 @@ async fn start_publish(
     // `#k=` fragment. Present → every segment + init is sealed with it; the mesh/seeds/
     // Bulletin carry only ciphertext.
     key: Option<String>,
+    // Origin-shield ("Hide my connection"): serve only recruited relay volunteers, so
+    // ordinary viewers never see the publisher's address. Absent (old callers) = off;
+    // the UNSTATION_SHIELD env still forces it on regardless.
+    shield: Option<bool>,
 ) -> Result<PublishInfo, String> {
     let _busy = claim_pub_busy(&state)?; // one setup at a time — see AppState::pub_busy
     if !*state.chain_ready.lock().unwrap() {
@@ -1529,9 +1800,13 @@ async fn start_publish(
     let session = Session::start(stream, 1, stun(), pub_tx.clone())?;
     session.set_max_inbound(128);
     // Origin-shield (privacy, opt-in): answer only relay volunteers so the publisher's
-    // IP never reaches the audience. Env for now (a Settings toggle can push it via a
-    // command later); requires seeds to exist to carry the stream — an honest trade.
-    if shield_publish() {
+    // IP never reaches the audience. The UI's "Hide my connection" toggle ORs with the
+    // UNSTATION_SHIELD env force; requires seeds to carry the stream — an honest trade.
+    let shielded = shield.unwrap_or(false) || shield_publish();
+    // Effective helpers (R5): the Settings/env preference, FORCED on while shielded —
+    // a shielded publisher serves only relay volunteers, so it must recruit them.
+    let helpers_on = state.helpers_allowed.load(Ordering::Relaxed) || shielded;
+    if shielded {
         session.set_shield(true);
         log::info!("[publish] origin-shield ON — serving only relay volunteers");
     }
@@ -1575,8 +1850,9 @@ async fn start_publish(
     // into `tasks` so teardown really ends the stream (a surviving presence loop would
     // keep announcing it to the chain forever).
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
-    // Origin-shield: learn the relay seeds we're allowed to answer (see set_shield).
-    if shield_publish() {
+    // Relay discovery feeds origin-shield's answer gate AND the recruiter's coverage
+    // count — spawn it once whenever helpers are in play (shield implies helpers).
+    if helpers_on {
         tasks.push(session.spawn_relay_discovery());
     }
     tasks.push(session.spawn_presence(80_000_000, true, Arc::new(AtomicBool::new(true))));
@@ -1586,6 +1862,7 @@ async fn start_publish(
     // publisher waits for it, puts it on Bulletin, and references it in the signed manifest so
     // viewers can initialize MSE before any media fragment.
     let init_slot: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
+    let manifest_cid_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     tasks.push(spawn_manifest_publish(
         app.clone(),
         &session,
@@ -1593,7 +1870,19 @@ async fn start_publish(
         init_slot.clone(),
         whip.then_some(LL_PART_MS),
         stream_key.is_some(),
+        manifest_cid_slot.clone(),
     ));
+    // R5 — recruit volunteer seeds to help carry the stream, gated on effective helpers.
+    let recruited: Recruited = Arc::new(Mutex::new(HashMap::new()));
+    if helpers_on {
+        tasks.push(spawn_volunteer_recruiter(
+            session.clone(),
+            stream,
+            manifest_cid_slot.clone(),
+            recruited.clone(),
+            shielded,
+        ));
+    }
     let (edge_tx, edge_rx) = unbounded_channel::<(Seq, SegmentId)>();
     tasks.push(session.spawn_edge_publisher(edge_rx));
 
@@ -1897,6 +2186,9 @@ async fn start_publish(
         name: canon,
         info: info.clone(),
         live: live_flag,
+        stream,
+        manifest_cid: manifest_cid_slot,
+        recruited,
     });
 
     Ok(info)
@@ -1913,6 +2205,8 @@ async fn start_publish(
     title: Option<String>,
     // Invite-only stream key (hex) from the UI; seals every camera segment + init.
     key: Option<String>,
+    // Origin-shield ("Hide my connection") — see the desktop command; absent = off.
+    shield: Option<bool>,
 ) -> Result<PublishInfo, String> {
     let _busy = claim_pub_busy(&state)?; // one setup at a time — see AppState::pub_busy
     if !*state.chain_ready.lock().unwrap() {
@@ -1948,8 +2242,13 @@ async fn start_publish(
     // origin still shouldn't sit at the viewer default.
     session.set_max_inbound(64);
     // Origin-shield (privacy): a phone publisher is exactly who most wants its IP off
-    // the audience's peer list — serve only relay volunteers when opted in.
-    if shield_publish() {
+    // the audience's peer list — serve only relay volunteers when opted in. The UI's
+    // "Hide my connection" toggle ORs with the UNSTATION_SHIELD env force.
+    let shielded = shield.unwrap_or(false) || shield_publish();
+    // Effective helpers (R5): the Settings/env preference, FORCED on while shielded —
+    // a shielded publisher serves only relay volunteers, so it must recruit them.
+    let helpers_on = state.helpers_allowed.load(Ordering::Relaxed) || shielded;
+    if shielded {
         session.set_shield(true);
         log::info!("[publish] origin-shield ON — serving only relay volunteers");
     }
@@ -1979,13 +2278,15 @@ async fn start_publish(
     });
     // Track every spawned task so teardown really ends the stream (see the desktop path).
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
-    // Origin-shield: learn the relay seeds we're allowed to answer (see set_shield).
-    if shield_publish() {
+    // Relay discovery feeds origin-shield's answer gate AND the recruiter's coverage
+    // count — spawn it once whenever helpers are in play (shield implies helpers).
+    if helpers_on {
         tasks.push(session.spawn_relay_discovery());
     }
     tasks.push(session.spawn_presence(80_000_000, true, Arc::new(AtomicBool::new(true))));
 
     let init_slot: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
+    let manifest_cid_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     tasks.push(spawn_manifest_publish(
         app.clone(),
         &session,
@@ -1993,7 +2294,19 @@ async fn start_publish(
         init_slot.clone(),
         Some(LL_PART_MS),
         stream_key.is_some(),
+        manifest_cid_slot.clone(),
     ));
+    // R5 — recruit volunteer seeds to help carry the stream, gated on effective helpers.
+    let recruited: Recruited = Arc::new(Mutex::new(HashMap::new()));
+    if helpers_on {
+        tasks.push(spawn_volunteer_recruiter(
+            session.clone(),
+            stream,
+            manifest_cid_slot.clone(),
+            recruited.clone(),
+            shielded,
+        ));
+    }
 
     let (edge_tx, edge_rx) = unbounded_channel::<(Seq, SegmentId)>();
     tasks.push(session.spawn_edge_publisher(edge_rx));
@@ -2082,6 +2395,9 @@ async fn start_publish(
         name: canon,
         info: info.clone(),
         live: live_flag,
+        stream,
+        manifest_cid: manifest_cid_slot,
+        recruited,
     });
     Ok(info)
 }
@@ -2097,6 +2413,9 @@ fn teardown_publish(sess: PublishSession) {
     for t in sess.tasks {
         t.abort();
     }
+    // With the recruiter aborted (no new recruits can race in), tell every volunteer
+    // recruited this session it can stop seeding — best-effort, in the background.
+    release_recruits(sess.stream, &sess.manifest_cid, &sess.recruited);
     let _ = sess.pub_tx.send(EngineEvent::Stop);
     sess.session.shutdown();
     // `_hls` drops here.
@@ -2228,7 +2547,12 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         // shell additionally registers single-instance (with its `deep-link` feature) so a
         // second launch forwards its argv URL here instead of opening a new window.
         .plugin(tauri_plugin_deep_link::init())
-        .manage(AppState::default());
+        .manage(AppState {
+            // Volunteer helpers default from the env (`UNSTATION_HELPERS != "0"`);
+            // Settings overrides at runtime via `set_use_helpers`.
+            helpers_allowed: Arc::new(AtomicBool::new(use_helpers())),
+            ..AppState::default()
+        });
     // Android camera-publish (M4): register the Kotlin CameraPlugin (Camera2 + MediaCodec →
     // encoded AUs into the Rust core via CameraBridge). JS drives it via `plugin:unstation-camera`.
     #[cfg(all(target_os = "android", feature = "publish"))]
@@ -2244,9 +2568,6 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
     #[cfg(feature = "publish")]
     let b = b.invoke_handler(tauri::generate_handler![
         platform,
-        signin_status,
-        begin_signin,
-        complete_signin,
         resolve_stream,
         set_chain_identity,
         set_bulletin_identity,
@@ -2259,6 +2580,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         fast_watch_stop,
         set_lend_cap,
         set_fast_connect,
+        set_use_helpers,
+        chain_health,
         start_publish,
         stop_publish,
         publish_status,
@@ -2270,9 +2593,6 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
     #[cfg(not(feature = "publish"))]
     let b = b.invoke_handler(tauri::generate_handler![
         platform,
-        signin_status,
-        begin_signin,
-        complete_signin,
         resolve_stream,
         set_chain_identity,
         set_bulletin_identity,
@@ -2285,6 +2605,8 @@ pub fn builder() -> tauri::Builder<tauri::Wry> {
         fast_watch_stop,
         set_lend_cap,
         set_fast_connect,
+        set_use_helpers,
+        chain_health,
         set_keep_awake,
         open_app_settings
     ]);

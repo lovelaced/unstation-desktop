@@ -11,11 +11,16 @@ unstation-core = { path = "../unstation-core" }
 # The chain SDK's native facade (statement store, wallet, VRF, bulletin).
 # Mirrors truhost/desktop/src-tauri's dependency on the same crate.
 useragent-native = { package = "useragent-native", path = "../../../useragent-kit/crates/host-native" }
+# Mobile SSO V2 (headless pairing + allowance slot request) — see sso_pair.rs.
+useragent-sso = { package = "useragent-sso", path = "../../../useragent-kit/crates/host-sso" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros"] }
 parity-scale-codec = { version = "3", features = ["derive"] }
 schnorrkel = "0.11"
 bytes = "1"
 log = "0.4"
+zeroize = "1"
+serde_json = "1"
+hex = "0.4"
 # NOTE: the SDK's `testnet-provisioning` auto-provision is NOT used — it targets the
 # production "Paseo People Next" runtime, not a local kitchensink dev node. The chain_e2e
 # allowance is granted out-of-band, runtime-correctly, by scripts/provision-allowance.sh.

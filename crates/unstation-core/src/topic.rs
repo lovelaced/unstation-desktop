@@ -56,6 +56,27 @@ pub fn durable_topic(stream: &StreamId) -> TopicId {
     blake2b256(&buf)
 }
 
+/// Global volunteer rendezvous topic: `BLAKE2b-256("unstation/volunteers/v1")`.
+///
+/// This is deliberately the ONLY non-per-stream topic besides the readiness probe:
+/// streams are non-enumerable (every other topic hashes in a stream id you must
+/// already know), so a publisher looking for spare capacity has no way to find idle
+/// seeds — and an idle seed has no stream to announce on. Open volunteer seeds
+/// announce a `VolunteerRecord` here; publishers read it and recruit via each
+/// volunteer's per-peer [`recruit_topic`] inbox.
+pub fn volunteers_topic() -> TopicId {
+    blake2b256(b"unstation/volunteers/v1")
+}
+
+/// Per-volunteer recruitment inbox: `BLAKE2b-256("recruit" ‖ peer_id)`. A publisher
+/// posts sealed `Recruitment`s here to assign (or release) a stream on that volunteer.
+pub fn recruit_topic(volunteer: &PeerId) -> TopicId {
+    let mut buf = Vec::with_capacity(7 + 32);
+    buf.extend_from_slice(b"recruit");
+    buf.extend_from_slice(&volunteer.0);
+    blake2b256(&buf)
+}
+
 /// Which discovery shard a peer announces into: `peer_id mod N_shards`.
 pub fn shard_for(peer: &PeerId, n_shards: u32) -> u32 {
     if n_shards <= 1 {
@@ -83,6 +104,34 @@ mod tests {
         // The fast tier's per-peer topic is distinct from the mesh signaling topic.
         assert_ne!(fast_signaling_topic(&s, &p), signaling_topic(&s, &p));
         assert_eq!(fast_signaling_topic(&s, &p), fast_signaling_topic(&s, &p));
+    }
+
+    #[test]
+    fn volunteer_topics_are_pinned_and_domain_separated() {
+        // The global rendezvous is a fixed hash — pinned so the derivation (and every
+        // deployed seed's announce address) can never drift silently.
+        assert_eq!(
+            crate::crypto::hex32(&volunteers_topic()),
+            "afac5db536e197cbfbb6181edf7d542cc6f7d3a6f3e9f7ad417ee1dc9caf33ed"
+        );
+
+        // Recruit inboxes are per-volunteer.
+        let a = PeerId::from_u64(1);
+        let b = PeerId::from_u64(2);
+        assert_eq!(recruit_topic(&a), recruit_topic(&a));
+        assert_ne!(recruit_topic(&a), recruit_topic(&b));
+
+        // And domain-separated from every existing topic even when the volunteer's
+        // peer bytes equal a stream's bytes.
+        let bytes = [1u8; 32];
+        let (s, p) = (StreamId(bytes), PeerId(bytes));
+        let recruit = recruit_topic(&p);
+        assert_ne!(recruit, volunteers_topic());
+        assert_ne!(recruit, discovery_topic(&s, 0));
+        assert_ne!(recruit, signaling_topic(&s, &p));
+        assert_ne!(recruit, fast_signaling_topic(&s, &p));
+        assert_ne!(recruit, edge_topic(&s));
+        assert_ne!(recruit, durable_topic(&s));
     }
 
     #[test]

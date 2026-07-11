@@ -32,6 +32,7 @@ pub mod topic;
 pub mod transport;
 pub mod transport_mem;
 pub mod types;
+pub mod volunteer;
 
 pub use config::{MeshConfig, Mode, PickerWeights, Role};
 pub use engine::MeshEngine;

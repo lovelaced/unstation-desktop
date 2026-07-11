@@ -2,7 +2,7 @@
 
 # Unstation
 
-*Broadcast and watch live video peer-to-peer — no servers, no CDN, no central point of failure.*
+*Live video that no one can switch off. Watch and broadcast peer to peer, with no server in the middle.*
 
 ![Platform](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Windows%20%C2%B7%20Linux%20%C2%B7%20Android-lightgrey?style=flat-square)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)
@@ -18,177 +18,101 @@
 
 ---
 
-Unstation is a desktop app for live streaming with no infrastructure in the middle. You broadcast
-from OBS (or the built-in ingest); viewers pull the video directly from you — and from each other —
-over a WebRTC mesh, so the more people watch, the more capacity there is. Discovery and the
-connection handshake ride the Polkadot statement store; a durable copy of the stream's identity
-lives on the Bulletin chain. There is no origin server, no CDN, and no relay operator to take down.
+Most live streaming runs through a company's servers. That company can throttle it, take it down, or
+just switch it off. Unstation has no servers. The video goes straight from the person broadcasting to
+the people watching, and from viewer to viewer, so there is nothing in the middle to pull the plug on.
 
-There's also an [Android app](https://github.com/lovelaced/unstation-android) that watches the same
-streams and broadcasts straight from the phone camera.
+The more people watch, the more capacity there is, because everyone watching also helps pass the
+stream along. You sign in once by scanning a code with the Polkadot app on your phone. There are no
+accounts, no email, and no company holding your details.
 
-## Features
+There is a desktop app for macOS, Windows, and Linux, and an
+[Android app](https://github.com/lovelaced/unstation-android) that watches the same streams and can
+broadcast straight from your phone camera.
 
-- **No servers in the path** — viewers exchange video over direct WebRTC data channels. Peer discovery and the initial handshake ride the Polkadot statement store; nothing is hosted, nothing is operator-run.
-- **Publish from OBS in seconds** — the app exposes a standard local RTMP ingest, so any encoder works. Point OBS at it and go live; a guided setup panel appears if the encoder hasn't connected.
-- **Invite your friends with a link** — every stream gets an `unstation://watch/<name>` link plus a QR code. Opening it lands straight in the stream; typing the name still works.
-- **Every segment cryptographically verified** — each chunk is content-addressed with `blake2b256` and the stream is signed with the publisher's key, so a malicious peer can't slip in fake video. Peers that serve forged bytes are scored down and banned.
-- **Honest, legible states** — joining, catching up, "can't reach anyone", and "the broadcast ended" are real states driven by the engine, with retry paths — never an eternal spinner. Publishers get a live dashboard: preflight checks, viewers, encoder and uplink bitrate.
-- **Bandwidth that scales with the crowd** — a deadline-aware piece-picker pulls each segment from the fastest peer that has it, and viewers that prove reachable automatically volunteer as relays for peers stuck behind NAT.
-- **Scan-once sign-in** — prove you're a person by scanning a QR with your Polkadot app. Your keys never leave your phone; the desktop only ever holds a small, revocable network pass.
-- **One Rust core, deterministically tested** — the mesh engine is IO-agnostic and runs hundreds of virtual peers under a seeded simulator, with adversarial-peer and churn suites gating CI.
+## What you can do
 
-## Quick start
+- **Watch.** Open an invite link, or type a stream's name. Unstation finds whoever is broadcasting,
+  checks that the video really came from them, and plays it.
+- **Broadcast.** Point OBS (or any streaming app) at Unstation and go live, or broadcast from your
+  phone camera. Share a link and people can watch right away.
+- **Help out.** Run a small program on a spare server and it becomes a *relay*, lending its bandwidth
+  so people on hard networks (phones on cell data, viewers behind strict firewalls) can still connect.
+  See [Run a relay](docs/run-a-relay.md).
 
-<details>
-<summary>Prerequisites</summary>
+## Why it's different
 
-- **Rust** (stable) — `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
-- **Node + pnpm** — `npm i -g pnpm`
-- **ffmpeg** — required to publish (RTMP → CMAF). `brew install ffmpeg` on macOS.
-- **The chain SDK** — a private Polkadot Rust SDK this app builds against, checked out as
-  `../useragent-kit` (a sibling of this repo). Ask the maintainers for access.
+- **No one in the middle.** The video travels directly between people over an encrypted connection.
+  Nothing is hosted on a server, so there is no operator to pressure and nothing central to take down.
+- **You can't be fed fake video.** Every piece of the stream is fingerprinted and signed by the
+  broadcaster, so if a bad actor tries to slip in altered video, your app rejects it automatically.
+- **Private by default.** The addresses that connect people are always encrypted in transit. You can
+  make a stream *unlisted* (only people with the link can find it) or *invite only* (end to end
+  encrypted, so even the relays passing it along can't watch it).
+- **It gets stronger with a crowd.** Instead of buckling under load like a single server, a bigger
+  audience means more people sharing the stream, so popular broadcasts hold up better, not worse.
+- **Honest about what's happening.** Connecting, catching up, "can't reach anyone right now", "the
+  broadcast ended" are real, plainly-worded states, never an endless spinner that hides a problem.
 
-</details>
+## How it works, in a nutshell
+
+There is no central directory of streams. Instead, Unstation uses a public, permissionless
+noticeboard (the Polkadot statement store) where broadcasters post a tiny "I'm live, here's how to
+reach me" note, and viewers post encrypted notes to set up a direct connection. Once two people are
+connected, the video itself flows straight between them, never touching the noticeboard.
+
+Each broadcaster signs their stream with a key that only they hold, and every chunk of video is
+addressed by its own fingerprint, so your app can prove that what it plays is exactly what the
+broadcaster sent. Relays and other viewers can pass the video along, but they can never change it.
+
+For the full picture, see [How it works](docs/how-it-works.md). For the wire-level details, the
+[Protocol](docs/protocol.md) reference. For the honest security story (what's protected, what leaks,
+and the threat model), [Security and FAQ](docs/security.md).
+
+## Install
+
+Download a build from [Releases](https://github.com/lovelaced/unstation-desktop/releases), or run
+it from source:
 
 ```bash
-# Run the desktop app (publisher + viewer in one)
 cd desktop
 pnpm install
 pnpm tauri dev
 ```
 
-Build and test the mesh engine on its own (no GUI, no chain):
+Building the full app needs a few tools and access to a private Polkadot SDK. The engine on its own
+builds and tests with no chain and no GUI. See
+[Contributing and building from source](docs/contributing.md) for the details.
 
-```bash
-cargo test --workspace      # engine + deterministic simulator + adversarial/churn suites
-cargo bench                 # criterion benchmarks
-```
+## Documentation
 
-Or install a prebuilt `.dmg` from [Releases](https://github.com/lovelaced/unstation-desktop/releases).
+| Doc | For |
+|-----|-----|
+| [How it works](docs/how-it-works.md) | The whole system in plain but technical language, with a diagram |
+| [Protocol](docs/protocol.md) | Wire formats, the chain layer, the mesh, the trust chain |
+| [Security](docs/security.md) | The threat model, what's protected, what leaks, honest limits |
+| [FAQ](docs/faq.md) | Is it private, is it legal, what do I need, what does it cost |
+| [Run a relay](docs/run-a-relay.md) | Lend bandwidth from a spare server in one command |
+| [Contributing](docs/contributing.md) | Repo layout, building the app and the relay, running the tests |
 
-## Usage
-
-### Watch a stream
-
-Open an invite link — or open the app, sign in once with your Polkadot app, and type the stream
-name. Unstation resolves it, verifies the publisher's signed manifest, connects over WebRTC, and
-plays the verified video. The status line shows the truth: `LIVE · P2P · N peers`, catching up,
-or an honest "can't reach anyone" with the app still retrying underneath.
-
-### Go live from OBS
-
-1. In the app, choose **Go Live** and name the stream — this opens the local RTMP ingest.
-2. In OBS: **Settings → Stream → Service: Custom**, Server `rtmp://127.0.0.1:21935/live`, Stream Key `unstation`.
-3. **Start Streaming.** The console flips to LIVE when real fragments arrive, and shows your
-   preflight (`identity ✓ · announced ✓ · encoder ✓`), viewers, and bitrates.
-4. Share the invite link (or QR) from the console.
-
-No OBS handy? `scripts/mock-obs.sh` is a faithful ffmpeg stand-in:
-
-```bash
-scripts/mock-obs.sh                 # moving test pattern + tone → the default ingest
-scripts/mock-obs.sh -i clip.mp4     # stream a file (looped) instead
-scripts/mock-obs.sh -t 10           # one-shot 10 s (handy in tests)
-```
-
-The full real-media path (OBS-style RTMP → segmenter → mesh → HLS → `ffprobe`-verified playback)
-is covered by `cargo test -p hls-server --test go_live -- --ignored`.
-
-## Test on a second Mac over your LAN
-
-Unstation is peer-to-peer, so the real test is two machines. The
-[`Release macOS DMG`](.github/workflows/release-macos.yml) workflow produces a universal
-(Apple Silicon + Intel) `.dmg` you can install on a second Mac.
-
-### 1. Build the DMG
-
-If CI has credentials for the private chain SDK (**Settings → Secrets and variables → Actions**:
-secret `SDK_TOKEN`, variable `SDK_REPO`, optional `SDK_REF`), run
-**Actions → "Release macOS DMG" → Run workflow** with a version tag (e.g. `v0.1.0`) — it builds
-the universal `.dmg` and publishes a GitHub Release with notes.
-
-> **No CI credential?** Build on your own machine — you already have the SDK checked out next to
-> this repo:
->
-> ```bash
-> scripts/release-macos.sh            # build only → prints the .dmg path to AirDrop to the other Mac
-> scripts/release-macos.sh v0.1.0     # build + cut a GitHub release (needs `gh`, logged in)
-> ```
->
-> Same universal `.dmg` and the same git-cliff notes, no tokens involved.
-
-### 2. Install on both Macs
-
-Open the `.dmg` and drag **Unstation** into Applications. The build is unsigned, so Gatekeeper
-blocks the first launch — clear the quarantine flag once:
-
-```bash
-xattr -dr com.apple.quarantine /Applications/Unstation.app
-```
-
-(Or right-click the app → **Open** → **Open**.)
-
-### 3. Stream between them
-
-Both Macs need **internet access** — discovery and the connection handshake ride the Polkadot
-statement store; only the video itself is direct peer-to-peer. The **publishing** Mac also needs
-**ffmpeg** (`brew install ffmpeg`).
-
-**Mac A — publish:**
-
-1. Launch Unstation and sign in (scan the QR with your Polkadot app).
-2. Choose **Go Live** and name the stream (e.g. `lan-test`).
-3. Point OBS at `rtmp://127.0.0.1:21935/live` (Stream Key `unstation`) and **Start Streaming**.
-
-**Mac B — watch:**
-
-1. Launch Unstation and sign in.
-2. Choose **Watch** and enter the same name (`lan-test`).
-
-**Success looks like:** Mac B plays the video and the status line reads `LIVE · P2P · 1 peer`.
-When macOS prompts to allow incoming network connections, click **Allow** (the direct WebRTC link
-needs it). Cross-network pairs use STUN and volunteer relays; for networks where nothing else
-works, operator-provided TURN servers can be supplied via `UNSTATION_TURN`.
-
-## How it works
-
-Each live segment flows through one pipeline:
-
-1. **Ingest** — ffmpeg accepts RTMP from OBS and packages it into CMAF/fMP4 segments, keyframe-aligned at 1 s for low latency.
-2. **Address & sign** — every segment is hashed (`blake2b256`); the publisher signs the manifest and live edge with its `sr25519` key.
-3. **Announce** — the publisher posts presence to the Polkadot statement store and anchors its signed manifest + init segment on the Bulletin chain; viewers discover it by name.
-4. **Connect** — viewer and publisher exchange SDP/ICE over the statement store, then open a direct WebRTC link (a reliable `ctrl` channel + an unreliable `bulk` channel). A connection maintainer redials with backoff and reacts to drops instantly.
-5. **Pull, verify, play** — a deadline-aware picker requests segments from the best peer (weighted by measured throughput, latency, and reputation), verifies each against its content hash, and feeds a localhost HLS server that the player reads. Segments then reshare peer-to-peer, and the live edge propagates by signed in-mesh gossip.
-
-The engine is split into small, IO-agnostic crates so it runs identically in production and in the simulator:
-
-| Crate | Role |
-|-------|------|
-| `unstation-core` | The mesh engine — deadline picker, buffer maps, content-addressed store, SCALE wire protocol, reassembly + verify, peer scoring/bans, bounded-memory hardening. Traits + injected clock, no IO. |
-| `transport-libdc` | Real WebRTC data-channel transport (libdatachannel): two channels per peer, trickle ICE, degree caps. |
-| `unstation-chain` | Discovery, SDP-over-statement signaling, the live-edge manifest, and the Bulletin origin-of-record. |
-| `unstation-session` | Orchestrator — dial pacing/backoff, the connection maintainer, and the publish/watch bootstrap. |
-| `unstation-app` | The Tauri command/event layer shared by the desktop and Android shells. |
-| `hls-server` | Localhost HLS re-server that feeds verified segments to the player. |
-| `infra/segmenter` | The ffmpeg RTMP → CMAF segmenter (the OBS ingest) and the on-device CMAF muxer. |
-| `unstation-node` | Headless seed/relay scaffold (volunteer relaying currently happens in-app: reachable viewers auto-promote). |
-| `desktop/` | Tauri app (Rust shell + web UI): Watch / Go Live / Settings. |
+The docs are also published as a [site](https://lovelaced.github.io/unstation-desktop/).
 
 ## Status
 
-Experimental. Working today: two-machine publish/watch over real WebRTC, signed-manifest trust,
-camera broadcasting from [Android](https://github.com/lovelaced/unstation-android), invite links,
-peer scoring with bans, volunteer relaying, and the Bulletin anchor for the stream's identity.
-On the roadmap: a dedicated seed mode with its own budget controls, segment-level durable
-fallback, push-based signaling, and a sub-2-second WebRTC media path. It reuses unaudited
-prototypes as references — measure live chain limits before relying on it for an event.
+Experimental and unaudited. Working today: broadcasting and watching between machines over real
+peer-to-peer connections, signed-stream trust so video can't be forged, invite links, unlisted and
+end-to-end-encrypted streams, hiding the broadcaster's address behind volunteer relays, a durable
+backup copy of each stream's identity, a sub-second low-latency path for trusted viewers, and
+open relays that anyone can run on a spare server in one command.
+
+It leans on unaudited prototype components and a public test network. Measure the live limits before
+you rely on it for something that matters.
 
 ## Contributing
 
-Issues and pull requests are welcome. Before opening a PR run `scripts/test-all.sh` (or at least
-`cargo test --workspace`) — the deterministic simulator, the adversarial/churn suites, and the
-engine coverage gate (≥ 90%) must stay green.
+Issues and pull requests are welcome. Before opening a PR, run `scripts/test-all.sh` (or at least
+`cargo test --workspace`): the deterministic simulator, the adversarial and churn suites, and the
+engine coverage gate must stay green. See [Contributing](docs/contributing.md) to get set up.
 
 ## License
 

@@ -24,6 +24,17 @@ export function clearWatchUi(){ cancelStallLadder(); const c=document.getElement
 let ladderTimers=[];
 export function cancelStallLadder(){ ladderTimers.forEach(clearTimeout); ladderTimers=[]; }
 function vidPlaying(){ const v=document.getElementById('vid'); return !!(v && v.readyState>=3 && !v.paused); }
+
+// GOING QUIET, shared by the 45s give-up rung and terminal watch errors (e.g. an
+// invite-only stream without its key): stop the ladder, drop keep-awake, and stop the
+// backend watch outright — its signaling poll + discovery + dialing would otherwise
+// keep running behind the card indefinitely (on cellular that pinned the radio and,
+// with the screen held on, produced real thermal warnings on-device).
+export function stopWatchQuietly(){
+  cancelStallLadder();
+  if(window.__keepAwake) window.__keepAwake(false);
+  if(NATIVE && invoke) invoke('stop_watch').catch(()=>{});
+}
 export function startWatchWatchdog(){
   cancelStallLadder();
   ladderTimers.push(setTimeout(()=>{ if(!vidPlaying()) setCatchup('<span class="spin"></span>'+STRINGS.catchingUp); }, 3000));
@@ -34,13 +45,9 @@ export function startWatchWatchdog(){
     setCatchup('<div class="giveup"><div>'+msg+'</div><div class="giveup-row">'
       +'<button class="btn" id="retryWatchBtn" type="button">'+STRINGS.tryAgain+'</button>'
       +'<button class="btn ghost" id="giveUpLeaveBtn" type="button">'+STRINGS.leave+'</button></div></div>');
-    // Giving up means GOING QUIET, not just showing a card: the session used to keep
-    // its active signaling poll + discovery + dialing running behind the card
-    // indefinitely — on cellular that pinned the radio and (with the screen held on)
-    // produced real thermal warnings on-device. Stop the watch outright; "Try again"
-    // re-runs a full start_watch from S.watchTarget, so nothing is lost.
-    if(window.__keepAwake) window.__keepAwake(false);
-    if(NATIVE && invoke) invoke('stop_watch').catch(()=>{});
+    // Giving up means going quiet (see stopWatchQuietly); "Try again" re-runs a full
+    // start_watch from S.watchTarget, so nothing is lost.
+    stopWatchQuietly();
   }, 45000));
 }
 
@@ -221,7 +228,10 @@ function updateBehindLive(){
   const mt=document.getElementById('modeText');
   if(!watching){ behindSuffix=''; hideSkipChip(); return; }
   const b=behindLiveSecs();
+  // Hysteresis: appear past 6s behind, disappear only once back under 3s — lag
+  // hovering around one threshold must not flap the chip in and out of the HUD.
   if(b!=null && b>6){ behindSuffix=STRINGS.behindLive(Math.round(b)); if(skipBtn) skipBtn.hidden=false; }
+  else if(b!=null && b>3 && skipBtn && !skipBtn.hidden){ behindSuffix=STRINGS.behindLive(Math.round(b)); }
   else { behindSuffix=''; hideSkipChip(); }
   if(mt) mt.textContent=stripBehind(mt.textContent)+behindSuffix;
 }

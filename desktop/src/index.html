@@ -41,7 +41,7 @@
       <aside class="entry-panel">
         <div class="eyebrow">Why it's different</div>
         <ul class="assure">
-          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2.4"/><circle cx="5" cy="6" r="1.8"/><circle cx="19" cy="6" r="1.8"/><circle cx="5" cy="18" r="1.8"/><circle cx="19" cy="18" r="1.8"/><path d="M10 11 6.5 7.2M14 11l3.5-3.8M10 13l-3.5 3.8M14 13l3.5 3.8"/></svg><span><b>No server in the path</b>Peers relay the video to each other — nothing to throttle or take down.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2.4"/><circle cx="5" cy="6" r="1.8"/><circle cx="19" cy="6" r="1.8"/><circle cx="5" cy="18" r="1.8"/><circle cx="19" cy="18" r="1.8"/><path d="M10 11 6.5 7.2M14 11l3.5-3.8M10 13l-3.5 3.8M14 13l3.5 3.8"/></svg><span><b>No server in the path</b>Peers relay the video to each other, so there's nothing to throttle or take down.</span></li>
           <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/></svg><span><b>Verified byte-for-byte</b>Every segment is content-addressed and signed by the publisher.</span></li>
           <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg><span><b>Keys stay on your phone</b>Sign in once with your Polkadot app; this device only holds a revocable allowance.</span></li>
         </ul>
@@ -55,7 +55,7 @@
         <div class="qr-copy">
           <div class="eyebrow">First time here</div>
           <h2>Pair your Polkadot app</h2>
-          <p>Two quick steps on your phone: <b>scan</b> this code, then <b>approve the network-access request</b> (you may need to sign — give it a moment). Your keys never leave your phone; this device only gets a small, revocable allowance. Sign-in is required to watch or go live.</p>
+          <p>Two quick steps on your phone: <b>scan</b> this code, then <b>approve the network-access request</b> (you may need to sign, so give it a moment). Your keys never leave your phone; this device only gets a small, revocable allowance. Sign-in is required to watch or go live.</p>
           <div class="row"><button class="btn" id="pairedBtn" type="button">I've scanned it</button><button class="btn ghost" data-goto="entry" type="button">Not now</button></div>
           <div class="await" id="pairStatus" style="display:none;margin-top:4px;"><span class="dot-await"></span><span id="pairStatusText">Linking…</span></div>
           <div class="row" id="allowRetry" style="display:none;gap:10px;margin-top:8px;"><button class="btn" id="retryAllowanceBtn" type="button">Try again</button><button class="btn ghost" id="rePairBtn2" type="button">Re-pair from scratch</button></div>
@@ -92,10 +92,11 @@
         <div class="set-row"><div><div class="set-k">Backup copy</div><div class="set-v"><span class="set-status"><span class="sdot" id="setBackupDot" data-h="wait"></span><span id="setBackup">—</span></span></div></div></div>
         <div class="set-row"><div><div class="set-k">Network status</div><div class="set-v"><span class="set-status"><span class="sdot" id="setNetDot" data-h="wait"></span><span id="setNetwork">Checking…</span></span></div></div></div>
         <div class="set-row"><div><div class="set-k">Connection health</div><div class="set-v"><span class="set-status"><span class="sdot" id="setHealthDot"></span><span id="setHealth">Not watching or streaming right now.</span></span></div></div></div>
-        <div class="set-row"><div><div class="set-k">Sharing your connection</div><div class="set-v"><span class="set-status"><span class="sdot" id="setLendDot"></span><span id="setLend">On while you watch</span></span></div><div class="set-v set-note" id="lendExplain"></div></div><div class="set-ctl"><select class="set-select" id="lendCap"><option value="0">Auto — pause when busy</option><option value="5000000">Up to 5 Mbps</option><option value="2000000">Up to 2 Mbps</option><option value="1000000">Up to 1 Mbps</option><option value="1">Off</option></select><button class="btn ghost" id="stopSeedBtn" type="button" style="display:none;">Stop</button></div></div>
+        <div class="set-row"><div><div class="set-k">Sharing your connection</div><div class="set-v"><span class="set-status"><span class="sdot" id="setLendDot"></span><span id="setLend">On while you watch</span></span></div><div class="set-v set-note" id="lendExplain"></div></div><div class="set-ctl"><select class="set-select" id="lendCap"><option value="0">Auto · pauses when busy</option><option value="5000000">Up to 5 Mbps</option><option value="2000000">Up to 2 Mbps</option><option value="1000000">Up to 1 Mbps</option><option value="1">Off</option></select><button class="btn ghost" id="stopSeedBtn" type="button" style="display:none;">Stop</button></div></div>
         <div class="set-row" id="rowCamQuality" hidden><div><div class="set-k">Camera quality</div><div class="set-v set-note" id="camQExplain"></div></div><div class="set-ctl"><select class="set-select" id="camQuality"><option value="720">Standard (720p)</option><option value="480">Data saver (480p)</option><option value="1080">High (1080p)</option></select></div></div>
         <div class="set-row" id="rowFastConnect"><div><div class="set-k">Fast connect</div><div class="set-v"><span class="set-status"><span class="sdot" id="setFastDot" data-h="good"></span><span id="setFast">On</span></span></div><div class="set-v set-note" id="fastSetExplain"></div></div><div class="set-ctl"><button class="btn ghost" id="fastConnectToggle" type="button">Turn off</button></div></div>
-        <div class="set-row"><div><div class="set-k">About</div><div class="set-v">Unstation · v0.0.0 · AGPL-3.0-or-later</div></div></div>
+        <div class="set-row" id="rowHelpers"><div><div class="set-k">Volunteer relays</div><div class="set-v"><span class="set-status"><span class="sdot" id="setHelpersDot" data-h="good"></span><span id="setHelpers">On</span></span></div><div class="set-v set-note" id="helpersExplain"></div></div><div class="set-ctl"><button class="btn ghost" id="helpersToggle" type="button">Turn off</button></div></div>
+        <div class="set-row"><div><div class="set-k">About</div><div class="set-v">Unstation · <span id="aboutVersion">v0.0.0</span> · AGPL-3.0-or-later</div></div></div>
       </div>
     </div>
 
@@ -111,11 +112,15 @@
           <div class="hint">viewers tune in with&nbsp;&nbsp;<b id="sharePreview" class="accent">friday-night-football</b></div>
           <label class="check-row" for="unlistedToggle">
             <input type="checkbox" id="unlistedToggle" />
-            <span class="check-copy"><b>Unlisted</b> — adds an unguessable code so only people you share the link with can find it</span>
+            <span class="check-copy"><b>Unlisted</b> · adds an unguessable code so only people you share the link with can find it</span>
           </label>
           <label class="check-row" for="encryptedToggle">
             <input type="checkbox" id="encryptedToggle" />
-            <span class="check-copy"><b>Invite-only</b> — encrypts the video end-to-end; only people with your link can watch, and relays never see the content</span>
+            <span class="check-copy"><b>Invite-only</b> · encrypts the video end-to-end; only people with your link can watch, and relays never see the content</span>
+          </label>
+          <label class="check-row" for="shieldToggle">
+            <input type="checkbox" id="shieldToggle" />
+            <span class="check-copy"><b>Hide my connection</b> · viewers get your stream through volunteer relays, so only the relays you recruit see your address. Starts a touch slower.</span>
           </label>
           <div class="pub-actions" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
             <button class="btn" id="startStream" type="button">Go live</button>
@@ -134,7 +139,7 @@
             <div id="pubWaiting" style="position:absolute;inset:0;z-index:5;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:11px;text-align:center;padding:26px">
               <span class="dot-await"></span>
               <b style="font-size:15px">Waiting for your encoder…</b>
-              <div id="pubWaitingHint" style="max-width:32rem;opacity:.72;font-size:12.5px;line-height:1.55">Point any encoder — OBS, or <code>scripts/mock-obs.sh</code> — at the server below and start streaming. Connect it any time, before or after this screen; it goes live on its own.</div>
+              <div id="pubWaitingHint" style="max-width:32rem;opacity:.72;font-size:12.5px;line-height:1.55">Point your streaming app, like OBS, at the server below and start streaming. Connect it any time, before or after this screen. It goes live on its own.</div>
             </div>
             <div id="pubVidDiag" class="diag" hidden></div>
           </div>
@@ -142,8 +147,8 @@
         <aside class="pub-rail">
           <div class="eyebrow">Connect your encoder</div>
           <div class="ingest-card">
-            <div class="field"><span class="k" id="ingestServerK">Server</span><code id="ingestServer">rtmp://127.0.0.1:21935/live</code><button class="copy" data-copy="ingestServer" type="button">Copy</button></div>
-            <div class="field" id="ingestKeyField"><span class="k">Stream key</span><code id="ingestKey">unstation</code><button class="copy" data-copy="ingestKey" type="button">Copy</button></div>
+            <div class="field"><span class="k" id="ingestServerK">Server</span><code id="ingestServer">—</code><button class="copy" data-copy="ingestServer" type="button">Copy</button></div>
+            <div class="field" id="ingestKeyField"><span class="k">Stream key</span><code id="ingestKey">—</code><button class="copy" data-copy="ingestKey" type="button">Copy</button></div>
             <details class="obs-setup" id="obsSetup">
               <summary id="obsSetupSummary">Set up OBS</summary>
               <ol class="obs-steps" id="obsSteps"></ol>
@@ -152,7 +157,7 @@
           </div>
           <div class="share-bar invite-bar">
             <span class="share-k">Share</span>
-            <code id="inviteLink">unstation://watch/…</code>
+            <code id="inviteLink">—</code>
             <button class="copy" id="copyInvite" data-copy="inviteLink" type="button">Copy</button>
             <button class="share-act" id="showQrBtn" type="button">Show QR</button>
             <button class="share-act" id="shareInviteBtn" type="button" hidden>Share…</button>
@@ -161,7 +166,7 @@
           <div class="share-alt">or viewers just type <b id="shareLink" class="accent">friday-night-football</b> in Unstation</div>
           <div class="share-bar fast-invite-row" id="fastInviteRow" hidden>
             <span class="share-k fast-k">⚡ Fast</span>
-            <span class="fast-d" id="fastInviteDesc">straight from you, sooner — trusted friends only (not verified)</span>
+            <span class="fast-d" id="fastInviteDesc">straight from you, sooner · trusted friends only (not verified)</span>
             <code id="fastInviteLink" hidden>…</code>
             <button class="copy" id="copyFastInvite" data-copy="fastInviteLink" type="button">Copy invite</button>
             <button class="share-act" id="shareFastInvite" type="button" hidden>Share…</button>
@@ -174,7 +179,7 @@
             </div>
             <div class="ph-row">
               <span class="ph-dot" id="phDot" data-h="wait"></span>
-              <div><div class="ph-status" id="phStatus">Waiting for your encoder</div><div class="ph-note" id="phNote">Point OBS at the server above and start streaming — it goes live on its own.</div></div>
+              <div><div class="ph-status" id="phStatus">Waiting for your encoder</div><div class="ph-note" id="phNote">Point OBS at the server above and start streaming. It goes live on its own.</div></div>
             </div>
             <div class="ph-stats">
               <div class="ph-stat"><div class="k">Watching</div><div class="v" id="phViewers">0</div></div>

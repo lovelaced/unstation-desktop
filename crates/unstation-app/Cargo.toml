@@ -41,6 +41,8 @@ bytes = "1"
 # Real chain integration.
 unstation-session = { path = "../unstation-session" }
 unstation-chain = { path = "../unstation-chain" }
+# SCALE-encodes the volunteer `Recruitment`s the publisher recruiter posts (R5).
+parity-scale-codec = "3"
 useragent-native = { package = "useragent-native", path = "../../../useragent-kit/crates/host-native" }
 # testnet-provisioning embeds Alice's dev key → SDK forbids optimized release builds;
 # keep debug-assertions on in the consuming shells' release profile (LAN test builds).

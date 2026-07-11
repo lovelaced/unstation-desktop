@@ -1,0 +1,160 @@
+/* unstation docs — a quiet dark reading surface that carries the app's palette
+   without its chrome. Legibility first: one wide reading column, one rationed
+   coral accent, generous line height, everything else out of the way. */
+
+:root {
+  --ground: #0B0B0E;
+  --surface: #16151A;
+  --surface-2: #1E1C24;
+  --text: #ECE7E4;
+  --dim: #9A93A0;
+  --faint: #635D69;
+  --brand: #FF5C7A;   /* coral — links, the one accent */
+  --amber: #FFB347;   /* relay / seed */
+  --ok: #21C9AE;      /* verified / healthy */
+  --info: #5AA8FF;
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.14);
+  --ui: -apple-system, BlinkMacSystemFont, "Inter", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--text);
+  font-family: var(--ui);
+  font-size: 17px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+.wrap { width: 100%; max-width: 52rem; margin: 0 auto; padding: 0 24px; }
+
+.skip {
+  position: absolute; left: -9999px; top: 0; background: var(--brand);
+  color: #0B0B0E; padding: 8px 14px; border-radius: 0 0 8px 0; z-index: 10;
+}
+.skip:focus { left: 0; }
+
+/* ---- header ---- */
+.site-head {
+  position: sticky; top: 0; z-index: 5;
+  background: rgba(11, 11, 14, 0.86);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--line);
+}
+.head-inner {
+  display: flex; align-items: center; gap: 18px;
+  min-height: 58px; flex-wrap: wrap; padding-top: 8px; padding-bottom: 8px;
+}
+.wordmark {
+  font-weight: 700; letter-spacing: -0.01em; font-size: 18px;
+  color: var(--text); text-decoration: none; margin-right: 4px;
+}
+.wordmark::before {
+  content: ""; display: inline-block; width: 8px; height: 8px;
+  border-radius: 50%; background: var(--brand); margin-right: 9px;
+  vertical-align: middle;
+}
+.site-nav { display: flex; flex-wrap: wrap; gap: 4px 2px; flex: 1; }
+.site-nav a {
+  color: var(--dim); text-decoration: none; font-size: 14.5px;
+  padding: 5px 10px; border-radius: 7px;
+}
+.site-nav a:hover { color: var(--text); background: rgba(255, 255, 255, 0.05); }
+.site-nav a[aria-current="page"] { color: var(--brand); background: rgba(255, 92, 122, 0.1); }
+.gh {
+  color: var(--dim); text-decoration: none; font-size: 14.5px;
+  padding: 5px 12px; border: 1px solid var(--line-strong); border-radius: 8px;
+}
+.gh:hover { color: var(--text); border-color: var(--dim); }
+
+/* ---- document ---- */
+.doc { padding: 46px 24px 88px; }
+
+.doc h1 {
+  font-size: clamp(30px, 5vw, 42px); line-height: 1.08; letter-spacing: -0.015em;
+  margin: 0 0 6px; font-weight: 700;
+}
+.doc h1 + p { color: var(--dim); font-size: 19px; margin-top: 0; }
+.doc h1::after {
+  content: ""; display: block; width: 54px; height: 3px; margin: 18px 0 30px;
+  border-radius: 3px; background: linear-gradient(90deg, var(--brand), var(--amber));
+}
+.doc h2 {
+  font-size: 25px; letter-spacing: -0.01em; margin: 52px 0 14px;
+  padding-top: 14px; border-top: 1px solid var(--line); font-weight: 650;
+}
+.doc h3 { font-size: 19px; margin: 34px 0 10px; font-weight: 620; }
+.doc h4 { font-size: 16px; margin: 26px 0 8px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+
+.doc p, .doc li { color: var(--text); }
+.doc p { margin: 0 0 16px; }
+.doc a { color: var(--brand); text-decoration: none; border-bottom: 1px solid rgba(255, 92, 122, 0.35); }
+.doc a:hover { border-bottom-color: var(--brand); }
+
+.doc ul, .doc ol { padding-left: 1.3em; margin: 0 0 18px; }
+.doc li { margin: 6px 0; }
+.doc li::marker { color: var(--faint); }
+
+.doc strong { color: #fff; font-weight: 640; }
+.doc hr { border: 0; border-top: 1px solid var(--line); margin: 40px 0; }
+
+/* inline + block code */
+.doc code {
+  font-family: var(--mono); font-size: 0.86em;
+  background: var(--surface-2); padding: 2px 6px; border-radius: 5px;
+  border: 1px solid var(--line);
+}
+.doc pre {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: 12px; padding: 16px 18px; overflow-x: auto; margin: 0 0 20px;
+  line-height: 1.5;
+}
+.doc pre code { background: none; border: 0; padding: 0; font-size: 14px; color: var(--text); }
+
+/* callouts (blockquotes) */
+.doc blockquote {
+  margin: 0 0 20px; padding: 2px 18px; color: var(--dim);
+  border-left: 3px solid var(--amber); background: rgba(255, 179, 71, 0.05);
+  border-radius: 0 8px 8px 0;
+}
+.doc blockquote p { margin: 12px 0; }
+
+/* tables — scroll rather than overflow the page */
+.doc .table-scroll, .doc p:has(> table) { overflow-x: auto; }
+.doc table {
+  border-collapse: collapse; width: 100%; margin: 0 0 22px;
+  font-size: 15px; display: table;
+}
+.doc thead th {
+  text-align: left; color: var(--dim); font-weight: 600; font-size: 13px;
+  text-transform: uppercase; letter-spacing: 0.03em;
+  padding: 8px 14px; border-bottom: 1px solid var(--line-strong);
+}
+.doc tbody td { padding: 9px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.doc tbody tr:last-child td { border-bottom: 0; }
+.doc tbody code { white-space: nowrap; }
+
+.doc img { max-width: 100%; height: auto; border-radius: 10px; }
+
+/* a lead paragraph pattern for doc intros: first para after the rule reads bigger */
+.doc .lead { font-size: 19px; color: var(--dim); }
+
+/* footer */
+.site-foot { border-top: 1px solid var(--line); padding: 30px 0 50px; color: var(--faint); }
+.site-foot p { margin: 4px 0; font-size: 14px; }
+
+@media (max-width: 620px) {
+  body { font-size: 16px; }
+  .head-inner { min-height: 0; }
+  .site-nav { order: 3; width: 100%; }
+  .doc { padding-top: 34px; }
+}
