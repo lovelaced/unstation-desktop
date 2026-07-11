@@ -193,4 +193,284 @@ mod tests {
         assert_eq!(dimensions(&[0x67]), None);
         assert_eq!(dimensions(&[0x67, 0xFF, 0xFF, 0xFF]), None);
     }
+
+    // ---- deterministic SPS synthesis (no ffmpeg) --------------------------------------
+    //
+    // A tiny H.264 SPS *encoder* — the exact inverse of `dimensions`/`unescape`/`BitReader`
+    // above — so the high-profile / scaling-matrix / POC-type-1 / interlaced / cropping /
+    // overflow branches can each be hit by a purpose-built fixture without an encoder at test
+    // time. It is NOT a decoder (it never reads the parser's fields); it only lays down the
+    // bits the parser consumes, then round-trips through emulation-prevention so `unescape`
+    // reconstructs exactly these bits.
+
+    struct SpsWriter {
+        out: Vec<u8>,
+        cur: u8,
+        n: u8,
+    }
+    impl SpsWriter {
+        fn new() -> Self {
+            Self { out: Vec::new(), cur: 0, n: 0 }
+        }
+        fn bit(&mut self, b: u64) {
+            self.cur = (self.cur << 1) | (b as u8 & 1);
+            self.n += 1;
+            if self.n == 8 {
+                self.out.push(self.cur);
+                self.cur = 0;
+                self.n = 0;
+            }
+        }
+        fn put(&mut self, v: u64, bits: u32) {
+            for i in (0..bits).rev() {
+                self.bit((v >> i) & 1);
+            }
+        }
+        /// Unsigned Exp-Golomb (inverse of `BitReader::ue`).
+        fn ue(&mut self, v: u64) {
+            let code = v + 1;
+            let m = 63 - code.leading_zeros();
+            for _ in 0..m {
+                self.bit(0);
+            }
+            self.put(code, m + 1);
+        }
+        /// Signed Exp-Golomb (inverse of `BitReader::se`).
+        fn se(&mut self, v: i64) {
+            let k = if v > 0 { (2 * v - 1) as u64 } else { (-2 * v) as u64 };
+            self.ue(k);
+        }
+        /// Byte-align, insert emulation-prevention bytes, prepend the `0x67` SPS NAL header.
+        fn nal(mut self) -> Vec<u8> {
+            if self.n > 0 {
+                self.cur <<= 8 - self.n;
+                self.out.push(self.cur);
+            }
+            let mut nal = vec![0x67u8];
+            let mut zeros = 0;
+            for &b in &self.out {
+                if zeros >= 2 && b <= 3 {
+                    nal.push(3);
+                    zeros = 0;
+                }
+                nal.push(b);
+                zeros = if b == 0 { zeros + 1 } else { 0 };
+            }
+            nal
+        }
+    }
+
+    /// Configurable SPS. Defaults describe a 640x360 progressive baseline stream; each test
+    /// flips exactly the fields it needs so the intended parser branch is the only variable.
+    #[derive(Clone)]
+    struct Sps {
+        profile: u64,
+        chroma_format_idc: u64,
+        separate_colour_plane: bool,
+        scaling_present: bool,
+        scaling_lists: Vec<bool>,
+        poc_type: u64,
+        poc_cycle: Vec<i64>,
+        width_mbs_minus1: u64,
+        height_map_minus1: u64,
+        frame_mbs_only: bool,
+        crop: Option<(u64, u64, u64, u64)>,
+    }
+    impl Default for Sps {
+        fn default() -> Self {
+            Self {
+                profile: 66,
+                chroma_format_idc: 1,
+                separate_colour_plane: false,
+                scaling_present: false,
+                scaling_lists: Vec::new(),
+                poc_type: 0,
+                poc_cycle: Vec::new(),
+                width_mbs_minus1: 39, // 40 mbs → 640
+                height_map_minus1: 22, // 23 map units → 368
+                frame_mbs_only: true,
+                crop: Some((0, 0, 0, 4)), // 368 → 360
+            }
+        }
+    }
+    impl Sps {
+        fn encode(&self) -> Vec<u8> {
+            let mut w = SpsWriter::new();
+            let high = matches!(
+                self.profile,
+                100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+            );
+            w.put(self.profile, 8);
+            w.put(0, 8); // constraint flags
+            w.put(30, 8); // level_idc
+            w.ue(0); // seq_parameter_set_id
+            if high {
+                w.ue(self.chroma_format_idc);
+                if self.chroma_format_idc == 3 {
+                    w.bit(self.separate_colour_plane as u64);
+                }
+                w.ue(0); // bit_depth_luma_minus8
+                w.ue(0); // bit_depth_chroma_minus8
+                w.bit(0); // qpprime_y_zero_transform_bypass_flag
+                w.bit(self.scaling_present as u64);
+                if self.scaling_present {
+                    for (i, &present) in self.scaling_lists.iter().enumerate() {
+                        w.bit(present as u64);
+                        if present {
+                            let size = if i < 6 { 16 } else { 64 };
+                            for _ in 0..size {
+                                w.se(0); // flat (identity) scaling list — deltas all 0
+                            }
+                        }
+                    }
+                }
+            }
+            w.ue(4); // log2_max_frame_num_minus4
+            w.ue(self.poc_type);
+            if self.poc_type == 0 {
+                w.ue(4); // log2_max_pic_order_cnt_lsb_minus4
+            } else if self.poc_type == 1 {
+                w.bit(0); // delta_pic_order_always_zero_flag
+                w.se(0); // offset_for_non_ref_pic
+                w.se(0); // offset_for_top_to_bottom_field
+                w.ue(self.poc_cycle.len() as u64);
+                for &o in &self.poc_cycle {
+                    w.se(o);
+                }
+            }
+            w.ue(1); // max_num_ref_frames
+            w.bit(0); // gaps_in_frame_num_value_allowed_flag
+            w.ue(self.width_mbs_minus1);
+            w.ue(self.height_map_minus1);
+            w.bit(self.frame_mbs_only as u64);
+            if !self.frame_mbs_only {
+                w.bit(0); // mb_adaptive_frame_field_flag
+            }
+            w.bit(1); // direct_8x8_inference_flag
+            match self.crop {
+                Some((l, r, t, b)) => {
+                    w.bit(1);
+                    w.ue(l);
+                    w.ue(r);
+                    w.ue(t);
+                    w.ue(b);
+                }
+                None => w.bit(0),
+            }
+            w.nal()
+        }
+    }
+
+    #[test]
+    fn synth_baseline_matches_640x360() {
+        // Proves the encoder is the parser's inverse: the default fixture must read back as the
+        // same 640x360 the hand-crafted real baseline SPS above yields.
+        assert_eq!(dimensions(&Sps::default().encode()), Some((640, 360)));
+    }
+
+    #[test]
+    fn parses_high444_with_separate_colour_plane() {
+        // profile 244 (High 4:4:4) + chroma_format_idc 3 exercises the separate_colour_plane
+        // skip inside the chroma branch.
+        let sps = Sps {
+            profile: 244,
+            chroma_format_idc: 3,
+            separate_colour_plane: true,
+            crop: None,
+            width_mbs_minus1: 79, // 1280
+            height_map_minus1: 44, // 720
+            ..Sps::default()
+        };
+        assert_eq!(dimensions(&sps.encode()), Some((1280, 720)));
+    }
+
+    #[test]
+    fn parses_high_with_seq_scaling_matrix() {
+        // seq_scaling_matrix_present with a mix of present/absent lists drives the scaling-list
+        // skip (both the "present → consume a list" and "absent" arms).
+        let sps = Sps {
+            profile: 100,
+            scaling_present: true,
+            scaling_lists: vec![true, false, true, false, false, false, false, true],
+            crop: None,
+            ..Sps::default()
+        };
+        assert_eq!(dimensions(&sps.encode()), Some((640, 368)));
+    }
+
+    #[test]
+    fn parses_poc_type_1() {
+        // pic_order_cnt_type 1 carries a ref-frame offset cycle (each a signed Exp-Golomb) the
+        // parser must skip to reach the frame geometry.
+        let sps = Sps {
+            poc_type: 1,
+            poc_cycle: vec![1, -1, 2],
+            crop: None,
+            ..Sps::default()
+        };
+        assert_eq!(dimensions(&sps.encode()), Some((640, 368)));
+    }
+
+    #[test]
+    fn interlaced_doubles_the_height() {
+        // frame_mbs_only=0 → an extra mb_adaptive flag AND field-height doubling (map units are
+        // half-frames). 22 map units → (22+1)*16*2 = 736.
+        let sps = Sps {
+            frame_mbs_only: false,
+            crop: None,
+            ..Sps::default()
+        };
+        assert_eq!(dimensions(&sps.encode()), Some((640, 736)));
+    }
+
+    #[test]
+    fn interlaced_crop_scales_vertically() {
+        // Vertical crop units are 2*(2-frame_mbs_only)=4 lines each when interlaced: crop_b=2
+        // removes 8 lines from 736 → 728.
+        let sps = Sps {
+            frame_mbs_only: false,
+            crop: Some((0, 0, 0, 2)),
+            ..Sps::default()
+        };
+        assert_eq!(dimensions(&sps.encode()), Some((640, 728)));
+    }
+
+    #[test]
+    fn rejects_zero_dimension_after_crop() {
+        // A crop that consumes the whole width yields w==0 → None (not a panic / underflow).
+        let sps = Sps {
+            width_mbs_minus1: 0, // 16 px wide
+            crop: Some((4, 4, 0, 0)), // crop_x = (4+4)*2 = 16 → 0
+            ..Sps::default()
+        };
+        assert_eq!(dimensions(&sps.encode()), None);
+    }
+
+    #[test]
+    fn rejects_oversized_dimension() {
+        // pic_width_in_mbs large enough to exceed u16 → None (the >u16::MAX guard).
+        let sps = Sps {
+            width_mbs_minus1: 5000, // 5001*16 = 80016 > 65535
+            crop: None,
+            ..Sps::default()
+        };
+        assert_eq!(dimensions(&sps.encode()), None);
+    }
+
+    #[test]
+    fn parses_body_without_nal_header() {
+        // `dimensions` accepts an SPS with the 1-byte NAL header already stripped (first byte is
+        // the profile_idc, not a type-7 header). Strip the 0x67 from a known-good fixture.
+        let full = Sps::default().encode();
+        assert_eq!(dimensions(&full[1..]), Some((640, 360)));
+    }
+
+    #[test]
+    fn malformed_exp_golomb_runaway_is_none() {
+        // A long run of zero bits makes an Exp-Golomb code exceed 63 leading zeros → None,
+        // rather than looping or over-reading.
+        let mut sps = vec![0x67, 0, 0, 0]; // header + profile/constraint/level = 0
+        sps.extend_from_slice(&[0u8; 16]); // >64 zero bits for the next ue()
+        assert_eq!(dimensions(&sps), None);
+    }
 }

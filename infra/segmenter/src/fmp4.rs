@@ -1493,4 +1493,382 @@ mod tests {
         fb.push_au(&idr, 3000, true); // closes GOP 0 (two samples → 6000 ticks)
         assert_eq!(fb.base_decode_time, 6000);
     }
+
+    // ---- deterministic B-frame (POC) muxing without a real encoder ---------------------
+    //
+    // The POC presentation-remap path only runs for a bitstream that reorders (B-frames);
+    // its deep branches previously ran solely under the #[ignore]d real-encoder tests. Here
+    // we synthesize just the SPS + coded-slice HEADERS the muxer actually parses (it copies
+    // the rest of each AU verbatim into `mdat` without inspecting it), so a full x264-style
+    // bf=2 GOP drives `push_au_pts` → POC record → composition-offset emit deterministically,
+    // with no ffmpeg. This is a bit *encoder* (the inverse of the h264_poc parser), not a
+    // decoder.
+
+    struct BitWriter {
+        out: Vec<u8>,
+        cur: u8,
+        n: u8,
+    }
+    impl BitWriter {
+        fn new() -> Self {
+            Self { out: Vec::new(), cur: 0, n: 0 }
+        }
+        fn bit(&mut self, b: u32) {
+            self.cur = (self.cur << 1) | (b as u8 & 1);
+            self.n += 1;
+            if self.n == 8 {
+                self.out.push(self.cur);
+                self.cur = 0;
+                self.n = 0;
+            }
+        }
+        fn put(&mut self, v: u32, bits: u32) {
+            for i in (0..bits).rev() {
+                self.bit((v >> i) & 1);
+            }
+        }
+        fn ue(&mut self, v: u32) {
+            let code = v as u64 + 1;
+            let m = 63 - code.leading_zeros();
+            for _ in 0..m {
+                self.bit(0);
+            }
+            for i in (0..=m).rev() {
+                self.bit(((code >> i) & 1) as u32);
+            }
+        }
+        fn nal(mut self, header: u8) -> Vec<u8> {
+            if self.n > 0 {
+                self.cur <<= 8 - self.n;
+                self.out.push(self.cur);
+            }
+            let mut nal = vec![header];
+            let mut zeros = 0;
+            for &b in &self.out {
+                if zeros >= 2 && b <= 3 {
+                    nal.push(3);
+                    zeros = 0;
+                }
+                nal.push(b);
+                zeros = if b == 0 { zeros + 1 } else { 0 };
+            }
+            nal
+        }
+    }
+
+    const LOG2_MAX_FRAME_NUM_M4: u32 = 4; // log2_max_frame_num = 8
+    const LOG2_MAX_POC_LSB_M4: u32 = 4; // log2_max_poc_lsb = 8
+
+    /// A High-profile SPS (POC type 0) whose fields match the slices below.
+    fn bframe_sps() -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.put(100, 8); // profile_idc (High)
+        w.put(0, 8); // constraints
+        w.put(30, 8); // level_idc
+        w.ue(0); // sps_id
+        w.ue(1); // chroma_format_idc (4:2:0)
+        w.ue(0); // bit_depth_luma_minus8
+        w.ue(0); // bit_depth_chroma_minus8
+        w.bit(0); // qpprime
+        w.bit(0); // seq_scaling_matrix_present
+        w.ue(LOG2_MAX_FRAME_NUM_M4);
+        w.ue(0); // poc_type
+        w.ue(LOG2_MAX_POC_LSB_M4);
+        w.ue(2); // max_num_ref_frames
+        w.bit(0); // gaps
+        w.ue(19); // pic_width_in_mbs_minus1  → 320
+        w.ue(14); // pic_height_in_map_units_minus1 → 240
+        w.bit(1); // frame_mbs_only
+        // parse_sps stops above; the two fields below let the sibling sps::dimensions parser
+        // read the same NAL back to (320, 240).
+        w.bit(1); // direct_8x8_inference_flag
+        w.bit(0); // frame_cropping_flag = 0
+        w.nal(0x67)
+    }
+
+    /// One coded-slice header carrying `poc_lsb`, framed just past pic_order_cnt_lsb.
+    fn bframe_slice(is_idr: bool, nal_ref_idc: u8, frame_num: u32, poc_lsb: u32) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.ue(0); // first_mb_in_slice
+        w.ue(if is_idr { 7 } else { 5 }); // slice_type
+        w.ue(0); // pps_id
+        w.put(frame_num, LOG2_MAX_FRAME_NUM_M4 + 4);
+        if is_idr {
+            w.ue(0); // idr_pic_id
+        }
+        w.put(poc_lsb, LOG2_MAX_POC_LSB_M4 + 4);
+        let header = ((nal_ref_idc & 3) << 5) | if is_idr { 5 } else { 1 };
+        w.nal(header)
+    }
+
+    /// x264-style bf=2 (no pyramid): decode order interleaves each P ahead of the two
+    /// B-frames it brackets. Returns `(annexb_au, keyframe, pts_us)` in DECODE order, plus the
+    /// display index each frame presents at (for verification). POC = 2·display_index (step 2).
+    fn bframe_gop(groups: usize) -> Vec<(Vec<u8>, bool, i64, i64)> {
+        // decode-order display indices: I(0), then for each group k: P(3k), B(3k-2), B(3k-1).
+        let mut order = vec![0i64];
+        for k in 1..=groups as i64 {
+            order.push(3 * k);
+            order.push(3 * k - 2);
+            order.push(3 * k - 1);
+        }
+        let frame_ticks_us = 33_367i64; // ~30fps monotonic decode-order timestamps (OBS-style)
+        order
+            .iter()
+            .enumerate()
+            .map(|(dec_idx, &disp)| {
+                let is_idr = disp == 0;
+                let nal_ref_idc = if disp == 0 {
+                    3
+                } else if disp % 3 == 0 {
+                    2 // P-frame (reference)
+                } else {
+                    0 // disposable B-frame
+                };
+                let poc_lsb = (2 * disp) as u32;
+                let slice = bframe_slice(is_idr, nal_ref_idc, dec_idx as u32 & 0xff, poc_lsb);
+                let mut au = vec![0u8, 0, 0, 1];
+                au.extend_from_slice(&slice);
+                (au, is_idr, dec_idx as i64 * frame_ticks_us, disp)
+            })
+            .collect()
+    }
+
+    /// Extract (base_media_decode_time, [(duration, composition_offset)]) from a fragment's
+    /// FIRST (video) traf, using the known trun flag layout the builder writes.
+    fn video_trun(frag: &[u8]) -> (u64, Vec<(u32, u32)>) {
+        let moof = find_box(frag, b"moof").expect("moof");
+        let traf = find_box(moof, b"traf").expect("video traf");
+        let tfdt = find_box(traf, b"tfdt").expect("tfdt");
+        let base = u64::from_be_bytes(tfdt[4..12].try_into().unwrap());
+        let trun = find_box(traf, b"trun").expect("trun");
+        let count = u32::from_be_bytes(trun[4..8].try_into().unwrap()) as usize;
+        let flags = u32::from_be_bytes([0, trun[1], trun[2], trun[3]]);
+        let mut p = 8;
+        if flags & 0x0001 != 0 {
+            p += 4; // data offset
+        }
+        let mut out = Vec::new();
+        for _ in 0..count {
+            let dur = u32::from_be_bytes(trun[p..p + 4].try_into().unwrap());
+            let cto = u32::from_be_bytes(trun[p + 12..p + 16].try_into().unwrap());
+            out.push((dur, cto));
+            p += 16; // dur + size + flags + cto
+        }
+        (base, out)
+    }
+
+    #[test]
+    fn poc_path_recovers_bframe_presentation_order() {
+        // 7 groups → 22 access units in decode order, enough to pass the POC-step warm-up and
+        // close several low-latency parts (each locking then reusing the reorder delay).
+        let frames = bframe_gop(7);
+        let n = frames.len();
+        assert_eq!(n, 22);
+
+        let params = H264Params { sps: bframe_sps(), pps: vec![0x68, 0xee, 0x3c, 0x80], width: 320, height: 240 };
+        // Sanity: the synthetic SPS parses to the coded size via the sibling parser.
+        assert_eq!(crate::sps::dimensions(&params.sps), Some((320, 240)));
+
+        let mut fb = FragmentBuilder::new_ll(params, 100); // 100ms parts (9000 ticks)
+        let mut segs = Vec::new();
+        for (au, kf, pts_us, _disp) in &frames {
+            if let Some(seg) = fb.push_au_pts(au, *pts_us, *kf) {
+                segs.push(seg);
+            }
+        }
+        if let Some(seg) = fb.flush() {
+            segs.push(seg);
+        }
+        assert!(segs.len() >= 2, "several parts emitted, got {}", segs.len());
+
+        // Every emitted fragment is well-formed; only the first (keyframe-led) is independent.
+        for (i, seg) in segs.iter().enumerate() {
+            top_boxes(&seg.bytes); // asserts the boxes tile exactly
+            let indep = fragment_is_independent(&seg.bytes);
+            if i == 0 {
+                assert!(indep, "leading fragment starts on the IDR");
+            }
+        }
+
+        // Reconstruct each sample's presentation time PTS = tfdt + Σ(prior decode durations) +
+        // composition_offset, and confirm the whole stream presents in display order with a
+        // uniform frame duration. This is the end-to-end proof the POC remap is exact.
+        let fd = 3003u32; // 33_367µs @ 90kHz
+        let mut all_pts = Vec::new();
+        let mut total_samples = 0;
+        let mut saw_nonzero_cto = false;
+        for seg in &segs {
+            let (base, samples) = video_trun(&seg.bytes);
+            let mut dts = base;
+            for (dur, cto) in samples {
+                assert_eq!(dur, fd, "uniform decode duration");
+                if cto > 0 {
+                    saw_nonzero_cto = true;
+                }
+                all_pts.push(dts + cto as u64);
+                dts += dur as u64;
+                total_samples += 1;
+            }
+        }
+        assert_eq!(total_samples, n, "all AUs muxed exactly once");
+        assert!(saw_nonzero_cto, "B-frame reorder produced composition offsets");
+        all_pts.sort_unstable();
+        // Display order is 0..22, each one frame_dur apart (a constant reorder delay of 1 frame
+        // shifts every PTS by +fd), so the sorted set is exactly {1..=22}·fd.
+        let expected: Vec<u64> = (1..=n as u64).map(|d| d * fd as u64).collect();
+        assert_eq!(all_pts, expected, "presentation timeline is display order, no gaps/dupes");
+    }
+
+    #[test]
+    fn pts_path_without_poc_falls_back_to_reorder_delay() {
+        // When the SPS carries no usable POC (won't parse), push_au_pts must still handle a
+        // B-frame PTS timeline via the per-fragment compute_timing path (decode order I P B B).
+        // Low-latency mode (with a wide part target so all four stay in one fragment) exercises
+        // the no-POC part-cadence branch, which measures the PTS SPAN each push.
+        let params = H264Params { sps: vec![0x41], pps: vec![0x68], width: 320, height: 240 };
+        let mut fb = FragmentBuilder::new_ll(params, 1000);
+        let fd_us = 33_367i64;
+        // Decode order I(disp0) P(disp3) B(disp1) B(disp2); PTS in decode order.
+        let plan = [(0x65u8, 0i64, true), (0x41, 3, false), (0x41, 1, false), (0x41, 2, false)];
+        for (nal_ty, disp, kf) in plan {
+            let au = [0, 0, 0, 1, nal_ty, 0x88];
+            assert!(fb.push_au_pts(&au, disp * fd_us, kf).is_none(), "part target not reached");
+        }
+        let seg = fb.flush().expect("trailing fragment");
+        let (_base, samples) = video_trun(&seg.bytes);
+        assert_eq!(samples.len(), 4);
+        // Reordered stream → at least one nonzero composition offset; durations uniform.
+        assert!(samples.iter().any(|&(_, cto)| cto > 0), "reorder offsets present: {samples:?}");
+        assert!(samples.iter().all(|&(d, _)| d > 0));
+    }
+
+    #[test]
+    fn fragment_info_reads_tfhd_defaults_and_first_sample_flags() {
+        // A fragment whose trun omits per-sample durations/flags: fragment_info must fall back
+        // to the tfhd defaults, and honour a first-sample-flags override for independence.
+        // Set every optional tfhd field so fragment_info walks past each one: base-data-offset
+        // (0x01), sample-description-index (0x02), default-sample-duration (0x08),
+        // default-sample-size (0x10), default-sample-flags (0x20).
+        let mut tfhd_body = Vec::new();
+        tfhd_body.extend_from_slice(&1u32.to_be_bytes()); // track id
+        tfhd_body.extend_from_slice(&0u64.to_be_bytes()); // base-data-offset
+        tfhd_body.extend_from_slice(&1u32.to_be_bytes()); // sample-description-index
+        tfhd_body.extend_from_slice(&1000u32.to_be_bytes()); // default sample duration
+        tfhd_body.extend_from_slice(&512u32.to_be_bytes()); // default sample size
+        tfhd_body.extend_from_slice(&0x0101_0000u32.to_be_bytes()); // default flags (non-sync)
+        let tfhd = full_bx(b"tfhd", 0, 0x0000_003b, &tfhd_body); // 0x01|0x02|0x08|0x10|0x20
+
+        let mut trun_body = Vec::new();
+        trun_body.extend_from_slice(&3u32.to_be_bytes()); // sample count
+        trun_body.extend_from_slice(&0u32.to_be_bytes()); // data offset
+        trun_body.extend_from_slice(&0x0200_0000u32.to_be_bytes()); // first-sample-flags: sync
+        let trun = full_bx(b"trun", 0, 0x0000_0005, &trun_body); // data-offset | first-sample-flags
+
+        let traf = bx(b"traf", &concat(&[tfhd, trun]));
+        let moof = bx(b"moof", &traf);
+        let info = fragment_info(&moof).expect("parses");
+        // 3 samples × default 1000 ticks; first-sample-flags mark the lead sample as a sync
+        // sample → independent, overriding the non-sync tfhd default.
+        assert_eq!(info.duration_ticks, 3000);
+        assert!(info.independent, "first-sample-flags sync overrides default");
+    }
+
+    #[test]
+    fn fragment_info_reads_per_sample_flags_and_no_tfhd() {
+        // No tfhd at all; per-sample durations + flags carried inline. The leading sample's
+        // own flags decide independence.
+        let mut trun_body = Vec::new();
+        trun_body.extend_from_slice(&2u32.to_be_bytes()); // count
+        trun_body.extend_from_slice(&0u32.to_be_bytes()); // data offset
+        for (dur, flags) in [(1500u32, 0x0101_0000u32), (1500, 0x0101_0000)] {
+            trun_body.extend_from_slice(&dur.to_be_bytes());
+            trun_body.extend_from_slice(&flags.to_be_bytes());
+        }
+        // flags: data-offset | sample-duration | sample-flags
+        let trun = full_bx(b"trun", 0, 0x0000_0501, &trun_body);
+        let traf = bx(b"traf", &trun);
+        let moof = bx(b"moof", &traf);
+        let info = fragment_info(&moof).expect("parses");
+        assert_eq!(info.duration_ticks, 3000);
+        assert!(!info.independent, "leading per-sample flags are non-sync");
+    }
+
+    #[test]
+    fn fragment_info_clamps_hostile_sample_count() {
+        // A forged trun claiming 2^32-1 samples with no per-sample records must be clamped, not
+        // walked billions of times (or hung).
+        let mut trun_body = Vec::new();
+        trun_body.extend_from_slice(&u32::MAX.to_be_bytes()); // absurd sample count
+        trun_body.extend_from_slice(&0u32.to_be_bytes()); // data offset
+        let trun = full_bx(b"trun", 0, 0x0000_0001, &trun_body); // data-offset only, rec == 0
+        let traf = bx(b"traf", &trun);
+        let moof = bx(b"moof", &traf);
+        // Returns quickly (clamped to 8192 iterations); no per-sample duration → 0 ticks.
+        let info = fragment_info(&moof).expect("parses without hanging");
+        assert_eq!(info.duration_ticks, 0);
+    }
+
+    #[test]
+    fn fragment_info_rejects_malformed() {
+        assert!(fragment_info(&[]).is_none(), "empty");
+        assert!(fragment_info(b"not boxes").is_none(), "garbage");
+        // A declared box size < 8 is rejected by the box walker.
+        assert!(fragment_info(&[0, 0, 0, 4, b'm', b'o', b'o', b'f']).is_none(), "size < 8");
+        // A box claiming more bytes than the buffer holds.
+        assert!(fragment_info(&[0, 0, 0, 255, b'm', b'o', b'o', b'f']).is_none(), "overrun");
+        // moof present but no traf inside.
+        let moof = bx(b"moof", &full_bx(b"mfhd", 0, 0, &1u32.to_be_bytes()));
+        assert!(fragment_info(&moof).is_none(), "moof without traf");
+        // traf present, trun too short (< 8 bytes of body).
+        let traf = bx(b"traf", &full_bx(b"trun", 0, 0, &0u16.to_be_bytes()));
+        let moof2 = bx(b"moof", &traf);
+        assert!(fragment_info(&moof2).is_none(), "trun shorter than its header");
+    }
+
+    #[test]
+    fn compute_timing_edge_cases() {
+        // Empty input returns the fallback frame duration.
+        assert_eq!(compute_timing(&mut [], 3000), 3000);
+        // A single AU has no gap to measure → fallback, offset 0.
+        let mut one = [Au { avcc: vec![0], pts: 5000, duration: 0, comp_offset: 7, keyframe: true, poc_dec: 0, poc_gop: 0, poc_val: 0 }];
+        assert_eq!(compute_timing(&mut one, 2500), 2500);
+        assert_eq!(one[0].duration, 2500);
+        assert_eq!(one[0].comp_offset, 0);
+    }
+
+    #[test]
+    fn push_opus_ignores_empty_frame() {
+        let mut fb = FragmentBuilder::new(params()).with_opus_audio(2);
+        fb.push_opus(&[], 960); // dropped: empty packet
+        fb.push_opus(&[0x0b, 1, 2], 960); // the only real frame
+        let idr = [0, 0, 0, 1, 0x65, 1, 2];
+        fb.push_au(&idr, 3000, true);
+        let seg = fb.push_au(&idr, 3000, true).expect("GOP closes");
+        // The audio traf carries exactly one sample (the empty one was ignored).
+        let moof = find_box(&seg.bytes, b"moof").unwrap();
+        let mut count = None;
+        let mut j = 0;
+        let mut trafs = 0;
+        while j + 8 <= moof.len() {
+            let size = u32::from_be_bytes([moof[j], moof[j + 1], moof[j + 2], moof[j + 3]]) as usize;
+            if &moof[j + 4..j + 8] == b"traf" {
+                trafs += 1;
+                if trafs == 2 {
+                    let body = &moof[j + 8..j + size];
+                    let trun = find_box(body, b"trun").unwrap();
+                    count = Some(u32::from_be_bytes(trun[4..8].try_into().unwrap()));
+                }
+            }
+            j += size;
+        }
+        assert_eq!(count, Some(1));
+    }
+
+    #[test]
+    fn emit_and_flush_on_empty_are_none() {
+        let mut fb = FragmentBuilder::new(params());
+        assert!(fb.emit().is_none(), "nothing pending → no fragment");
+        assert!(fb.flush().is_none(), "flush of an empty builder");
+    }
 }

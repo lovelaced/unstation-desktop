@@ -15,12 +15,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 IGNORE='transport-libdc/src|unstation-node/src/main'
-# Re-based 90 → 84 (July 10): the WHIP B-frame work added substantial H.264 bitstream
-# parsing (segmenter fmp4/sps/h264_poc) whose deep branches only run under the
-# #[ignore]d real-encoder tests, landing the engine at ~85.4% — the floor sits just
-# below that so platform variance can't flake the gate. RATCHET: raise this back
-# toward 90 as deterministic fixtures for those media paths land — never lower it.
-THRESHOLD="${COVERAGE_MIN:-84}"
+# Ratcheted 84 -> 90 (July 11). Deterministic synthetic fixtures for the H.264 media
+# paths landed (segmenter sps 99% / h264_poc 99% / fmp4 92%, via a bit-encoder that is
+# the exact inverse of the parsers, so no ffmpeg is needed for those), plus hls-server
+# error/LL-reload tests, taking the engine to ~91.3%. The floor sits ~1.3% below that so
+# platform variance can't flake the gate. NOTE: the coverage CI job installs ffmpeg;
+# without it the segmenter's real-media lib.rs tests skip and the total falls under 90.
+# RATCHET: only ever raise this floor, never lower it.
+THRESHOLD="${COVERAGE_MIN:-90}"
 
 if [ "${1:-}" = "--check" ]; then
   echo "[coverage] gating engine line coverage at >= ${THRESHOLD}%"

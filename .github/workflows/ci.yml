@@ -54,8 +54,12 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      # ffmpeg is required here (unlike the plain test job): the segmenter's real-media
+      # tests skip without it, and the coverage threshold is calibrated to the run WITH
+      # them, so leaving it out drops infra/segmenter/src/lib.rs from ~82% to ~19% and
+      # fails the gate.
       - name: Install native build deps
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake pkg-config libssl-dev clang
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake pkg-config libssl-dev clang ffmpeg
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview

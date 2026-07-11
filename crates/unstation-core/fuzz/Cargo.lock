@@ -571,6 +571,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "segmenter"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "unstation-core",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -811,6 +819,7 @@ dependencies = [
  "arbitrary",
  "libfuzzer-sys",
  "parity-scale-codec",
+ "segmenter",
  "unstation-core",
 ]
 

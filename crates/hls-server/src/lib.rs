@@ -767,4 +767,202 @@ mod tests {
         assert!(pl.contains("seg/0.m4s"), "parent 0 completed: {pl}");
         assert!(pl.contains("URI=\"part/2.m4s\""), "parent 1's first part announced: {pl}");
     }
+
+    /// Full HTTP response including the status line + headers (for OPTIONS/404 assertions).
+    fn http_raw(addr: SocketAddr, method: &str, path: &str) -> String {
+        let mut s = TcpStream::connect(addr).unwrap();
+        let req = format!("{method} {path} HTTP/1.0\r\nHost: localhost\r\n\r\n");
+        s.write_all(req.as_bytes()).unwrap();
+        let mut buf = String::new();
+        s.read_to_string(&mut buf).unwrap();
+        buf
+    }
+
+    /// Response body as raw bytes (segments/parts are binary CMAF, not UTF-8).
+    fn http_get_bytes(addr: SocketAddr, path: &str) -> Vec<u8> {
+        let mut s = TcpStream::connect(addr).unwrap();
+        let req = format!("GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n");
+        s.write_all(req.as_bytes()).unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).unwrap();
+        match buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            Some(pos) => buf.split_off(pos + 4),
+            None => buf,
+        }
+    }
+
+    /// `configure` toggles LL + updates part/target ms (0 leaves a field unchanged); `reset`
+    /// clears init/parts/counters and zeroes the play head.
+    #[test]
+    fn configure_updates_and_reset_clears() {
+        let sink = shared(1000, false, 0);
+        sink.configure(true, 200, 3000);
+        {
+            let g = sink.shared.lock().unwrap();
+            assert!(g.ll);
+            assert_eq!(g.part_ms, 200);
+            assert_eq!(g.target_ms, 3000);
+        }
+        // Zero values must leave the current part/target untouched (and can flip ll back off).
+        sink.configure(false, 0, 0);
+        {
+            let g = sink.shared.lock().unwrap();
+            assert!(!g.ll);
+            assert_eq!(g.part_ms, 200, "part_ms unchanged by 0");
+            assert_eq!(g.target_ms, 3000, "target_ms unchanged by 0");
+        }
+        sink.push_init(Bytes::from_static(b"INIT"));
+        sink.push_segment(0, Bytes::from_static(b"x"));
+        sink.reset();
+        let g = sink.shared.lock().unwrap();
+        assert!(g.init.is_none());
+        assert!(g.parts.is_empty());
+        assert_eq!(g.next_parent_msn, 0);
+        assert_eq!(g.cur_parent_msn, 0);
+        assert!(!g.have_any);
+        drop(g);
+        assert_eq!(sink.on_play_head(), 0, "reset zeroes the play head");
+    }
+
+    /// `url()` returns the loopback `live.m3u8` URL for the bound port.
+    #[test]
+    fn url_points_at_live_playlist() {
+        let srv = HlsServer::start(2000).unwrap();
+        let url = srv.url();
+        assert_eq!(url, format!("http://{}/live.m3u8", srv.addr()));
+    }
+
+    /// Non-fragment bytes in LL mode can't yield fragment_info → the part is treated as
+    /// dependent with unknown duration; and a single parent that outgrows the window is never
+    /// evicted (it's the live edge), so the window can exceed the cap rather than lose the head.
+    #[test]
+    fn ll_non_fragment_is_dependent_and_open_parent_never_evicted() {
+        let sink = shared(1000, true, 100);
+        // 62 garbage "parts": the first opens parent 0 (have_any was false); the rest are
+        // non-independent (fragment_info == None) so they all stay under parent 0.
+        for seq in 0..62u64 {
+            sink.push_segment(seq, Bytes::from_static(b"not-a-fragment"));
+        }
+        let g = sink.shared.lock().unwrap();
+        // Nothing was independent (None → false), so no part after the first opened a parent.
+        assert!(g.parts.values().all(|p| !p.independent));
+        assert!(g.parts.values().all(|p| p.dur_ticks == 0));
+        assert!(g.parts.values().all(|p| p.parent_msn == 0));
+        // The open parent is the live edge: eviction refuses to drop it, so the window is
+        // allowed to exceed MAX_LIVE_PARTS instead of losing the head.
+        assert!(g.parts.len() > MAX_LIVE_PARTS, "open parent retained whole: {}", g.parts.len());
+        assert_eq!(g.parts.len(), 62);
+    }
+
+    /// `/std.m3u8` over HTTP: parts-free view in LL mode, plain standard playlist otherwise.
+    #[test]
+    fn serves_std_playlist_over_http() {
+        // LL server → std_playlist (completed parents only, no parts/preload-hint).
+        let mut fb = segmenter::FragmentBuilder::new_ll(ll_params(), 100);
+        let srv = HlsServer::start_ll(1000, 100).unwrap();
+        let sink = srv.sink();
+        sink.push_init(Bytes::from_static(b"INIT"));
+        feed(&mut fb, &sink, true);
+        for _ in 0..5 { feed(&mut fb, &sink, false); }
+        feed(&mut fb, &sink, true);
+        for _ in 0..5 { feed(&mut fb, &sink, false); }
+        let pl = http_get(srv.addr(), "/std.m3u8");
+        assert!(pl.contains("#EXTM3U"), "got: {pl}");
+        assert!(!pl.contains("#EXT-X-PART"), "std view is parts-free: {pl}");
+        assert!(pl.contains("seg/0.m4s"), "completed parent listed: {pl}");
+
+        // Standard-mode server → /std.m3u8 falls through to the standard playlist.
+        let srv2 = HlsServer::start(2000).unwrap();
+        let sink2 = srv2.sink();
+        sink2.push_segment(0, Bytes::from_static(b"A"));
+        let pl2 = http_get(srv2.addr(), "/std.m3u8");
+        assert!(pl2.contains("#EXTM3U"), "got: {pl2}");
+        assert!(pl2.contains("seg/0.m4s"), "standard playlist over /std.m3u8: {pl2}");
+    }
+
+    /// `/part/<seq>.m4s`: an existing part returns its bytes + moves the play head; a missing
+    /// one 404s. `/seg/<msn>.m4s` in LL mode concatenates the parent's parts; a parent with no
+    /// members 404s.
+    #[test]
+    fn serves_ll_part_and_parent_segment_over_http() {
+        let mut fb = segmenter::FragmentBuilder::new_ll(ll_params(), 100);
+        let srv = HlsServer::start_ll(1000, 100).unwrap();
+        let sink = srv.sink();
+        // GOP0 → parts 0,1 under parent 0.
+        feed(&mut fb, &sink, true);
+        for _ in 0..5 { feed(&mut fb, &sink, false); }
+        let addr = srv.addr();
+
+        // An individual part is served and updates the play head to its seq.
+        let part0 = http_get_bytes(addr, "/part/0.m4s");
+        assert!(!part0.is_empty(), "part 0 served");
+        assert_eq!(sink.on_play_head(), 0);
+        // A part that doesn't exist is a clean 404.
+        let missing_part = http_raw(addr, "GET", "/part/999.m4s");
+        assert!(missing_part.contains(" 404 "), "missing part 404s: {missing_part}");
+
+        // A completed parent segment is the concatenation of its parts; play head = last part.
+        let seg0 = http_get_bytes(addr, "/seg/0.m4s");
+        let (b0, b1) = {
+            let g = sink.shared.lock().unwrap();
+            (g.parts[&0].bytes.len(), g.parts[&1].bytes.len())
+        };
+        assert_eq!(seg0.len(), b0 + b1, "parent 0 = parts 0+1 concatenated");
+        assert_eq!(sink.on_play_head(), 1, "seg fetch advances play head to last part");
+        // A parent with no members (never produced) 404s.
+        let missing_seg = http_raw(addr, "GET", "/seg/999.m4s");
+        assert!(missing_seg.contains(" 404 "), "empty parent 404s: {missing_seg}");
+    }
+
+    /// A CORS preflight (OPTIONS) is answered 204 with the permissive CORS headers, without
+    /// touching the media state.
+    #[test]
+    fn options_preflight_returns_204_with_cors() {
+        let srv = HlsServer::start(2000).unwrap();
+        let resp = http_raw(srv.addr(), "OPTIONS", "/live.m3u8");
+        assert!(resp.contains(" 204 "), "204 No Content: {resp}");
+        assert!(resp.contains("Access-Control-Allow-Origin: *"), "{resp}");
+        assert!(resp.contains("Access-Control-Allow-Methods"), "{resp}");
+        assert!(resp.contains("Access-Control-Allow-Headers"), "{resp}");
+    }
+
+    /// An entirely unknown path (not a playlist, init, part or seg) is a clean 404.
+    #[test]
+    fn unknown_path_is_404() {
+        let srv = HlsServer::start(2000).unwrap();
+        let resp = http_raw(srv.addr(), "GET", "/definitely/not/a/thing");
+        assert!(resp.contains(" 404 "), "unknown path 404s: {resp}");
+    }
+
+    /// `/init.mp4` is 404 before the init segment arrives, and serves the bytes after.
+    #[test]
+    fn init_missing_then_present() {
+        let srv = HlsServer::start(2000).unwrap();
+        let sink = srv.sink();
+        let before = http_raw(srv.addr(), "GET", "/init.mp4");
+        assert!(before.contains(" 404 "), "no init yet: {before}");
+        sink.push_init(Bytes::from_static(b"INITBYTES"));
+        let after = http_get(srv.addr(), "/init.mp4");
+        assert!(after.contains("INITBYTES"), "init served: {after}");
+    }
+
+    /// A blocking-reload request for a media-sequence that never arrives parks on the condvar
+    /// and returns the current playlist once the bounded deadline elapses (deterministic: the
+    /// target is unreachable, so this always takes the timeout branch). The extra unknown query
+    /// param also exercises blocking_target's catch-all.
+    #[test]
+    fn blocking_reload_times_out_when_target_unreachable() {
+        let mut fb = segmenter::FragmentBuilder::new_ll(ll_params(), 100);
+        let srv = HlsServer::start_ll(1000, 100).unwrap();
+        let sink = srv.sink();
+        // Produce a little so the playlist is non-trivial, but nowhere near msn 9999.
+        feed(&mut fb, &sink, true);
+        feed(&mut fb, &sink, false);
+        let addr = srv.addr();
+        // `x=1` is neither _HLS_msn nor _HLS_part → blocking_target's `_ => {}` arm.
+        let pl = http_get(addr, "/live.m3u8?_HLS_msn=9999&_HLS_part=0&x=1");
+        // It timed out and served whatever exists now (the live edge, far below msn 9999).
+        assert!(pl.contains("#EXTM3U"), "playlist served after timeout: {pl}");
+        assert!(pl.contains("#EXT-X-MEDIA-SEQUENCE:0"), "{pl}");
+    }
 }

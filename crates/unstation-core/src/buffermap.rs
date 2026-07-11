@@ -56,9 +56,11 @@ impl BufferMap {
         self.bits.count_ones()
     }
 
-    /// Highest held sequence number, if any.
+    /// Highest held sequence number, if any. `checked_add` guards a hostile map whose
+    /// `base + index` would overflow `u64` (a crafted `BufferMap`/`Hello` with a
+    /// near-`u64::MAX` base): such a map reports no highest rather than panicking.
     pub fn highest(&self) -> Option<Seq> {
-        self.bits.iter_ones().last().map(|i| self.base + i as Seq)
+        self.bits.iter_ones().last().and_then(|i| self.base.checked_add(i as Seq))
     }
 
     /// Serialize to the wire bitfield carried in `BufferMap`/`Hello`.
@@ -122,6 +124,20 @@ mod tests {
         assert_eq!(b.count(), 0);
         b.set(100);
         assert!(b.has(100));
+    }
+
+    #[test]
+    fn hostile_base_near_max_does_not_panic() {
+        // A crafted peer can send any (base, bitfield); every operation must hold up.
+        // Regression (found by the buffermap_bytes fuzz target): highest() computed
+        // base + index, which overflowed u64 for a base near u64::MAX.
+        let mut b = BufferMap::from_bytes(u64::MAX, &[0xFF; 8]);
+        assert_eq!(b.highest(), None, "base+index overflow yields no highest, not a panic");
+        assert!(!b.has(0)); // below base
+        let _ = b.count();
+        b.set(0); // below base — no-op
+        b.prune_below(0); // <= base — no-op
+        let _ = b.to_bytes();
     }
 
     #[test]

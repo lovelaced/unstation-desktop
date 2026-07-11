@@ -320,5 +320,300 @@ mod tests {
         let sps = parse_sps(REAL_SPS).unwrap();
         assert!(slice_poc_lsb(&[0x67, 0x00], &sps).is_none(), "SPS NAL is not a slice");
         assert!(parse_sps(&[0x41, 0x00]).is_none(), "not an SPS");
+        assert!(slice_poc_lsb(&[], &sps).is_none(), "empty slice NAL");
+    }
+
+    // ---- deterministic SPS / slice synthesis (no ffmpeg) ------------------------------
+    //
+    // A minimal H.264 SPS + slice-header *encoder* — the inverse of `parse_sps` /
+    // `slice_poc_lsb` — so the 4:4:4, scaling-matrix, POC-type≠0, interlaced and truncated
+    // paths each get a purpose-built fixture without a real encoder. It writes the bits the
+    // parser reads (round-tripped through emulation-prevention); it never parses.
+
+    struct BitWriter {
+        out: Vec<u8>,
+        cur: u8,
+        n: u8,
+    }
+    impl BitWriter {
+        fn new() -> Self {
+            Self { out: Vec::new(), cur: 0, n: 0 }
+        }
+        fn bit(&mut self, b: u32) {
+            self.cur = (self.cur << 1) | (b as u8 & 1);
+            self.n += 1;
+            if self.n == 8 {
+                self.out.push(self.cur);
+                self.cur = 0;
+                self.n = 0;
+            }
+        }
+        fn put(&mut self, v: u32, bits: u32) {
+            for i in (0..bits).rev() {
+                self.bit((v >> i) & 1);
+            }
+        }
+        fn ue(&mut self, v: u32) {
+            let code = v as u64 + 1;
+            let m = 63 - code.leading_zeros();
+            for _ in 0..m {
+                self.bit(0);
+            }
+            for i in (0..=m).rev() {
+                self.bit(((code >> i) & 1) as u32);
+            }
+        }
+        fn se(&mut self, v: i32) {
+            let k = if v > 0 { (2 * v - 1) as u32 } else { (-2 * v) as u32 };
+            self.ue(k);
+        }
+        /// Byte-align, emulation-prevent, and prepend the given 1-byte NAL header.
+        fn nal(mut self, header: u8) -> Vec<u8> {
+            if self.n > 0 {
+                self.cur <<= 8 - self.n;
+                self.out.push(self.cur);
+            }
+            let mut nal = vec![header];
+            let mut zeros = 0;
+            for &b in &self.out {
+                if zeros >= 2 && b <= 3 {
+                    nal.push(3);
+                    zeros = 0;
+                }
+                nal.push(b);
+                zeros = if b == 0 { zeros + 1 } else { 0 };
+            }
+            nal
+        }
+    }
+
+    #[derive(Clone)]
+    struct SpsCfg {
+        profile: u32,
+        chroma_format_idc: u32,
+        separate_colour_plane: bool,
+        scaling_present: bool,
+        scaling_lists: Vec<bool>,
+        poc_type: u32,
+        log2_max_frame_num_minus4: u32,
+        log2_max_poc_lsb_minus4: u32,
+        frame_mbs_only: bool,
+    }
+    impl Default for SpsCfg {
+        fn default() -> Self {
+            Self {
+                profile: 100,
+                chroma_format_idc: 1,
+                separate_colour_plane: false,
+                scaling_present: false,
+                scaling_lists: Vec::new(),
+                poc_type: 0,
+                log2_max_frame_num_minus4: 0,
+                log2_max_poc_lsb_minus4: 0,
+                frame_mbs_only: true,
+            }
+        }
+    }
+    impl SpsCfg {
+        fn encode(&self) -> Vec<u8> {
+            let mut w = BitWriter::new();
+            let high = matches!(
+                self.profile,
+                100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
+            );
+            w.put(self.profile, 8);
+            w.put(0, 8); // constraints
+            w.put(30, 8); // level_idc
+            w.ue(0); // sps_id
+            if high {
+                w.ue(self.chroma_format_idc);
+                if self.chroma_format_idc == 3 {
+                    w.bit(self.separate_colour_plane as u32);
+                }
+                w.ue(0); // bit_depth_luma_minus8
+                w.ue(0); // bit_depth_chroma_minus8
+                w.bit(0); // qpprime
+                w.bit(self.scaling_present as u32);
+                if self.scaling_present {
+                    for (i, &present) in self.scaling_lists.iter().enumerate() {
+                        w.bit(present as u32);
+                        if present {
+                            let size = if i < 6 { 16 } else { 64 };
+                            for _ in 0..size {
+                                w.se(0);
+                            }
+                        }
+                    }
+                }
+            }
+            w.ue(self.log2_max_frame_num_minus4);
+            w.ue(self.poc_type);
+            if self.poc_type == 0 {
+                w.ue(self.log2_max_poc_lsb_minus4);
+            }
+            w.ue(1); // max_num_ref_frames
+            w.bit(0); // gaps
+            w.ue(9); // pic_width_in_mbs_minus1 (irrelevant to POC)
+            w.ue(9); // pic_height_in_map_units_minus1
+            w.bit(self.frame_mbs_only as u32);
+            // parse_sps stops after frame_mbs_only; nothing more is read.
+            w.nal(0x67)
+        }
+    }
+
+    /// A coded-slice header carrying just enough to reach pic_order_cnt_lsb.
+    struct SliceCfg {
+        is_idr: bool,
+        nal_ref_idc: u8,
+        frame_num: u32,
+        field_pic: Option<bool>, // Some(bottom) sets field_pic_flag=1
+        poc_lsb: u32,
+    }
+    impl SliceCfg {
+        fn encode(&self, sps: &SpsCfg) -> Vec<u8> {
+            let mut w = BitWriter::new();
+            w.ue(0); // first_mb_in_slice
+            w.ue(if self.is_idr { 7 } else { 5 }); // slice_type (value unused by parser)
+            w.ue(0); // pps_id
+            if sps.chroma_format_idc == 3 && sps.separate_colour_plane {
+                w.put(0, 2); // colour_plane_id
+            }
+            w.put(self.frame_num, sps.log2_max_frame_num_minus4 + 4);
+            if !sps.frame_mbs_only {
+                match self.field_pic {
+                    Some(bottom) => {
+                        w.bit(1);
+                        w.bit(bottom as u32);
+                    }
+                    None => w.bit(0),
+                }
+            }
+            if self.is_idr {
+                w.ue(0); // idr_pic_id
+            }
+            w.put(self.poc_lsb, sps.log2_max_poc_lsb_minus4 + 4);
+            let header = ((self.nal_ref_idc & 3) << 5) | if self.is_idr { 5 } else { 1 };
+            w.nal(header)
+        }
+    }
+
+    #[test]
+    fn parses_high444_sps() {
+        // chroma_format_idc 3 → separate_colour_plane bit is present in the SPS, and its slices
+        // carry a 2-bit colour_plane_id the POC read must skip.
+        let cfg = SpsCfg {
+            profile: 244,
+            chroma_format_idc: 3,
+            separate_colour_plane: true,
+            log2_max_poc_lsb_minus4: 2, // log2=6
+            ..SpsCfg::default()
+        };
+        let sps = parse_sps(&cfg.encode()).expect("4:4:4 SPS parses");
+        assert!(sps.separate_colour_plane);
+        assert_eq!(sps.log2_max_poc_lsb, 6);
+        let slice = SliceCfg { is_idr: true, nal_ref_idc: 3, frame_num: 0, field_pic: None, poc_lsb: 0 }
+            .encode(&cfg);
+        assert_eq!(slice_poc_lsb(&slice, &sps), Some((true, 0)));
+        let slice2 = SliceCfg { is_idr: false, nal_ref_idc: 2, frame_num: 1, field_pic: None, poc_lsb: 12 }
+            .encode(&cfg);
+        assert_eq!(slice_poc_lsb(&slice2, &sps), Some((false, 12)));
+    }
+
+    #[test]
+    fn parses_sps_with_scaling_matrix() {
+        // seq_scaling_matrix_present forces the scaling-list skip; a wrong skip corrupts the
+        // POC fields that follow, so a sane log2_max_poc_lsb proves the skip is exact.
+        let cfg = SpsCfg {
+            profile: 100,
+            scaling_present: true,
+            scaling_lists: vec![true, false, false, true, false, false, true, false],
+            log2_max_poc_lsb_minus4: 4, // log2=8
+            log2_max_frame_num_minus4: 2, // log2=6
+            ..SpsCfg::default()
+        };
+        let sps = parse_sps(&cfg.encode()).expect("scaling-matrix SPS parses");
+        assert_eq!(sps.log2_max_poc_lsb, 8);
+        assert_eq!(sps.log2_max_frame_num, 6);
+    }
+
+    #[test]
+    fn rejects_unsupported_poc_type() {
+        // POC type ≠ 0 is unsupported for reorder → None (the muxer then uses decode-order
+        // timing). Covers both the type-1 and type-2 paths.
+        for t in [1u32, 2] {
+            let cfg = SpsCfg { poc_type: t, ..SpsCfg::default() };
+            // Note: for type 1 the encoder omits the extra cycle syntax, but parse_sps bails on
+            // the type before reading it — exactly the branch under test.
+            assert!(parse_sps(&cfg.encode()).is_none(), "poc_type {t} unsupported");
+        }
+    }
+
+    #[test]
+    fn interlaced_slice_reads_field_flags() {
+        // frame_mbs_only=0 → each slice header carries field_pic_flag (+ bottom_field_flag) the
+        // POC read must consume before pic_order_cnt_lsb.
+        let cfg = SpsCfg { frame_mbs_only: false, log2_max_poc_lsb_minus4: 2, ..SpsCfg::default() };
+        let sps = parse_sps(&cfg.encode()).expect("interlaced SPS parses");
+        assert!(!sps.frame_mbs_only);
+        // A field-coded slice (field_pic_flag=1, bottom_field_flag=1).
+        let field = SliceCfg { is_idr: false, nal_ref_idc: 2, frame_num: 3, field_pic: Some(true), poc_lsb: 7 }
+            .encode(&cfg);
+        assert_eq!(slice_poc_lsb(&field, &sps), Some((false, 7)));
+        // A frame-coded slice in the same interlaced stream (field_pic_flag=0).
+        let frame = SliceCfg { is_idr: false, nal_ref_idc: 2, frame_num: 4, field_pic: None, poc_lsb: 9 }
+            .encode(&cfg);
+        assert_eq!(slice_poc_lsb(&frame, &sps), Some((false, 9)));
+    }
+
+    #[test]
+    fn truncated_slice_reads_zeros_past_end() {
+        // A slice header cut off before pic_order_cnt_lsb must not panic: the reader treats
+        // past-the-end bits as 0 and returns a (defensive) value.
+        let sps = parse_sps(REAL_SPS).unwrap();
+        // Just the NAL header + one payload byte — nowhere near pic_order_cnt_lsb.
+        let (is_idr, _lsb) = slice_poc_lsb(&[0x41, 0x80], &sps).expect("no panic on short slice");
+        assert!(!is_idr);
+    }
+
+    #[test]
+    fn exp_golomb_runaway_is_bounded() {
+        // A slice whose first Exp-Golomb code is an unterminated run of zeros must not loop —
+        // ue() bails after 31 leading zeros. This is the hostile-input guard.
+        let sps = parse_sps(REAL_SPS).unwrap();
+        let mut zeros = vec![0x41u8];
+        zeros.extend_from_slice(&[0u8; 8]); // 64 zero bits → runaway
+        assert!(slice_poc_lsb(&zeros, &sps).is_some(), "bounded, no hang");
+    }
+
+    #[test]
+    fn poc_tracker_handles_lsb_wraparound_both_directions() {
+        // log2_max_poc_lsb=4 → max=16, half=8. Exercise both MSB-adjust arms plus the
+        // non-reference and IDR-reset rules.
+        let sps = SpsPoc {
+            log2_max_frame_num: 4,
+            log2_max_poc_lsb: 4,
+            frame_mbs_only: true,
+            separate_colour_plane: false,
+        };
+        let mut t = PocTracker::new(&sps);
+        assert_eq!(t.poc(true, 0, 3), 0, "IDR anchors at 0");
+        assert_eq!(t.poc(false, 2, 3), 2, "no wrap");
+        // lsb jumps far forward (11 vs prev 2, diff 9 > 8) → MSB wraps DOWN.
+        assert_eq!(t.poc(false, 11, 3), -5, "forward jump wraps msb down");
+        // lsb drops far back (1 vs prev 11, diff 10 ≥ 8) → MSB wraps UP.
+        assert_eq!(t.poc(false, 1, 3), 1, "backward jump wraps msb up");
+        // A non-reference frame (nal_ref_idc=0) must NOT advance the MSB reference state.
+        let before = t.poc(false, 4, 0);
+        let after = t.poc(false, 4, 0);
+        assert_eq!(before, after, "non-ref frames don't move the reference");
+        // IDR resets the reference regardless of history.
+        assert_eq!(t.poc(true, 0, 3), 0, "IDR resets");
+    }
+
+    #[test]
+    fn nal_ref_idc_extracts_ref_bits() {
+        assert_eq!(nal_ref_idc(0x65), 3); // IDR, ref 3
+        assert_eq!(nal_ref_idc(0x41), 2); // P, ref 2
+        assert_eq!(nal_ref_idc(0x01), 0); // disposable B, ref 0
     }
 }

@@ -17,6 +17,11 @@ arbitrary = { version = "1", features = ["derive"] }
 [dependencies.unstation-core]
 path = ".."
 
+# The CMAF/H.264 media parsers (SPS dimensions + POC slice headers) parse untrusted RTP/WHIP
+# bytes; fuzz them here alongside the wire decoders. Resolves to the same unstation-core above.
+[dependencies.segmenter]
+path = "../../../infra/segmenter"
+
 [[bin]]
 name = "protocol_decode"
 path = "fuzz_targets/protocol_decode.rs"
@@ -41,6 +46,20 @@ bench = false
 [[bin]]
 name = "presence_merge"
 path = "fuzz_targets/presence_merge.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sps_dimensions"
+path = "fuzz_targets/sps_dimensions.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h264_poc_mux"
+path = "fuzz_targets/h264_poc_mux.rs"
 test = false
 doc = false
 bench = false
