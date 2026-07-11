@@ -51,7 +51,7 @@ broadcast straight from your phone camera.
   encrypted, so even the relays passing it along can't watch it).
 - **It gets stronger with a crowd.** Instead of buckling under load like a single server, a bigger
   audience means more people sharing the stream, so popular broadcasts hold up better, not worse.
-- **Honest about what's happening.** Connecting, catching up, "can't reach anyone right now", "the
+- **Clear about what's happening.** Connecting, catching up, "can't reach anyone right now", "the
   broadcast ended" are real, plainly-worded states, never an endless spinner that hides a problem.
 
 ## How it works, in a nutshell
@@ -66,8 +66,8 @@ addressed by its own fingerprint, so your app can prove that what it plays is ex
 broadcaster sent. Relays and other viewers can pass the video along, but they can never change it.
 
 For the full picture, see [How it works](docs/how-it-works.md). For the wire-level details, the
-[Protocol](docs/protocol.md) reference. For the honest security story (what's protected, what leaks,
-and the threat model), [Security and FAQ](docs/security.md).
+[Protocol](docs/protocol.md) reference. For the security story (what's protected, what leaks, and the
+threat model), [Security](docs/security.md).
 
 ## Install
 
@@ -90,7 +90,7 @@ builds and tests with no chain and no GUI. See
 |-----|-----|
 | [How it works](docs/how-it-works.md) | The whole system in plain but technical language, with a diagram |
 | [Protocol](docs/protocol.md) | Wire formats, the chain layer, the mesh, the trust chain |
-| [Security](docs/security.md) | The threat model, what's protected, what leaks, honest limits |
+| [Security](docs/security.md) | The threat model, what's protected, what leaks, and the limits |
 | [FAQ](docs/faq.md) | Is it private, is it legal, what do I need, what does it cost |
 | [Run a relay](docs/run-a-relay.md) | Lend bandwidth from a spare server in one command |
 | [Contributing](docs/contributing.md) | Repo layout, building the app and the relay, running the tests |

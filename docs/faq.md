@@ -23,23 +23,23 @@ provider for. Watching and broadcasting from the app cost nothing.
 
 ## Is it really impossible to shut down?
 
-It's honest to say there is no server and no company in the middle, so there is no operator to
-pressure and nothing central to switch off. The video goes straight between people. That removes the
-usual single point of failure.
+There is no server and no company in the middle, so there is no operator to pressure and nothing
+central to switch off. The video goes straight between people. That removes the usual single point
+of failure.
 
-It is not honest to say nothing could ever disrupt it. The shared noticeboard is a public blockchain
-that clients reach through network endpoints, and those endpoints are a place pressure could be
-applied. Anyone can run their own, and the app lets you point at alternatives, but out of the box
-it uses a small set of default endpoints. See [Security](security.md#what-are-the-weak-points) for
-the honest list of chokepoints.
+But nothing is completely immune to disruption. The shared noticeboard is a public blockchain that
+clients reach through network endpoints, and those endpoints are a place pressure could be applied.
+Anyone can run their own, and the app lets you point at alternatives, but out of the box it uses a
+small set of default endpoints. See [Security](security.md#what-are-the-weak-points) for the full
+list of chokepoints.
 
 ## Who can see that I'm watching, or my IP address?
 
 This is peer-to-peer, so anyone you connect to directly can see your IP address, the same way any
 video call works. In practice that's the broadcaster or a relay. A broadcaster can hide their own
 address behind volunteer relays so ordinary viewers never see it. The notes that set up connections
-are always encrypted, so someone just watching the noticeboard cannot harvest addresses. The full,
-honest breakdown of what leaks to whom is in [Security](security.md#what-can-each-party-see).
+are always encrypted, so someone just watching the noticeboard cannot harvest addresses. The full
+breakdown of what leaks to whom is in [Security](security.md#what-can-each-party-see).
 
 ## Can the broadcaster see who is watching?
 
@@ -92,7 +92,7 @@ installed. Full steps are in the app itself when you choose Go Live.
 
 There are no accounts and no profile. Your keys stay on your phone. The notes posted to the shared
 noticeboard are tied to a per-app pseudonym, not your name, and they expire on their own. The one
-honest caveat is that all of one device's activity is signed by the same pseudonym, so someone
+caveat is that all of one device's activity is signed by the same pseudonym, so someone
 watching the blockchain could see that "this pseudonym broadcast these streams," without knowing who
 that is. More on that in [Security](security.md#on-chain-metadata).
 

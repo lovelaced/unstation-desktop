@@ -13,7 +13,7 @@ phone camera.
 
 - **Just want to understand it?** [How it works](how-it-works.md) walks through the whole system in
   plain but technical language, with a diagram.
-- **Curious about privacy or safety?** [Security](security.md) is the honest threat model: what's
+- **Curious about privacy or safety?** [Security](security.md) covers the threat model: what's
   protected, what leaks, and to whom. [FAQ](faq.md) answers the everyday questions.
 - **Want to help?** [Run a relay](run-a-relay.md) on a spare server and lend bandwidth in one
   command. A relay carries streams but can never watch or change them.

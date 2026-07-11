@@ -80,7 +80,12 @@ MD_LINK = re.compile(r"\]\((?!https?://)([a-z0-9-]+)\.md(#[a-z0-9-]+)?\)")
 def render(md_text):
     md_text = FRONT_MATTER.sub("", md_text)            # tolerate leftover front matter
     md_text = MD_LINK.sub(r"](\1.html\2)", md_text)    # between-page links
-    md = markdown.Markdown(extensions=["tables", "fenced_code", "toc"])
+    # `permalink` adds a small "#" link on each heading so any section (a specific FAQ
+    # answer, say) can be linked to directly; the CSS reveals it on hover.
+    md = markdown.Markdown(
+        extensions=["tables", "fenced_code", "toc"],
+        extension_configs={"toc": {"permalink": "#"}},
+    )
     html = md.convert(md_text)
     # Let wide tables scroll inside their own box instead of overflowing the page on
     # narrow screens (the CSS styles .table-scroll).

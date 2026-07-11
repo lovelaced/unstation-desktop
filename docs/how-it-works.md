@@ -4,7 +4,7 @@ This is the middle-length explanation: enough to really understand the design, w
 wire-level detail. If you want the plain version, read the [FAQ](faq.md). If you want the exact
 formats, read the [Protocol](protocol.md).
 
-## The problem, and the shape of the answer
+## The problem, and the answer
 
 Normal live streaming sends your video to a company's servers, which then send it to viewers. That
 company is a single point of control: it can throttle the stream, take it down, or fail. It's also a
@@ -15,7 +15,7 @@ to each other, over encrypted peer-to-peer connections. There's no server to tak
 operator to lean on. And because every viewer also helps pass the stream along, more viewers means
 more capacity, not less.
 
-Two hard problems come with that shape. First, with no central directory, how does a viewer find a
+Going serverless brings two hard problems. First, with no central directory, how does a viewer find a
 broadcaster and set up a direct connection? Second, with untrusted strangers relaying the video, how
 do you know what you're watching wasn't tampered with? Unstation's whole design is the answer to
 those two questions.
@@ -117,8 +117,8 @@ finger, and then joins in and starts carrying the stream. This is how Unstation 
 
 Recruited relays are also what makes **hiding the broadcaster's address** work: a broadcaster can
 choose to serve everyone through its relays, so ordinary viewers never connect to it directly and
-never learn its address. Crucially, it only accepts connections from the specific relays it recruited
-and verified, not from anyone who merely claims to be one. See [Security](security.md) for why that
+never learn its address. It only accepts connections from the specific relays it recruited and
+verified, not from anyone who merely claims to be one. See [Security](security.md) for why that
 distinction matters.
 
 ## The fast path
@@ -128,7 +128,7 @@ cases that need to be quicker, there's an optional sub-two-second path: for invi
 the broadcaster can send video directly as a real-time media stream, skipping the per-chunk
 verification to save time. It's opt-in and invite-gated, and the verified stream keeps running
 underneath as an automatic fallback. Because it isn't verified, it's a deliberate speed-for-trust
-trade, described honestly in [Security](security.md#out-of-scope).
+trade, spelled out in [Security](security.md#out-of-scope).
 
 ## The trust chain, in one paragraph
 

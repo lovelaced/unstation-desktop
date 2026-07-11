@@ -1,7 +1,7 @@
 # Security
 
-This page is the honest version. It describes what Unstation actually protects, what it deliberately
-doesn't, and exactly what each party in the system can see. It's written for readers who want to
+This page describes what Unstation actually protects, what it deliberately doesn't, and exactly what
+each party in the system can see, without softening any of it. It's written for readers who want to
 understand the design and decide how much to trust it. If you just want the plain answers, the
 [FAQ](faq.md) is friendlier.
 
@@ -86,7 +86,7 @@ services clients reach it and other resources through.
 There are no accounts, and the keys that identify you never leave your phone. Your device acts under
 a per-app pseudonym, not your name, and the notes it posts expire on their own.
 
-The honest caveat: **all of one device's activity is signed by that same pseudonym.** Someone
+The caveat: **all of one device's activity is signed by that same pseudonym.** Someone
 watching the chain over time could build a profile like "this pseudonym broadcast these streams on
 these evenings," without ever learning who the pseudonym belongs to. Linking that pseudonym to a real
 person would require information from somewhere else (an IP correlation, or the initial personhood
@@ -100,7 +100,7 @@ sealed.
 
 ## What are the weak points
 
-Being honest about where pressure could be applied or where privacy is thinner than you might hope:
+Where pressure could be applied, or where privacy is thinner than you might hope:
 
 - **Default endpoints.** The chain and the content backup are reached through a small set of default
   network endpoints. Anyone can run their own, and the app accepts alternatives, but out of the box a

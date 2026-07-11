@@ -197,7 +197,7 @@ It keeps a small set of unchoked upload slots plus one rotating optimistic slot,
 broadcasters rank by lowest RTT and never choke. Misbehavior costs reputation (a hash failure halves
 it; timeouts and protocol abuse cost less and can't ban on their own), verified deliveries slowly
 heal it, and a peer below the floor is choked, closed, and banned for 10 minutes. Reassembly is keyed
-per `(sender, seq)` so a bad peer can't poison an honest peer's in-progress chunk.
+per `(sender, seq)` so a bad peer can't poison a legitimate peer's in-progress chunk.
 
 ## Discovery, dialing, and origin-shield
 

@@ -95,6 +95,18 @@ body {
 .doc h3 { font-size: 19px; margin: 34px 0 10px; font-weight: 620; }
 .doc h4 { font-size: 16px; margin: 26px 0 8px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
 
+/* Per-heading anchor link (the "#" appended by the builder). Quiet by default,
+   surfaces on hover, so any section can be linked to directly. */
+.doc .headerlink {
+  margin-left: .35em; color: var(--faint); font-weight: 400; text-decoration: none;
+  border-bottom: 0; opacity: 0; transition: opacity var(--t-hover, .12s) ease;
+}
+.doc h1:hover .headerlink, .doc h2:hover .headerlink,
+.doc h3:hover .headerlink, .doc h4:hover .headerlink { opacity: 1; }
+.doc .headerlink:hover { color: var(--brand); border-bottom: 0; }
+.doc h1 .headerlink { display: none; }            /* the page title just links to the top */
+@media (hover: none) { .doc .headerlink { opacity: .45; } }  /* no hover on touch: keep tappable */
+
 .doc p, .doc li { color: var(--text); }
 .doc p { margin: 0 0 16px; }
 .doc a { color: var(--brand); text-decoration: none; border-bottom: 1px solid rgba(255, 92, 122, 0.35); }
