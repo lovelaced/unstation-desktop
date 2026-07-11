@@ -23,6 +23,11 @@
 
 html { -webkit-text-size-adjust: 100%; }
 
+/* Anchor jumps (linking to a #section) land below the sticky header instead of
+   behind it. Wider on narrow screens, where the nav wraps and the header is taller. */
+html { scroll-padding-top: 84px; }
+@media (max-width: 620px) { html { scroll-padding-top: 150px; } }
+
 body {
   margin: 0;
   background: var(--ground);
