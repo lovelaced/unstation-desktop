@@ -33,6 +33,8 @@ PAGES = [
      "The whole system in plain but technical language, with a diagram."),
     ("protocol.md", "protocol.html", "Protocol",
      "Wire formats, the chain layer, the mesh protocol, and the trust chain."),
+    ("engineering.md", "engineering.html", "Engineering",
+     "Design rationale for the mesh and the SCALE wire format: the tradeoffs, why decisions were taken, and what they enable."),
     ("security.md", "security.html", "Security",
      "The honest threat model: what Unstation protects, what it doesn't, and what each party can see."),
     ("faq.md", "faq.html", "FAQ",

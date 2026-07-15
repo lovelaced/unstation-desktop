@@ -1,8 +1,8 @@
 # Protocol reference
 
 The precise version. This describes the formats and rules a second implementation would need to
-interoperate. For the narrative, read [How it works](how-it-works.md); for the threat model, read
-[Security](security.md).
+interoperate. For the narrative, read [How it works](how-it-works.md); for why the mesh and the wire
+are built this way, the [Engineering Q&A](engineering.md); for the threat model, [Security](security.md).
 
 Cryptographic primitives used throughout: **BLAKE2b-256** for all hashing and content addressing,
 **sr25519** for identity signatures, **X25519** for key agreement, and **XChaCha20-Poly1305** for

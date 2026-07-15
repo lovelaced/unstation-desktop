@@ -17,8 +17,9 @@ phone camera.
   protected, what leaks, and to whom. [FAQ](faq.md) answers the everyday questions.
 - **Want to help?** [Run a relay](run-a-relay.md) on a spare server and lend bandwidth in one
   command. A relay carries streams but can never watch or change them.
-- **Building on it?** The [Protocol](protocol.md) reference has the wire formats and the chain
-  layer. [Contributing](contributing.md) covers the repo and the tests.
+- **Building on it?** The [Protocol](protocol.md) reference has the wire formats and the chain layer,
+  and the [Engineering Q&A](engineering.md) covers the mesh and SCALE design rationale.
+  [Contributing](contributing.md) covers the repo and the tests.
 
 ## What makes it different
 

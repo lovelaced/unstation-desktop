@@ -43,6 +43,7 @@ docs/_site/
 !docs/index.md
 !docs/how-it-works.md
 !docs/protocol.md
+!docs/engineering.md
 !docs/security.md
 !docs/faq.md
 !docs/run-a-relay.md
